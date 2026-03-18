@@ -952,7 +952,9 @@ static ideal ideal_from_polys(const std::vector<poly> &gens, RingEnv &RE)
 static ideal groebner_std(ideal I, const ring R)
 {
     rChangeCurrRing(R);
-    ideal G = kStd(I, currRing->qideal, isNotHomog, NULL, NULL, 0, 0, NULL);
+    intvec *w0 = NULL;
+    intvec **w = &w0;
+    ideal G = kStd(I, NULL, testHomog, w, NULL, 0, 0, NULL);
     return G;
 }
 
@@ -1569,7 +1571,7 @@ class PolyPropagator : public user_propagator_base
             poly d = p_Copy(cp.D, R);
 
             LOG_DEBUG(g_log, "knf", "---------------start---------------");
-            poly nf = kNF(G, currRing->qideal, d, 0, 0);
+            poly nf = kNF(G, NULL, d, 0, 0);
             LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
             bool in = nf_is_zero(nf);
@@ -1665,7 +1667,7 @@ class PolyPropagator : public user_propagator_base
         poly one = poly_from_si(1, R);
 
         LOG_DEBUG(g_log, "knf", "---------------start---------------");
-        poly nf = kNF(G, currRing->qideal, one, 0, 0);
+        poly nf = kNF(G, NULL, one, 0, 0);
         LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
         bool unsat = nf_is_zero(nf);
@@ -1752,7 +1754,7 @@ class PolyPropagator : public user_propagator_base
             poly d = p_Copy(cp.D, R);
 
             LOG_DEBUG(g_log, "knf", "---------------start---------------");
-            poly nf = kNF(G, currRing->qideal, d, 0, 0);
+            poly nf = kNF(G, NULL, d, 0, 0);
             LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
             bool in = nf_is_zero(nf);
