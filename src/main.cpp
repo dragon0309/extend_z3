@@ -27,13 +27,13 @@
 using namespace z3;
 using clk = std::chrono::steady_clock;
 
-static bool SHOW_MODEL = false;
+static bool SHOW_MODEL = true;
 static bool SINGULAR_VERBOSE = true;
 static bool PRINT_RING_DETAIL = false;
-static bool PRINT_FIXED_ALL = true; // log fixed for all tracked terms
-static bool PRINT_PROPAGATE = true; // log propagate
-static bool PRINT_POW_STATS = true; // print PPow timing/degree/terms
-static bool PRINT_POW_BASE = true;  // also print base expression (shortened)
+static bool PRINT_FIXED_ALL = true;
+static bool PRINT_PROPAGATE = true;
+static bool PRINT_POW_STATS = true;
+static bool PRINT_POW_BASE = true;
 static bool singular_initialized = false;
 static constexpr int64_t MAX_POW_EXPAND = 65536;
 static size_t LOG_EXPR_MAXLEN = 20000000;
@@ -41,7 +41,10 @@ static Logger g_log;
 
 static bool ORDER = true;
 static bool ENV = false;
-static bool SKIP_ALL_TRUE = false; // unused now (we do all-false only)
+static bool SKIP_ALL_TRUE = false; // unused now
+static bool ENABLE_ALL_FALSE = true;
+static bool ENABLE_ALL_TRUE = true;
+static bool ENABLE_MIXED = true;
 
 static void init_singular()
 {
@@ -111,14 +114,10 @@ static const char *k_poly_prelude = R"PRE(
      (PMul   (mul_l (Poly T)) (mul_r (Poly T)))
      (PPow   (pow_base (Poly T)) (pow_k Int)))))
 
-
-; Polynomial semantic eq
 (declare-fun eqP ((Poly Int) (Poly Int)) Bool)
-
-; Polynomial semantic eqmod with single modulus term as Poly(Int)
 (declare-fun eqmodP1 ((Poly Int) (Poly Int) (Poly Int)) Bool)
 
-; (kept for future)
+; kept for future
 (declare-fun eqmodP2 ((Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
 (declare-fun eqmodP3 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
 (declare-fun eqmodP4 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
@@ -170,7 +169,6 @@ static std::string inject_poly_eqP_eqmodP_if_missing(const std::string &raw)
 {
     if (contains_poly_decl(raw))
         return raw;
-
     return inject_after_setlogic(raw, k_poly_prelude);
 }
 
@@ -220,7 +218,6 @@ static bool get_int64_numeral(const expr &e, int64_t &out)
     return Z3_get_numeral_int64((Z3_context)e.ctx(), (Z3_ast)e, &out);
 }
 
-// String literal extraction for (PVar "x")
 static bool get_string_literal_smt(const expr &e, std::string &out)
 {
     if (!Z3_is_string_sort((Z3_context)e.ctx(), (Z3_sort)e.get_sort()))
@@ -363,10 +360,8 @@ static std::string coeff_base_pretty_name(const z3::expr &e)
     if (is_bv_to_int_app(e))
     {
         z3::expr bv = e.arg(0);
-
         if (bv.is_const() && !bv.is_numeral())
             return bv.decl().name().str();
-
         return std::string("bv2int");
     }
 
@@ -402,8 +397,8 @@ struct IndetEnv
 // ---------------- Coeff var mapping ----------------
 struct CoeffVarMap
 {
-    std::vector<z3::expr> z3_bases;      // base Int terms: Int const OR ubv_to_int(...)
-    std::vector<std::string> ring_names; // aligned with z3_bases
+    std::vector<z3::expr> z3_bases;
+    std::vector<std::string> ring_names;
     std::unordered_map<Z3_ast, unsigned> base_to_index;
 };
 
@@ -470,7 +465,7 @@ struct RingEnv
     ring R = nullptr;
 
     std::vector<char *> name_buf;
-    std::unordered_map<std::string, int> var_to_idx; // ring-var-name -> 1-based
+    std::unordered_map<std::string, int> var_to_idx;
 
     int ord_size = 0;
     rRingOrder_t *ord_heap = nullptr;
@@ -542,7 +537,7 @@ struct RingEnv
         block1_heap = (int *)omAlloc0(ord_size * sizeof(int));
         wvhdl_heap = nullptr;
 
-        ord_heap[0] = ringorder_lp;
+        ord_heap[0] = ringorder_dp;
         ord_heap[1] = ringorder_C;
         ord_heap[2] = (rRingOrder_t)0;
 
@@ -564,7 +559,7 @@ struct RingEnv
         if (it != var_to_idx.end())
             return it->second;
 
-        throw std::runtime_error("RingEnv: unknown ring variable (aux removed): " + ring_name);
+        throw std::runtime_error("RingEnv: unknown ring variable: " + ring_name);
     }
 };
 
@@ -963,6 +958,31 @@ static ideal groebner_std(ideal I, const ring R)
 
 static inline bool nf_is_zero(poly nf) { return nf == nullptr; }
 
+static bool poly_equal(poly a, poly b, const ring R)
+{
+    rChangeCurrRing(R);
+
+    if (a == nullptr && b == nullptr)
+        return true;
+    if (a == nullptr || b == nullptr)
+        return false;
+
+    poly ac = p_Copy(a, R);
+    poly bc = p_Copy(b, R);
+
+    number m1 = num_from_si(-1, R->cf);
+    poly bneg = p_Mult_nn(bc, m1, R);
+    n_Delete(&m1, R->cf);
+
+    poly diff = p_Add_q(ac, bneg, R);
+    bool eq = (diff == nullptr);
+
+    if (diff)
+        p_Delete(&diff, R);
+
+    return eq;
+}
+
 // ---------------- Split D by indets ----------------
 struct IndetKey
 {
@@ -995,7 +1015,7 @@ split_by_indets(poly D, int Nc, int Mi, RingEnv &RE)
         key.e.assign((size_t)Mi, 0);
         for (int j = 0; j < Mi; ++j)
         {
-            int idx = Nc + 1 + j; // 1-based
+            int idx = Nc + 1 + j;
             key.e[(size_t)j] = p_GetExp(t, idx, R);
         }
 
@@ -1163,6 +1183,10 @@ struct EqModPCompiled
 
     poly M_poly = nullptr; // owned
     poly D = nullptr;      // owned: D = A - B
+
+    std::string u_name;      // fresh quotient variable in ring
+    poly U_poly = nullptr;   // owned: monomial u_t
+    poly true_gen = nullptr; // owned: D - U_poly * M_poly
 };
 
 static bool extract_modulus_from_polyconst(const expr &Mterm, mpz_class &m_out)
@@ -1184,13 +1208,26 @@ static bool extract_modulus_from_polyconst(const expr &Mterm, mpz_class &m_out)
     return true;
 }
 
+static poly make_var_poly(RingEnv &RE, const std::string &name)
+{
+    ring R = RE.R;
+    rChangeCurrRing(R);
+    int vi = RE.ensure_var_idx(name);
+
+    poly p = p_NSet(num_from_si(1, R->cf), R);
+    p_SetExp(p, vi, 1, R);
+    p_Setm(p, R);
+    return p;
+}
+
 static EqModPCompiled compile_eqmodP1_singular(const expr &atom, const expr &A, const expr &B, const expr &Mterm,
                                                const std::string &label,
                                                const IndetEnv &env,
                                                const std::vector<std::string> &indet_ring_names,
                                                RingEnv &RE,
                                                const CoeffVarMap &cmap,
-                                               int Nc)
+                                               int Nc,
+                                               const std::string &u_name)
 {
     ring R = RE.R;
     rChangeCurrRing(R);
@@ -1200,14 +1237,15 @@ static EqModPCompiled compile_eqmodP1_singular(const expr &atom, const expr &A, 
         A,
         B,
         Mterm,
-        false,   // modulus_ok
-        false,   // modulus_is_const
-        0,       // m_const
-        nullptr, // M_poly
-        nullptr  // D
-    };
+        false,
+        false,
+        0,
+        nullptr,
+        nullptr,
+        u_name,
+        nullptr,
+        nullptr};
 
-    // D = A - B
     poly pA = polyterm_to_singular_poly(A, env, indet_ring_names, RE, cmap, Nc, label + "/LHS");
     poly pB = polyterm_to_singular_poly(B, env, indet_ring_names, RE, cmap, Nc, label + "/RHS");
 
@@ -1216,7 +1254,6 @@ static EqModPCompiled compile_eqmodP1_singular(const expr &atom, const expr &A, 
     n_Delete(&m1, R->cf);
     out.D = p_Add_q(pA, pBn, R);
 
-    // M as poly: either positive constant, or general poly (must be nonzero)
     mpz_class mv;
     if (extract_modulus_from_polyconst(Mterm, mv))
     {
@@ -1228,8 +1265,26 @@ static EqModPCompiled compile_eqmodP1_singular(const expr &atom, const expr &A, 
     else
     {
         out.M_poly = polyterm_to_singular_poly(Mterm, env, indet_ring_names, RE, cmap, Nc, label + "/MOD");
-        out.modulus_ok = (out.M_poly != nullptr); // reject mod 0 for now
+        out.modulus_ok = (out.M_poly != nullptr);
     }
+
+    if (out.modulus_ok)
+    {
+        out.U_poly = make_var_poly(RE, u_name);
+        poly um = poly_mul_clone(out.U_poly, out.M_poly, R);
+
+        number neg1 = num_from_si(-1, R->cf);
+        poly um_neg = p_Mult_nn(um, neg1, R);
+        n_Delete(&neg1, R->cf);
+
+        out.true_gen = p_Add_q(p_Copy(out.D, R), um_neg, R);
+    }
+
+    LOG_INFO(g_log, "singular", label + " D(poly) = " + poly_to_string(out.D, R));
+    if (out.M_poly)
+        LOG_INFO(g_log, "singular", label + " M(poly) = " + poly_to_string(out.M_poly, R));
+    if (out.true_gen)
+        LOG_INFO(g_log, "singular", label + " true_gen(poly) = " + poly_to_string(out.true_gen, R));
 
     return out;
 }
@@ -1242,6 +1297,7 @@ class PolyPropagator : public user_propagator_base
 
     std::vector<std::string> m_indet_ring_names;
     std::vector<std::string> m_ring_vars;
+    std::vector<std::string> m_qvar_names;
 
     int m_Nc = 0;
     int m_Mi = 0;
@@ -1280,7 +1336,7 @@ class PolyPropagator : public user_propagator_base
         if (!PRINT_PROPAGATE)
             return;
 
-        LOG_TRACE(g_log, "propagate", label_of(from) + "  ==>  " + infer.to_string());
+        LOG_TRACE(g_log, "propagate", label_of(from) + " ==> " + infer.to_string());
     }
 
     Z3_lbool lbool_of(const expr &a) const
@@ -1320,6 +1376,98 @@ class PolyPropagator : public user_propagator_base
         this->conflict(ants);
     }
 
+    bool same_modulus_across_eqmodp() const
+    {
+        if (m_eqmodp.empty())
+            return true;
+
+        ring R = m_RE.R;
+        if (R == nullptr)
+            return false;
+        rChangeCurrRing(R);
+
+        const auto &c0 = m_eqmodp[0];
+        if (!c0.modulus_ok || c0.M_poly == nullptr)
+        {
+            LOG_INFO(g_log, "singular",
+                     "same_modulus_across_eqmodp: eqmodP1#0 has invalid modulus");
+            return false;
+        }
+
+        LOG_INFO(g_log, "singular",
+                 "Reference modulus eqmodP1#0 M(poly) = " + poly_to_string(c0.M_poly, R));
+
+        for (size_t i = 1; i < m_eqmodp.size(); ++i)
+        {
+            const auto &ci = m_eqmodp[i];
+
+            if (!ci.modulus_ok || ci.M_poly == nullptr)
+            {
+                LOG_INFO(g_log, "singular",
+                         "same_modulus_across_eqmodp: eqmodP1#" + std::to_string(i) +
+                             " has invalid modulus");
+                return false;
+            }
+
+            bool same = poly_equal(ci.M_poly, c0.M_poly, R);
+
+            LOG_INFO(g_log, "singular",
+                     "Compare modulus eqmodP1#" + std::to_string(i) +
+                         " against eqmodP1#0 : " + std::string(same ? "SAME" : "DIFF"));
+
+            if (!same)
+            {
+                LOG_INFO(g_log, "singular",
+                         "  eqmodP1#0 M(poly) = " + poly_to_string(c0.M_poly, R));
+                LOG_INFO(g_log, "singular",
+                         "  eqmodP1#" + std::to_string(i) +
+                             " M(poly) = " + poly_to_string(ci.M_poly, R));
+                return false;
+            }
+        }
+
+        return true;
+    }
+    std::vector<poly> collect_true_context_generators(std::vector<expr> &ants_out)
+    {
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        std::vector<poly> gens;
+        ants_out.clear();
+
+        if (m_eqmodp.empty())
+            return gens;
+        if (!same_modulus_across_eqmodp())
+            return gens;
+
+        gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
+
+        for (auto &ep : m_eqp)
+        {
+            if (ep.D_full == nullptr)
+                continue;
+            if (lbool_of(ep.atom) != Z3_L_TRUE)
+                continue;
+
+            gens.push_back(p_Copy(ep.D_full, R));
+            ants_out.push_back(ep.atom);
+        }
+
+        for (auto &cp : m_eqmodp)
+        {
+            if (lbool_of(cp.atom) != Z3_L_TRUE)
+                continue;
+            if (cp.true_gen == nullptr)
+                continue;
+
+            gens.push_back(p_Copy(cp.true_gen, R));
+            ants_out.push_back(cp.atom);
+        }
+
+        return gens;
+    }
+
     void on_fixed_eqP(const expr &atom, Z3_lbool bv)
     {
         for (auto &cp : m_eqp)
@@ -1357,13 +1505,14 @@ class PolyPropagator : public user_propagator_base
         }
     }
 
-    // ---------------- eqmodP1: all-false refutation ONLY ----------------
+    // ---------------- eqmodP1: all-false ----------------
     void check_eqmodP1_all_false_refutation()
     {
+        if (!ENABLE_ALL_FALSE)
+            return;
         if (m_eqmodp.empty())
             return;
 
-        // require: all fixed and all FALSE
         for (auto &cp : m_eqmodp)
         {
             Z3_lbool bv = lbool_of(cp.atom);
@@ -1375,41 +1524,18 @@ class PolyPropagator : public user_propagator_base
                 return;
         }
 
-        // require: single modulus across all eqmodP1
-        {
-            const auto &c0 = m_eqmodp[0];
-            for (size_t i = 1; i < m_eqmodp.size(); ++i)
-            {
-                const auto &ci = m_eqmodp[i];
-                if (c0.modulus_is_const != ci.modulus_is_const)
-                    return;
-
-                if (c0.modulus_is_const)
-                {
-                    if (ci.m_const != c0.m_const)
-                        return;
-                }
-                else
-                {
-                    // structural equality on Poly term
-                    if (!z3::eq(ci.Mterm, c0.Mterm))
-                        return;
-                }
-            }
-        }
+        if (!same_modulus_across_eqmodp())
+            return;
 
         ring R = m_RE.R;
         rChangeCurrRing(R);
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation begin ===");
-        LOG_INFO(g_log, "singular", "Query: ∃ i such that (A_i - B_i) ∈ < M, {eqP_j | eqP_j is TRUE} > ?");
 
-        // Collect TRUE eqP polynomials as generators (and remember their atoms).
         std::vector<expr> true_eqp_atoms;
         std::vector<poly> gens;
         gens.reserve(1 + m_eqp.size());
 
-        // modulus generator: M (as poly)
         gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
 
         for (auto &ep : m_eqp)
@@ -1428,7 +1554,7 @@ class PolyPropagator : public user_propagator_base
         ideal I = ideal_from_polys(gens, m_RE);
         print_ideal("I", I, R);
 
-        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I)...");
+        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
         LOG_DEBUG(g_log, "kStd", "---------------start---------------");
         ideal G = groebner_std(I, R);
         LOG_DEBUG(g_log, "kStd", "---------------end---------------");
@@ -1436,10 +1562,11 @@ class PolyPropagator : public user_propagator_base
         print_ideal("G", G, R);
 
         bool hit = false;
+        expr hit_atom = ctx().bool_val(false);
+
         for (auto &cp : m_eqmodp)
         {
             poly d = p_Copy(cp.D, R);
-            rChangeCurrRing(R);
 
             LOG_DEBUG(g_log, "knf", "---------------start---------------");
             poly nf = kNF(G, currRing->qideal, d, 0, 0);
@@ -1464,6 +1591,7 @@ class PolyPropagator : public user_propagator_base
                          "[eqmodP1] all-false refute: " + label_of(cp.atom) +
                              " has D in <M, {TRUE eqP}>; cannot be FALSE");
                 hit = true;
+                hit_atom = cp.atom;
                 break;
             }
         }
@@ -1478,6 +1606,9 @@ class PolyPropagator : public user_propagator_base
             for (auto &a : true_eqp_atoms)
                 ants.push_back(a);
 
+            if (!hit_atom.is_false())
+                ants.push_back(hit_atom);
+
             conflict_with(ants);
         }
 
@@ -1489,6 +1620,187 @@ class PolyPropagator : public user_propagator_base
         LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
     }
 
+    // ---------------- eqmodP1: all-true ----------------
+    void check_eqmodP1_all_true_refutation()
+    {
+        if (!ENABLE_ALL_TRUE)
+            return;
+        if (m_eqmodp.empty())
+            return;
+
+        for (auto &cp : m_eqmodp)
+        {
+            Z3_lbool bv = lbool_of(cp.atom);
+            if (bv == Z3_L_UNDEF)
+                return;
+            if (bv != Z3_L_TRUE)
+                return;
+            if (!cp.modulus_ok)
+                return;
+        }
+
+        if (!same_modulus_across_eqmodp())
+            return;
+
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        LOG_INFO(g_log, "singular", "=== eqmodP1(all-true) refutation begin ===");
+
+        std::vector<expr> ants;
+        std::vector<poly> gens = collect_true_context_generators(ants);
+        if (gens.empty())
+            return;
+
+        ideal J = ideal_from_polys(gens, m_RE);
+        print_ideal("J_all_true", J, R);
+
+        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
+        LOG_DEBUG(g_log, "kStd", "---------------start---------------");
+        ideal G = groebner_std(J, R);
+        LOG_DEBUG(g_log, "kStd", "---------------end---------------");
+
+        print_ideal("G_all_true", G, R);
+
+        poly one = poly_from_si(1, R);
+
+        LOG_DEBUG(g_log, "knf", "---------------start---------------");
+        poly nf = kNF(G, currRing->qideal, one, 0, 0);
+        LOG_DEBUG(g_log, "knf", "---------------end---------------");
+
+        bool unsat = nf_is_zero(nf);
+
+        LOG_INFO(g_log, "singular",
+                 "ALL-TRUE check: NF_G(1)=" + poly_to_string(nf, R) +
+                     " ; 1 ∈ J ? " + std::string(unsat ? "YES" : "NO"));
+
+        if (nf)
+            p_Delete(&nf, R);
+        if (G)
+            idDelete(&G);
+        if (J)
+            idDelete(&J);
+
+        if (unsat)
+        {
+            LOG_INFO(g_log, "singular", "[eqmodP1] all-true refute: 1 ∈ J");
+            conflict_with(ants);
+        }
+
+        LOG_INFO(g_log, "singular", "=== eqmodP1(all-true) refutation end ===");
+    }
+
+    // ---------------- eqmodP1: mixed ----------------
+    void check_eqmodP1_mixed_refutation()
+    {
+        if (!ENABLE_MIXED)
+            return;
+        if (m_eqmodp.empty())
+            return;
+
+        bool has_true = false;
+        bool has_false = false;
+
+        for (auto &cp : m_eqmodp)
+        {
+            Z3_lbool bv = lbool_of(cp.atom);
+            if (bv == Z3_L_UNDEF)
+                return;
+            if (!cp.modulus_ok)
+                return;
+
+            if (bv == Z3_L_TRUE)
+                has_true = true;
+            else if (bv == Z3_L_FALSE)
+                has_false = true;
+        }
+
+        if (!(has_true && has_false))
+            return;
+
+        if (!same_modulus_across_eqmodp())
+            return;
+
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation begin ===");
+
+        std::vector<expr> true_context_ants;
+        std::vector<poly> gens = collect_true_context_generators(true_context_ants);
+        if (gens.empty())
+            return;
+
+        ideal J = ideal_from_polys(gens, m_RE);
+        print_ideal("J_mixed", J, R);
+
+        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
+        LOG_DEBUG(g_log, "kStd", "---------------start---------------");
+        ideal G = groebner_std(J, R);
+        LOG_DEBUG(g_log, "kStd", "---------------end---------------");
+
+        print_ideal("G_mixed", G, R);
+
+        bool hit = false;
+        expr hit_atom = ctx().bool_val(false);
+
+        for (auto &cp : m_eqmodp)
+        {
+            if (lbool_of(cp.atom) != Z3_L_FALSE)
+                continue;
+
+            poly d = p_Copy(cp.D, R);
+
+            LOG_DEBUG(g_log, "knf", "---------------start---------------");
+            poly nf = kNF(G, currRing->qideal, d, 0, 0);
+            LOG_DEBUG(g_log, "knf", "---------------end---------------");
+
+            bool in = nf_is_zero(nf);
+
+            LOG_INFO(g_log, "singular",
+                     "MIXED query instance: " + label_of(cp.atom) +
+                         " ; D=" + poly_to_string(cp.D, R) +
+                         " ; NF_G(D)=" + poly_to_string(nf, R) +
+                         " ; D ∈ J ? " + std::string(in ? "YES" : "NO"));
+
+            if (nf)
+                p_Delete(&nf, R);
+            if (d)
+                p_Delete(&d, R);
+
+            if (in)
+            {
+                LOG_INFO(g_log, "singular",
+                         "[eqmodP1] mixed refute: " + label_of(cp.atom) +
+                             " has D in J; cannot be FALSE");
+                hit = true;
+                hit_atom = cp.atom;
+                break;
+            }
+        }
+
+        if (G)
+            idDelete(&G);
+        if (J)
+            idDelete(&J);
+
+        if (hit)
+        {
+            std::vector<expr> ants = true_context_ants;
+            ants.push_back(hit_atom);
+            conflict_with(ants);
+        }
+
+        LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation end ===");
+    }
+
+    void check_eqmodP1_conflicts()
+    {
+        check_eqmodP1_all_false_refutation();
+        check_eqmodP1_all_true_refutation();
+        check_eqmodP1_mixed_refutation();
+    }
+
 public:
     PolyPropagator(solver *s,
                    const std::vector<expr> &eqps,
@@ -1498,9 +1810,10 @@ public:
                    const IndetEnv &env,
                    const CoeffVarMap &cmap,
                    const std::vector<std::string> &indet_ring_names,
-                   const std::vector<std::string> &ring_vars)
+                   const std::vector<std::string> &ring_vars,
+                   const std::vector<std::string> &qvar_names)
         : user_propagator_base(s), m_env(env), m_cmap(cmap),
-          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars)
+          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names)
     {
         init_singular();
 
@@ -1540,6 +1853,9 @@ public:
             m_eqp.push_back(std::move(cp));
         }
 
+        if (m_qvar_names.size() < eqmodsP1.size())
+            throw std::runtime_error("qvar_names size is smaller than eqmodsP1 size");
+
         for (size_t i = 0; i < eqmodsP1.size(); ++i)
         {
             auto &em = eqmodsP1[i];
@@ -1553,7 +1869,8 @@ public:
             EqModPCompiled cp = compile_eqmodP1_singular(em, em.arg(0), em.arg(1), em.arg(2),
                                                          label,
                                                          m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                         m_Nc);
+                                                         m_Nc,
+                                                         m_qvar_names[i]);
             m_eqmodp.push_back(std::move(cp));
         }
     }
@@ -1562,9 +1879,10 @@ public:
                    const IndetEnv &env,
                    const CoeffVarMap &cmap,
                    const std::vector<std::string> &indet_ring_names,
-                   const std::vector<std::string> &ring_vars)
+                   const std::vector<std::string> &ring_vars,
+                   const std::vector<std::string> &qvar_names)
         : user_propagator_base(c), m_env(env), m_cmap(cmap),
-          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars)
+          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names)
     {
         init_singular();
         register_fixed();
@@ -1597,6 +1915,14 @@ public:
                 if (cp.M_poly)
                     p_Delete(&cp.M_poly, R);
                 cp.M_poly = nullptr;
+
+                if (cp.U_poly)
+                    p_Delete(&cp.U_poly, R);
+                cp.U_poly = nullptr;
+
+                if (cp.true_gen)
+                    p_Delete(&cp.true_gen, R);
+                cp.true_gen = nullptr;
             }
 
             for (auto &ep : m_eqp)
@@ -1640,8 +1966,7 @@ public:
 
             m_eqp.push_back(std::move(cp));
 
-            // eqP changes can enable all-false refutation
-            check_eqmodP1_all_false_refutation();
+            check_eqmodP1_conflicts();
             return;
         }
 
@@ -1653,16 +1978,21 @@ public:
             this->add(B);
             this->add(M);
 
-            std::string label = "eqmodP1#" + std::to_string((int)m_eqmodp.size());
+            size_t idx = m_eqmodp.size();
+            if (idx >= m_qvar_names.size())
+                throw std::runtime_error("created(eqmodP1): no preallocated qvar name; ensure all eqmodP1 are present in input SMT2");
+
+            std::string label = "eqmodP1#" + std::to_string((int)idx);
             m_label[(Z3_ast)t] = label;
 
             EqModPCompiled cp = compile_eqmodP1_singular(t, A, B, M,
                                                          label,
                                                          m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                         m_Nc);
+                                                         m_Nc,
+                                                         m_qvar_names[idx]);
             m_eqmodp.push_back(std::move(cp));
 
-            check_eqmodP1_all_false_refutation();
+            check_eqmodP1_conflicts();
             return;
         }
     }
@@ -1682,25 +2012,25 @@ public:
             if (t.is_app() && t.decl().name().str() == "eqP" && t.num_args() == 2)
             {
                 on_fixed_eqP(t, bv);
-                check_eqmodP1_all_false_refutation();
+                check_eqmodP1_conflicts();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
             {
-                check_eqmodP1_all_false_refutation();
+                check_eqmodP1_conflicts();
             }
         }
     }
 
     void final() override
     {
-        check_eqmodP1_all_false_refutation();
+        check_eqmodP1_conflicts();
         std::cout << "===== [final] =====\n";
     }
 
     user_propagator_base *fresh(context &nctx) override
     {
-        return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars);
+        return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars, m_qvar_names);
     }
 };
 
@@ -1734,9 +2064,10 @@ int main(int argc, char **argv)
         {
             std::cerr << "Usage: " << argv[0]
                       << " <input.smt2> [--quiet] [--ring-detail] [--no-pow-stats] [--no-pow-base]"
-                         " [--expr-len=N]\n";
+                         " [--expr-len=N] [--disable-all-false] [--disable-all-true] [--disable-mixed]\n";
             return 1;
         }
+
         for (int i = 2; i < argc; ++i)
         {
             std::string a = argv[i];
@@ -1753,9 +2084,16 @@ int main(int argc, char **argv)
             if (a == "--env")
                 ENV = true;
             if (a == "--skipal")
-                SKIP_ALL_TRUE = true; // unused now
+                SKIP_ALL_TRUE = true;
             if (a == "--no-trace")
                 g_log.set_global(LogLevel::Debug);
+
+            if (a == "--disable-all-false")
+                ENABLE_ALL_FALSE = false;
+            if (a == "--disable-all-true")
+                ENABLE_ALL_TRUE = false;
+            if (a == "--disable-mixed")
+                ENABLE_MIXED = false;
 
             if (a.rfind("--expr-len=", 0) == 0)
                 LOG_EXPR_MAXLEN = std::stoul(a.substr(std::string("--expr-len=").size()));
@@ -1871,17 +2209,25 @@ int main(int argc, char **argv)
             indet_ring_names[i] = make_unique_name(base, used);
         }
 
+        std::vector<std::string> qvar_names(eqmodsP1.size());
+        for (size_t i = 0; i < eqmodsP1.size(); ++i)
+        {
+            qvar_names[i] = make_unique_name("u_mod_" + std::to_string(i), used);
+        }
+
         std::vector<std::string> ring_vars;
-        ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size());
+        ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() + qvar_names.size());
         ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
         ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
+        ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
 
         LOG_TRACE(g_log, "init",
                   "Initializing propagator with " +
                       std::to_string(eqps.size()) + " eqP constraint(s), " +
                       std::to_string(eqmodsP1.size()) + " eqmodP1 constraint(s).");
 
-        PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1, env, cmap, indet_ring_names, ring_vars);
+        PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1,
+                          env, cmap, indet_ring_names, ring_vars, qvar_names);
 
         auto t0 = clk::now();
         check_result r = s.check();
