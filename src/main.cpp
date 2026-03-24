@@ -196,6 +196,52 @@ static std::vector<expr> parse_smt2_assertions(context &ctx, const std::string &
 }
 
 // ---------------- helpers ----------------
+static bool is_tracking_symbol_name(const std::string &name)
+{
+    if (name.size() < 3)
+        return false;
+    if (name[0] != 'A' || name[1] != '#')
+        return false;
+    for (size_t i = 2; i < name.size(); ++i)
+    {
+        if (!std::isdigit((unsigned char)name[i]))
+            return false;
+    }
+    return true;
+}
+
+static void print_model_filtered(const z3::model &m)
+{
+    std::cout << "Model:\n";
+
+    Z3_context c = (Z3_context)m.ctx();
+    Z3_model zm = (Z3_model)m;
+
+    for (unsigned i = 0; i < m.size(); ++i)
+    {
+        z3::func_decl fd = m[i];
+        std::string name = fd.name().str();
+
+        if (is_tracking_symbol_name(name))
+            continue;
+
+        if (fd.arity() != 0)
+            continue;
+
+        Z3_func_decl zfd = (Z3_func_decl)fd;
+        Z3_ast ast = Z3_model_get_const_interp(c, zm, zfd);
+        if (ast == nullptr)
+            continue;
+
+        z3::expr val(m.ctx(), ast);
+
+        std::cout << "(define-fun " << name
+                  << " () " << fd.range()
+                  << "\n  " << val
+                  << ")\n";
+    }
+}
+
 static bool is_poly_sort(const sort &s)
 {
     if (!s.is_datatype())
@@ -2237,8 +2283,7 @@ int main(int argc, char **argv)
 
         std::cout << "Solver result: " << r << "\n";
         if (SHOW_MODEL && r == sat)
-            std::cout << "Model:\n"
-                      << s.get_model() << "\n";
+            print_model_filtered(s.get_model());
 
         std::cout << "[timer] z3.check() = " << fmt_duration(t1 - t0) << "\n";
 
