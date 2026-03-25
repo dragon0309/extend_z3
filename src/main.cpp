@@ -1354,6 +1354,7 @@ class PolyPropagator : public user_propagator_base
     std::vector<EqModPCompiled> m_eqmodp;
 
     std::unordered_map<Z3_ast, Z3_lbool> m_bool_cache;
+    std::unordered_map<Z3_ast, Z3_ast> m_fixed_ast_cache;
 
     RingEnv m_RE;
 
@@ -1393,6 +1394,347 @@ class PolyPropagator : public user_propagator_base
         if (it == m_bool_cache.end())
             return Z3_L_UNDEF;
         return it->second;
+    }
+
+    bool try_get_fixed_expr(const expr &t, expr &out) const
+    {
+        auto it = m_fixed_ast_cache.find((Z3_ast)t);
+        if (it == m_fixed_ast_cache.end())
+            return false;
+        if (it->second == nullptr)
+            return false;
+        expr v(t.ctx(), it->second);
+        out = v;
+        return true;
+    }
+
+    void cache_fixed_expr(const expr &t, const expr &v)
+    {
+        Z3_ast key = (Z3_ast)t;
+        Z3_ast val = (Z3_ast)v;
+        if (key == nullptr || val == nullptr)
+            return;
+
+        auto it = m_fixed_ast_cache.find(key);
+        if (it != m_fixed_ast_cache.end())
+        {
+            if (it->second == val)
+                return;
+            Z3_dec_ref((Z3_context)ctx(), it->second);
+            it->second = val;
+            Z3_inc_ref((Z3_context)ctx(), val);
+            return;
+        }
+
+        m_fixed_ast_cache.emplace(key, val);
+        Z3_inc_ref((Z3_context)ctx(), val);
+    }
+
+    static bool parse_z3_numeral_to_mpz(const expr &e, mpz_class &out)
+    {
+        if (!e.is_numeral())
+            return false;
+        Z3_string s = Z3_get_numeral_string((Z3_context)e.ctx(), (Z3_ast)e);
+        mpz_class v;
+        if (v.set_str(s, 10) != 0)
+            return false;
+        out = v;
+        return true;
+    }
+
+    bool try_eval_bv_with_fixed_values(const expr &e, mpz_class &out) const
+    {
+        if (e.is_numeral() && e.get_sort().is_bv())
+            return parse_z3_numeral_to_mpz(e, out);
+
+        expr fv = e;
+        if (try_get_fixed_expr(e, fv))
+        {
+            if (z3::eq(fv, e))
+                return false;
+            return try_eval_bv_with_fixed_values(fv, out);
+        }
+
+        return false;
+    }
+
+    bool try_eval_int_with_fixed_values(const expr &e, mpz_class &out) const
+    {
+        if (e.is_numeral() && e.get_sort().is_int())
+            return parse_z3_numeral_to_mpz(e, out);
+
+        expr fv = e;
+        if (try_get_fixed_expr(e, fv))
+        {
+            if (z3::eq(fv, e))
+                return false;
+            return try_eval_int_with_fixed_values(fv, out);
+        }
+
+        if (!e.is_app())
+            return false;
+
+        const std::string op = e.decl().name().str();
+
+        if (op == "-" && e.num_args() == 1)
+        {
+            mpz_class a;
+            if (!try_eval_int_with_fixed_values(e.arg(0), a))
+                return false;
+            out = -a;
+            return true;
+        }
+
+        if ((op == "+" || op == "-" || op == "*") && e.num_args() == 2)
+        {
+            mpz_class a, b;
+            if (!try_eval_int_with_fixed_values(e.arg(0), a))
+                return false;
+            if (!try_eval_int_with_fixed_values(e.arg(1), b))
+                return false;
+
+            if (op == "+")
+                out = a + b;
+            else if (op == "-")
+                out = a - b;
+            else
+                out = a * b;
+            return true;
+        }
+
+        if (is_bv_to_int_app(e) && e.num_args() == 1)
+        {
+            mpz_class bv;
+            if (!try_eval_bv_with_fixed_values(e.arg(0), bv))
+                return false;
+            out = bv;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool try_eval_polyterm_with_fixed_values(const expr &p, mpz_class &out) const
+    {
+        if (is_ctor(p, "PConst", 1))
+            return try_eval_int_with_fixed_values(p.arg(0), out);
+
+        if (is_ctor(p, "PNeg", 1))
+        {
+            mpz_class a;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
+                return false;
+            out = -a;
+            return true;
+        }
+        if (is_ctor(p, "PAdd", 2))
+        {
+            mpz_class a, b;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
+                return false;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
+                return false;
+            out = a + b;
+            return true;
+        }
+        if (is_ctor(p, "PSub", 2))
+        {
+            mpz_class a, b;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
+                return false;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
+                return false;
+            out = a - b;
+            return true;
+        }
+        if (is_ctor(p, "PMul", 2))
+        {
+            mpz_class a, b;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
+                return false;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
+                return false;
+            out = a * b;
+            return true;
+        }
+        if (is_ctor(p, "PPow", 2))
+        {
+            int64_t k = 0;
+            if (!get_int64_numeral(p.arg(1), k) || k < 0)
+                return false;
+            mpz_class base;
+            if (!try_eval_polyterm_with_fixed_values(p.arg(0), base))
+                return false;
+            mpz_class res = 1;
+            for (int64_t i = 0; i < k; ++i)
+                res *= base;
+            out = res;
+            return true;
+        }
+
+        return false;
+    }
+
+    static void collect_int_bv_subterms_rec(const expr &e,
+                                            std::unordered_set<Z3_ast> &seen,
+                                            std::vector<expr> &out)
+    {
+        if ((e.get_sort().is_int() || e.get_sort().is_bv()) && !e.is_numeral())
+        {
+            Z3_ast k = (Z3_ast)e;
+            if (seen.insert(k).second)
+                out.push_back(e);
+        }
+        for (unsigned i = 0; i < e.num_args(); ++i)
+            collect_int_bv_subterms_rec(e.arg(i), seen, out);
+    }
+
+    static void collect_eval_terms_from_polyterm_rec(const expr &p,
+                                                     std::unordered_set<Z3_ast> &seen,
+                                                     std::vector<expr> &out)
+    {
+        if (is_ctor(p, "PConst", 1))
+        {
+            collect_int_bv_subterms_rec(p.arg(0), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PNeg", 1))
+        {
+            collect_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PAdd", 2) || is_ctor(p, "PSub", 2) || is_ctor(p, "PMul", 2))
+        {
+            collect_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            collect_eval_terms_from_polyterm_rec(p.arg(1), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PPow", 2))
+        {
+            collect_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            collect_int_bv_subterms_rec(p.arg(1), seen, out);
+            return;
+        }
+    }
+
+    void register_eval_terms_for_eqmod_atom(const expr &A, const expr &B, const expr &M)
+    {
+        std::unordered_set<Z3_ast> seen;
+        std::vector<expr> terms;
+        collect_eval_terms_from_polyterm_rec(A, seen, terms);
+        collect_eval_terms_from_polyterm_rec(B, seen, terms);
+        collect_eval_terms_from_polyterm_rec(M, seen, terms);
+        for (const auto &t : terms)
+            this->add(t);
+    }
+
+    void collect_fixed_ants_from_polyterm(const expr &p,
+                                          std::unordered_set<Z3_ast> &seen,
+                                          std::vector<expr> &ants) const
+    {
+        std::unordered_set<Z3_ast> eval_seen;
+        std::vector<expr> eval_terms;
+        collect_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
+
+        for (const auto &t : eval_terms)
+        {
+            expr v = t;
+            if (!try_get_fixed_expr(t, v))
+                continue;
+
+            // Keep only terms that are concretely fixed now.
+            if (!(v.is_numeral() || v.is_true() || v.is_false()))
+                continue;
+
+            Z3_ast k = (Z3_ast)t;
+            if (seen.insert(k).second)
+                ants.push_back(t);
+        }
+    }
+
+    bool final_fixed_value_check_eqmodP1()
+    {
+        if (m_eqmodp.empty())
+            return true;
+
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        for (auto &cp : m_eqmodp)
+        {
+            Z3_lbool bv = lbool_of(cp.atom);
+            if (bv == Z3_L_UNDEF)
+                continue;
+
+            mpz_class a, b, m;
+            bool ok_a = try_eval_polyterm_with_fixed_values(cp.A, a);
+            bool ok_b = try_eval_polyterm_with_fixed_values(cp.B, b);
+            bool ok_m = try_eval_polyterm_with_fixed_values(cp.Mterm, m);
+            if (!(ok_a && ok_b && ok_m))
+            {
+                LOG_INFO(g_log, "singular",
+                         "[eqmodP1] final fixed-value check conflict: " + label_of(cp.atom) +
+                             " ; reason=insufficient fixed values for A/B/M evaluation");
+                conflict_with({cp.atom});
+                return false;
+            }
+
+            bool semantic_truth = false;
+            mpz_class d = a - b;
+
+            if (m == 0)
+            {
+                semantic_truth = (a == b);
+            }
+            else
+            {
+                poly pM = poly_from_mpz(m, R);
+                poly pD = poly_from_mpz(d, R);
+
+                std::vector<poly> gens;
+                gens.push_back(pM);
+                ideal I = ideal_from_polys(gens, m_RE);
+                ideal G = groebner_std(I, R);
+                poly nf = kNF(G, NULL, pD, 0, 0);
+
+                semantic_truth = nf_is_zero(nf);
+
+                if (nf)
+                    p_Delete(&nf, R);
+                if (pD)
+                    p_Delete(&pD, R);
+                if (G)
+                    idDelete(&G);
+                if (I)
+                    idDelete(&I);
+            }
+
+            bool assigned_truth = (bv == Z3_L_TRUE);
+            if (assigned_truth != semantic_truth)
+            {
+                LOG_INFO(g_log, "singular",
+                         "[eqmodP1] final fixed-value check conflict: " + label_of(cp.atom) +
+                             " ; a=" + a.get_str() +
+                             " ; b=" + b.get_str() +
+                             " ; m=" + m.get_str() +
+                             " ; assigned=" + std::string(assigned_truth ? "true" : "false") +
+                             " ; semantic=" + std::string(semantic_truth ? "true" : "false"));
+
+                std::vector<expr> ants;
+                ants.push_back(cp.atom);
+
+                std::unordered_set<Z3_ast> seen;
+                seen.insert((Z3_ast)cp.atom);
+                collect_fixed_ants_from_polyterm(cp.A, seen, ants);
+                collect_fixed_ants_from_polyterm(cp.B, seen, ants);
+                collect_fixed_ants_from_polyterm(cp.Mterm, seen, ants);
+
+                conflict_with(ants);
+                return false;
+            }
+        }
+
+        return true;
     }
 
     void add_and_propagate_all(const expr &ante, const std::vector<expr> &cons)
@@ -1603,9 +1945,7 @@ class PolyPropagator : public user_propagator_base
         print_ideal("I", I, R);
 
         LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
-        LOG_DEBUG(g_log, "kStd", "---------------start---------------");
         ideal G = groebner_std(I, R);
-        LOG_DEBUG(g_log, "kStd", "---------------end---------------");
 
         print_ideal("G", G, R);
 
@@ -1616,9 +1956,7 @@ class PolyPropagator : public user_propagator_base
         {
             poly d = p_Copy(cp.D, R);
 
-            LOG_DEBUG(g_log, "knf", "---------------start---------------");
             poly nf = kNF(G, NULL, d, 0, 0);
-            LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
             bool in = nf_is_zero(nf);
 
@@ -1704,17 +2042,13 @@ class PolyPropagator : public user_propagator_base
         print_ideal("J_all_true", J, R);
 
         LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-        LOG_DEBUG(g_log, "kStd", "---------------start---------------");
         ideal G = groebner_std(J, R);
-        LOG_DEBUG(g_log, "kStd", "---------------end---------------");
 
         print_ideal("G_all_true", G, R);
 
         poly one = poly_from_si(1, R);
 
-        LOG_DEBUG(g_log, "knf", "---------------start---------------");
         poly nf = kNF(G, NULL, one, 0, 0);
-        LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
         bool unsat = nf_is_zero(nf);
 
@@ -1783,9 +2117,7 @@ class PolyPropagator : public user_propagator_base
         print_ideal("J_mixed", J, R);
 
         LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-        LOG_DEBUG(g_log, "kStd", "---------------start---------------");
         ideal G = groebner_std(J, R);
-        LOG_DEBUG(g_log, "kStd", "---------------end---------------");
 
         print_ideal("G_mixed", G, R);
 
@@ -1799,9 +2131,7 @@ class PolyPropagator : public user_propagator_base
 
             poly d = p_Copy(cp.D, R);
 
-            LOG_DEBUG(g_log, "knf", "---------------start---------------");
             poly nf = kNF(G, NULL, d, 0, 0);
-            LOG_DEBUG(g_log, "knf", "---------------end---------------");
 
             bool in = nf_is_zero(nf);
 
@@ -1910,6 +2240,7 @@ public:
             this->add(em);
             for (unsigned j = 0; j < 3; ++j)
                 this->add(em.arg(j));
+            register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2));
 
             std::string label = "eqmodP1#" + std::to_string(i);
             m_label[(Z3_ast)em] = label;
@@ -1949,6 +2280,11 @@ public:
 
     ~PolyPropagator() override
     {
+        for (auto &kv : m_fixed_ast_cache)
+            if (kv.second != nullptr)
+                Z3_dec_ref((Z3_context)ctx(), kv.second);
+        m_fixed_ast_cache.clear();
+
         ring R = m_RE.R;
         if (R)
         {
@@ -2025,6 +2361,7 @@ public:
             this->add(A);
             this->add(B);
             this->add(M);
+            register_eval_terms_for_eqmod_atom(A, B, M);
 
             size_t idx = m_eqmodp.size();
             if (idx >= m_qvar_names.size())
@@ -2048,6 +2385,7 @@ public:
     void fixed(const expr &t, const expr &v) override
     {
         log_fixed(t, v);
+        cache_fixed_expr(t, v);
 
         if (t.is_numeral())
             return;
@@ -2073,6 +2411,7 @@ public:
     void final() override
     {
         check_eqmodP1_conflicts();
+        final_fixed_value_check_eqmodP1();
         std::cout << "===== [final] =====\n";
     }
 
