@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -39,12 +40,39 @@ static constexpr int64_t MAX_POW_EXPAND = 65536;
 static size_t LOG_EXPR_MAXLEN = 20000000;
 static Logger g_log;
 
+class TeeStreamBuf : public std::streambuf
+{
+    std::streambuf *a_;
+    std::streambuf *b_;
+
+public:
+    TeeStreamBuf(std::streambuf *a, std::streambuf *b) : a_(a), b_(b) {}
+
+protected:
+    int overflow(int ch) override
+    {
+        if (ch == EOF)
+            return !EOF;
+        const int ra = a_ ? a_->sputc((char)ch) : ch;
+        const int rb = b_ ? b_->sputc((char)ch) : ch;
+        return (ra == EOF || rb == EOF) ? EOF : ch;
+    }
+
+    int sync() override
+    {
+        const int sa = a_ ? a_->pubsync() : 0;
+        const int sb = b_ ? b_->pubsync() : 0;
+        return (sa == 0 && sb == 0) ? 0 : -1;
+    }
+};
+
 static bool ORDER = true;
 static bool ENV = false;
 static bool SKIP_ALL_TRUE = false; // unused now
 static bool ENABLE_ALL_FALSE = true;
 static bool ENABLE_ALL_TRUE = true;
 static bool ENABLE_MIXED = true;
+static bool ALL_FALSE_ASSUME_M_PRIME = false;
 
 static void init_singular()
 {
@@ -1949,6 +1977,59 @@ class PolyPropagator : public user_propagator_base
 
         print_ideal("G", G, R);
 
+        if (ALL_FALSE_ASSUME_M_PRIME)
+        {
+            // Product refutation under the assumption that R/<m> is an integral domain
+            // (e.g., m is prime / irreducible polynomial).
+            poly prod = nullptr;
+            for (auto &cp : m_eqmodp)
+            {
+                if (!prod)
+                {
+                    prod = p_Copy(cp.D, R);
+                }
+                else
+                {
+                    poly next = poly_mul_clone(prod, cp.D, R);
+                    p_Delete(&prod, R);
+                    prod = next;
+                }
+            }
+
+            poly nf = kNF(G, NULL, p_Copy(prod, R), 0, 0);
+            bool in = nf_is_zero(nf);
+
+            LOG_INFO(g_log, "singular",
+                     "Product query: P=" + poly_to_string(prod, R) +
+                         " ; NF_G(P)=" + poly_to_string(nf, R) +
+                         " ; P ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
+
+            if (in)
+            {
+                LOG_INFO(g_log, "singular",
+                         "[eqmodP1] all-false product refute: P in <M, {TRUE eqP}>; all-false assignment is impossible");
+                std::vector<expr> ants;
+                ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
+                for (auto &cp : m_eqmodp)
+                    ants.push_back(cp.atom);
+                for (auto &a : true_eqp_atoms)
+                    ants.push_back(a);
+                conflict_with(ants);
+            }
+
+            if (nf)
+                p_Delete(&nf, R);
+            if (prod)
+                p_Delete(&prod, R);
+            if (G)
+                idDelete(&G);
+            if (I)
+                idDelete(&I);
+
+            LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
+            return;
+        }
+
         bool hit = false;
         expr hit_atom = ctx().bool_val(false);
 
@@ -2179,6 +2260,28 @@ class PolyPropagator : public user_propagator_base
         check_eqmodP1_mixed_refutation();
     }
 
+    bool all_eqp_eqmodp_fixed() const
+    {
+        for (const auto &ep : m_eqp)
+        {
+            if (lbool_of(ep.atom) == Z3_L_UNDEF)
+                return false;
+        }
+        for (const auto &cp : m_eqmodp)
+        {
+            if (lbool_of(cp.atom) == Z3_L_UNDEF)
+                return false;
+        }
+        return true;
+    }
+
+    void check_eqmodP1_conflicts_when_ready()
+    {
+        if (!all_eqp_eqmodp_fixed())
+            return;
+        check_eqmodP1_conflicts();
+    }
+
 public:
     PolyPropagator(solver *s,
                    const std::vector<expr> &eqps,
@@ -2350,7 +2453,7 @@ public:
 
             m_eqp.push_back(std::move(cp));
 
-            check_eqmodP1_conflicts();
+            check_eqmodP1_conflicts_when_ready();
             return;
         }
 
@@ -2377,7 +2480,7 @@ public:
                                                          m_qvar_names[idx]);
             m_eqmodp.push_back(std::move(cp));
 
-            check_eqmodP1_conflicts();
+            check_eqmodP1_conflicts_when_ready();
             return;
         }
     }
@@ -2398,19 +2501,19 @@ public:
             if (t.is_app() && t.decl().name().str() == "eqP" && t.num_args() == 2)
             {
                 on_fixed_eqP(t, bv);
-                check_eqmodP1_conflicts();
+                check_eqmodP1_conflicts_when_ready();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
             {
-                check_eqmodP1_conflicts();
+                check_eqmodP1_conflicts_when_ready();
             }
         }
     }
 
     void final() override
     {
-        check_eqmodP1_conflicts();
+        // check_eqmodP1_conflicts_when_ready();
         final_fixed_value_check_eqmodP1();
         std::cout << "===== [final] =====\n";
     }
@@ -2443,7 +2546,19 @@ static int coeff_priority_rank(const std::string &pretty)
 
 int main(int argc, char **argv)
 {
-    g_log.enable_file("run.log");
+    std::ofstream runlog("run.log", std::ios::out | std::ios::trunc);
+    if (!runlog.is_open())
+    {
+        std::cerr << "Error: cannot open run.log for writing\n";
+        return 1;
+    }
+
+    std::streambuf *orig_cout = std::cout.rdbuf();
+    std::streambuf *orig_cerr = std::cerr.rdbuf();
+    TeeStreamBuf tee_cout(orig_cout, runlog.rdbuf());
+    TeeStreamBuf tee_cerr(orig_cerr, runlog.rdbuf());
+    std::cout.rdbuf(&tee_cout);
+    std::cerr.rdbuf(&tee_cerr);
 
     try
     {
@@ -2451,7 +2566,8 @@ int main(int argc, char **argv)
         {
             std::cerr << "Usage: " << argv[0]
                       << " <input.smt2> [--quiet] [--ring-detail] [--no-pow-stats] [--no-pow-base]"
-                         " [--expr-len=N] [--disable-all-false] [--disable-all-true] [--disable-mixed]\n";
+                         " [--expr-len=N] [--disable-all-false] [--disable-all-true] [--disable-mixed]"
+                         " [--m-prime]\n";
             return 1;
         }
 
@@ -2481,6 +2597,8 @@ int main(int argc, char **argv)
                 ENABLE_ALL_TRUE = false;
             if (a == "--disable-mixed")
                 ENABLE_MIXED = false;
+            if (a == "--m-prime")
+                ALL_FALSE_ASSUME_M_PRIME = true;
 
             if (a.rfind("--expr-len=", 0) == 0)
                 LOG_EXPR_MAXLEN = std::stoul(a.substr(std::string("--expr-len=").size()));
@@ -2625,16 +2743,25 @@ int main(int argc, char **argv)
             print_model_filtered(s.get_model());
 
         std::cout << "[timer] z3.check() = " << fmt_duration(t1 - t0) << "\n";
+        std::cout.flush();
+        std::cerr.flush();
+        std::cout.rdbuf(orig_cout);
+        std::cerr.rdbuf(orig_cerr);
+        runlog.flush();
 
         return 0;
     }
     catch (const z3::exception &ex)
     {
+        std::cout.rdbuf(orig_cout);
+        std::cerr.rdbuf(orig_cerr);
         std::cerr << "Z3 error: " << ex.msg() << "\n";
         return 1;
     }
     catch (const std::exception &ex)
     {
+        std::cout.rdbuf(orig_cout);
+        std::cerr.rdbuf(orig_cerr);
         std::cerr << "Error: " << ex.what() << "\n";
         return 1;
     }
