@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -73,6 +74,7 @@ static bool ENABLE_ALL_FALSE = true;
 static bool ENABLE_ALL_TRUE = true;
 static bool ENABLE_MIXED = true;
 static bool ALL_FALSE_ASSUME_M_PRIME = false;
+static bool ENABLE_REWRITING = true;
 
 static void init_singular()
 {
@@ -356,6 +358,8 @@ static std::string make_unique_name(const std::string &base, std::unordered_set<
     }
 }
 
+static bool is_bv_to_int_app(const z3::expr &e);
+
 // ---------------- collectors ----------------
 static void collect_eqP_rec(const expr &e, std::vector<expr> &atoms)
 {
@@ -381,6 +385,619 @@ static void collect_eqmodP1_rec(const expr &e, std::vector<expr> &atoms)
     }
     for (unsigned i = 0; i < e.num_args(); ++i)
         collect_eqmodP1_rec(e.arg(i), atoms);
+}
+
+struct PolyCtorDecls
+{
+    Z3_func_decl pvar_decl = nullptr;
+    Z3_func_decl pconst_decl = nullptr;
+};
+
+static void collect_poly_ctor_decls_rec(const expr &e, PolyCtorDecls &decls)
+{
+    if (is_ctor(e, "PVar", 1) && decls.pvar_decl == nullptr)
+        decls.pvar_decl = (Z3_func_decl)e.decl();
+    if (is_ctor(e, "PConst", 1) && decls.pconst_decl == nullptr)
+        decls.pconst_decl = (Z3_func_decl)e.decl();
+
+    if (!e.is_app())
+        return;
+    for (unsigned i = 0; i < e.num_args(); ++i)
+        collect_poly_ctor_decls_rec(e.arg(i), decls);
+}
+
+static bool parse_int_numeral_mpz(const expr &e, mpz_class &out)
+{
+    if (!(e.is_numeral() && e.get_sort().is_int()))
+        return false;
+    Z3_string s = Z3_get_numeral_string((Z3_context)e.ctx(), (Z3_ast)e);
+    return out.set_str(s, 10) == 0;
+}
+
+using AffineTerms = std::unordered_map<std::string, mpz_class>;
+
+static void affine_add_scaled(AffineTerms &dst, const AffineTerms &src, const mpz_class &k)
+{
+    if (k == 0)
+        return;
+    for (const auto &kv : src)
+    {
+        dst[kv.first] += k * kv.second;
+        if (dst[kv.first] == 0)
+            dst.erase(kv.first);
+    }
+}
+
+static bool affine_extract_poly(const expr &p, AffineTerms &terms, mpz_class &cst);
+
+static bool affine_extract_int_expr(const expr &e, AffineTerms &terms, mpz_class &cst)
+{
+    terms.clear();
+    cst = 0;
+
+    if (parse_int_numeral_mpz(e, cst))
+        return true;
+
+    if (e.get_sort().is_int() && e.is_const() && !e.is_numeral())
+    {
+        terms[e.to_string()] = 1;
+        return true;
+    }
+
+    if (is_bv_to_int_app(e))
+    {
+        terms[e.to_string()] = 1;
+        return true;
+    }
+
+    if (!(e.is_app()))
+        return false;
+
+    const std::string op = e.decl().name().str();
+    if (op == "-" && e.num_args() == 1)
+    {
+        AffineTerms t;
+        mpz_class c;
+        if (!affine_extract_int_expr(e.arg(0), t, c))
+            return false;
+        affine_add_scaled(terms, t, mpz_class(-1));
+        cst = -c;
+        return true;
+    }
+
+    if ((op == "+" || op == "-") && e.num_args() == 2)
+    {
+        AffineTerms t1, t2;
+        mpz_class c1, c2;
+        if (!affine_extract_int_expr(e.arg(0), t1, c1))
+            return false;
+        if (!affine_extract_int_expr(e.arg(1), t2, c2))
+            return false;
+        terms = std::move(t1);
+        cst = c1;
+        affine_add_scaled(terms, t2, (op == "+") ? mpz_class(1) : mpz_class(-1));
+        cst += (op == "+") ? c2 : -c2;
+        return true;
+    }
+
+    if (op == "*" && e.num_args() == 2)
+    {
+        mpz_class k;
+        AffineTerms t;
+        mpz_class c;
+        if (parse_int_numeral_mpz(e.arg(0), k))
+        {
+            if (!affine_extract_int_expr(e.arg(1), t, c))
+                return false;
+            affine_add_scaled(terms, t, k);
+            cst = k * c;
+            return true;
+        }
+        if (parse_int_numeral_mpz(e.arg(1), k))
+        {
+            if (!affine_extract_int_expr(e.arg(0), t, c))
+                return false;
+            affine_add_scaled(terms, t, k);
+            cst = k * c;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+static bool extract_poly_int_constant(const expr &p, mpz_class &k)
+{
+    if (!is_ctor(p, "PConst", 1))
+        return false;
+    return parse_int_numeral_mpz(p.arg(0), k);
+}
+
+static bool affine_extract_poly(const expr &p, AffineTerms &terms, mpz_class &cst)
+{
+    terms.clear();
+    cst = 0;
+
+    if (is_ctor(p, "PVar", 1))
+    {
+        std::string nm;
+        if (!get_string_literal_smt(p.arg(0), nm))
+            return false;
+        terms[nm] = 1;
+        return true;
+    }
+
+    if (is_ctor(p, "PConst", 1))
+    {
+        if (parse_int_numeral_mpz(p.arg(0), cst))
+            return true;
+        return affine_extract_int_expr(p.arg(0), terms, cst);
+    }
+
+    if (is_ctor(p, "PNeg", 1))
+    {
+        AffineTerms t;
+        mpz_class c;
+        if (!affine_extract_poly(p.arg(0), t, c))
+            return false;
+        affine_add_scaled(terms, t, mpz_class(-1));
+        cst = -c;
+        return true;
+    }
+
+    if (is_ctor(p, "PAdd", 2) || is_ctor(p, "PSub", 2))
+    {
+        AffineTerms t1, t2;
+        mpz_class c1, c2;
+        if (!affine_extract_poly(p.arg(0), t1, c1))
+            return false;
+        if (!affine_extract_poly(p.arg(1), t2, c2))
+            return false;
+        terms = std::move(t1);
+        cst = c1;
+        affine_add_scaled(terms, t2, is_ctor(p, "PAdd", 2) ? mpz_class(1) : mpz_class(-1));
+        cst += is_ctor(p, "PAdd", 2) ? c2 : -c2;
+        return true;
+    }
+
+    if (is_ctor(p, "PMul", 2))
+    {
+        mpz_class k;
+        AffineTerms t;
+        mpz_class c;
+        if (extract_poly_int_constant(p.arg(0), k))
+        {
+            if (!affine_extract_poly(p.arg(1), t, c))
+                return false;
+            affine_add_scaled(terms, t, k);
+            cst = k * c;
+            return true;
+        }
+        if (extract_poly_int_constant(p.arg(1), k))
+        {
+            if (!affine_extract_poly(p.arg(0), t, c))
+                return false;
+            affine_add_scaled(terms, t, k);
+            cst = k * c;
+            return true;
+        }
+        return false;
+    }
+
+    if (is_ctor(p, "PPow", 2))
+    {
+        int64_t e64 = -1;
+        if (!get_int64_numeral(p.arg(1), e64) || e64 < 0)
+            return false;
+        if (e64 == 0)
+        {
+            cst = 1;
+            return true;
+        }
+        if (e64 == 1)
+            return affine_extract_poly(p.arg(0), terms, cst);
+        return false;
+    }
+
+    return false;
+}
+
+static bool affine_extract_eqp_difference(const expr &eqp, AffineTerms &terms, mpz_class &cst)
+{
+    if (!(eqp.is_app() && eqp.decl().name().str() == "eqP" && eqp.num_args() == 2))
+        return false;
+
+    AffineTerms ta, tb;
+    mpz_class ca, cb;
+    if (!affine_extract_poly(eqp.arg(0), ta, ca))
+        return false;
+    if (!affine_extract_poly(eqp.arg(1), tb, cb))
+        return false;
+
+    terms = std::move(ta);
+    cst = ca;
+    affine_add_scaled(terms, tb, mpz_class(-1));
+    cst -= cb;
+    return true;
+}
+
+class VarUF
+{
+    std::unordered_map<std::string, std::string> parent_;
+    std::unordered_map<std::string, bool> zero_root_;
+
+public:
+    void ensure(const std::string &x)
+    {
+        if (parent_.find(x) == parent_.end())
+        {
+            parent_[x] = x;
+            zero_root_[x] = false;
+        }
+    }
+
+    std::string find(const std::string &x)
+    {
+        ensure(x);
+        std::string p = parent_[x];
+        if (p == x)
+            return x;
+        std::string r = find(p);
+        parent_[x] = r;
+        return r;
+    }
+
+    void unite(const std::string &a, const std::string &b)
+    {
+        std::string ra = find(a), rb = find(b);
+        if (ra == rb)
+            return;
+        const std::string keep = (ra < rb) ? ra : rb;
+        const std::string other = (ra < rb) ? rb : ra;
+        parent_[other] = keep;
+        zero_root_[keep] = zero_root_[keep] || zero_root_[other];
+    }
+
+    void mark_zero(const std::string &x)
+    {
+        std::string r = find(x);
+        zero_root_[r] = true;
+    }
+
+    bool root_is_zero(const std::string &x)
+    {
+        std::string r = find(x);
+        return zero_root_[r];
+    }
+
+    std::vector<std::string> all_vars() const
+    {
+        std::vector<std::string> out;
+        out.reserve(parent_.size());
+        for (const auto &kv : parent_)
+            out.push_back(kv.first);
+        return out;
+    }
+};
+
+struct PolyRewriteRule
+{
+    bool to_zero = false;
+    bool to_const = false;
+    mpz_class const_value = 0;
+    std::string target;
+};
+
+static std::unordered_map<std::string, PolyRewriteRule>
+infer_poly_rewrite_rules(const std::vector<expr> &eqps)
+{
+    VarUF uf;
+    std::unordered_map<std::string, mpz_class> root_const;
+
+    auto set_root_const = [&](const std::string &v, const mpz_class &cst)
+    {
+        std::string r = uf.find(v);
+        auto it = root_const.find(r);
+        if (it == root_const.end())
+            root_const[r] = cst;
+        else if (it->second != cst)
+            root_const.erase(it);
+    };
+
+    for (const auto &eqp : eqps)
+    {
+        AffineTerms terms;
+        mpz_class cst;
+        if (!affine_extract_eqp_difference(eqp, terms, cst))
+            continue;
+        if (terms.size() == 2)
+        {
+            if (cst != 0)
+                continue;
+            auto it0 = terms.begin();
+            auto it1 = std::next(it0);
+            const std::string &v0 = it0->first;
+            const std::string &v1 = it1->first;
+            const mpz_class &k0 = it0->second;
+            const mpz_class &k1 = it1->second;
+            if ((k0 == 1 && k1 == -1) || (k0 == -1 && k1 == 1))
+            {
+                std::string r0 = uf.find(v0);
+                std::string r1 = uf.find(v1);
+                uf.unite(v0, v1);
+                std::string rn = uf.find(v0);
+                auto c0 = root_const.find(r0);
+                auto c1 = root_const.find(r1);
+                if (c0 != root_const.end() && c1 != root_const.end())
+                {
+                    if (c0->second == c1->second)
+                        root_const[rn] = c0->second;
+                }
+                else if (c0 != root_const.end())
+                    root_const[rn] = c0->second;
+                else if (c1 != root_const.end())
+                    root_const[rn] = c1->second;
+            }
+        }
+        else if (terms.size() == 1)
+        {
+            const auto &kv = *terms.begin();
+            if (kv.second == 1)
+                set_root_const(kv.first, -cst);
+            else if (kv.second == -1)
+                set_root_const(kv.first, cst);
+        }
+    }
+
+    std::unordered_map<std::string, PolyRewriteRule> out;
+    std::vector<std::string> vars = uf.all_vars();
+    for (const auto &v : vars)
+    {
+        std::string r = uf.find(v);
+        auto itc = root_const.find(r);
+        if (itc != root_const.end())
+        {
+            if (itc->second == 0)
+                out[v] = PolyRewriteRule{true, false, 0, ""};
+            else
+                out[v] = PolyRewriteRule{false, true, itc->second, ""};
+            continue;
+        }
+        if (r != v)
+            out[v] = PolyRewriteRule{false, false, 0, r};
+    }
+
+    return out;
+}
+
+static expr rewrite_poly_vars_rec(const expr &e,
+                                  const std::unordered_map<std::string, PolyRewriteRule> &rules,
+                                  const PolyCtorDecls &decls,
+                                  std::unordered_map<Z3_ast, Z3_ast> &memo,
+                                  std::unordered_map<std::string, Z3_ast> &pvar_cache,
+                                  Z3_ast &zero_poly_cache,
+                                  const std::unordered_map<std::string, Z3_ast> &int_atom_cache)
+{
+    auto it_memo = memo.find((Z3_ast)e);
+    if (it_memo != memo.end())
+        return expr(e.ctx(), it_memo->second);
+
+    context &c = e.ctx();
+    expr out = e;
+
+    if (is_ctor(e, "PVar", 1) && decls.pvar_decl != nullptr)
+    {
+        std::string nm;
+        if (get_string_literal_smt(e.arg(0), nm))
+        {
+            auto it = rules.find(nm);
+            if (it != rules.end())
+            {
+                if (it->second.to_zero && decls.pconst_decl != nullptr)
+                {
+                    if (zero_poly_cache == nullptr)
+                    {
+                        func_decl pconst(c, decls.pconst_decl);
+                        expr_vector args(c);
+                        args.push_back(c.int_val(0));
+                        zero_poly_cache = (Z3_ast)pconst(args);
+                    }
+                    out = expr(c, zero_poly_cache);
+                }
+                else if (it->second.to_const && decls.pconst_decl != nullptr)
+                {
+                    func_decl pconst(c, decls.pconst_decl);
+                    expr_vector args(c);
+                    args.push_back(c.int_val(it->second.const_value.get_str().c_str()));
+                    out = pconst(args);
+                }
+                else if (!it->second.to_zero && !it->second.to_const)
+                {
+                    const std::string &dst = it->second.target;
+                    auto itpv = pvar_cache.find(dst);
+                    if (itpv == pvar_cache.end())
+                    {
+                        func_decl pvar(c, decls.pvar_decl);
+                        expr_vector args(c);
+                        args.push_back(c.string_val(dst.c_str()));
+                        Z3_ast n = (Z3_ast)pvar(args);
+                        pvar_cache[dst] = n;
+                        out = expr(c, n);
+                    }
+                    else
+                    {
+                        out = expr(c, itpv->second);
+                    }
+                }
+            }
+        }
+    }
+    else if ((e.get_sort().is_int() && e.is_const() && !e.is_numeral()) || is_bv_to_int_app(e))
+    {
+        const std::string nm = e.to_string();
+        auto it = rules.find(nm);
+        if (it != rules.end())
+        {
+            if (it->second.to_zero)
+            {
+                out = c.int_val(0);
+            }
+            else if (it->second.to_const)
+            {
+                out = c.int_val(it->second.const_value.get_str().c_str());
+            }
+            else
+            {
+                auto it_target = int_atom_cache.find(it->second.target);
+                if (it_target != int_atom_cache.end())
+                    out = expr(c, it_target->second);
+                else if (e.is_const())
+                    out = c.int_const(it->second.target.c_str());
+            }
+        }
+    }
+    else if (e.is_app() && e.num_args() > 0)
+    {
+        expr_vector nargs(c);
+        bool changed = false;
+        for (unsigned i = 0; i < e.num_args(); ++i)
+        {
+            expr ri = rewrite_poly_vars_rec(e.arg(i), rules, decls, memo, pvar_cache, zero_poly_cache, int_atom_cache);
+            if (!z3::eq(ri, e.arg(i)))
+                changed = true;
+            nargs.push_back(ri);
+        }
+        if (changed)
+            out = e.decl()(nargs);
+    }
+
+    memo[(Z3_ast)e] = (Z3_ast)out;
+    return out;
+}
+
+static std::vector<expr> apply_poly_var_rewrite(const std::vector<expr> &roots,
+                                                const std::unordered_map<std::string, PolyRewriteRule> &rules)
+{
+    if (rules.empty())
+        return roots;
+
+    PolyCtorDecls decls;
+    for (const auto &r : roots)
+        collect_poly_ctor_decls_rec(r, decls);
+
+    std::unordered_map<std::string, PolyRewriteRule> active_rules;
+    active_rules.reserve(rules.size());
+    for (const auto &kv : rules)
+    {
+        if (kv.second.to_zero && decls.pconst_decl == nullptr)
+            continue;
+        if (kv.second.to_const && decls.pconst_decl == nullptr)
+        {
+            // Keep int-level constant substitutions; only PVar constant replacement needs PConst.
+            active_rules.insert(kv);
+            continue;
+        }
+        active_rules.insert(kv);
+    }
+    if (active_rules.empty())
+        return roots;
+
+    std::vector<expr> out;
+    out.reserve(roots.size());
+    std::unordered_map<Z3_ast, Z3_ast> memo;
+    std::unordered_map<std::string, Z3_ast> pvar_cache;
+    Z3_ast zero_poly_cache = nullptr;
+    std::unordered_map<std::string, Z3_ast> int_atom_cache;
+    for (const auto &r : roots)
+    {
+        std::vector<expr> stack;
+        stack.push_back(r);
+        while (!stack.empty())
+        {
+            expr cur = stack.back();
+            stack.pop_back();
+            if ((cur.get_sort().is_int() && cur.is_const() && !cur.is_numeral()) || is_bv_to_int_app(cur))
+                int_atom_cache.emplace(cur.to_string(), (Z3_ast)cur);
+            if (cur.is_app())
+                for (unsigned i = 0; i < cur.num_args(); ++i)
+                    stack.push_back(cur.arg(i));
+        }
+    }
+
+    for (const auto &r : roots)
+    {
+        expr rr = rewrite_poly_vars_rec(r, active_rules, decls, memo, pvar_cache, zero_poly_cache, int_atom_cache);
+        out.push_back(rr);
+    }
+    return out;
+}
+
+static void collect_rewrite_vars_rec(const expr &e, std::unordered_set<std::string> &vars)
+{
+    if (is_ctor(e, "PVar", 1))
+    {
+        std::string nm;
+        if (get_string_literal_smt(e.arg(0), nm))
+            vars.insert(nm);
+    }
+
+    if (e.get_sort().is_int() && e.is_const() && !e.is_numeral())
+        vars.insert(e.to_string());
+    if (is_bv_to_int_app(e))
+        vars.insert(e.to_string());
+
+    if (!e.is_app())
+        return;
+    for (unsigned i = 0; i < e.num_args(); ++i)
+        collect_rewrite_vars_rec(e.arg(i), vars);
+}
+
+static int count_rewrite_vars(const std::vector<expr> &roots)
+{
+    std::unordered_set<std::string> vars;
+    for (const auto &r : roots)
+        collect_rewrite_vars_rec(r, vars);
+    return (int)vars.size();
+}
+
+static std::string pretty_rewrite_atom_name(const std::string &s)
+{
+    auto unwrap = [&](const char *prefix) -> std::string
+    {
+        const size_t plen = std::strlen(prefix);
+        if (s.size() > plen + 1 && s.rfind(prefix, 0) == 0 && s.back() == ')')
+            return s.substr(plen, s.size() - plen - 1);
+        return std::string();
+    };
+    std::string u;
+    u = unwrap("(ubv_to_int ");
+    if (!u.empty())
+        return u;
+    u = unwrap("(sbv_to_int ");
+    if (!u.empty())
+        return u;
+    u = unwrap("(bv2int ");
+    if (!u.empty())
+        return u;
+    return s;
+}
+
+static std::vector<expr> dedup_and_drop_trivial_eqp(const std::vector<expr> &eqps)
+{
+    std::vector<expr> out;
+    out.reserve(eqps.size());
+    std::unordered_set<std::string> seen;
+    for (const auto &e : eqps)
+    {
+        if (!(e.is_app() && e.decl().name().str() == "eqP" && e.num_args() == 2))
+            continue;
+        if ((e.arg(0) == e.arg(1)).simplify().is_true())
+            continue;
+        if (seen.insert(e.to_string()).second)
+            out.push_back(e);
+    }
+    return out;
 }
 
 static void collect_indets_rec(const expr &e, std::unordered_set<std::string> &S)
@@ -568,7 +1185,7 @@ struct RingEnv
 
     void build(coeffs cf,
                const std::vector<std::string> &base_vars,
-               rRingOrder_t /*order_ignored*/ = ringorder_lp)
+               rRingOrder_t /*order_ignored*/ = ringorder_dp)
     {
         init_singular();
 
@@ -2309,7 +2926,7 @@ public:
         if (!cfZ)
             throw std::runtime_error("n_Z unavailable for Singular.");
 
-        m_RE.build(cfZ, m_ring_vars, ringorder_lp);
+        m_RE.build(cfZ, m_ring_vars, ringorder_dp);
 
         for (size_t i = 0; i < eqps.size(); ++i)
         {
@@ -2378,7 +2995,7 @@ public:
         if (!cfZ)
             throw std::runtime_error("n_Z unavailable for Singular.");
 
-        m_RE.build(cfZ, m_ring_vars, ringorder_lp);
+        m_RE.build(cfZ, m_ring_vars, ringorder_dp);
     }
 
     ~PolyPropagator() override
@@ -2599,6 +3216,8 @@ int main(int argc, char **argv)
                 ENABLE_MIXED = false;
             if (a == "--m-prime")
                 ALL_FALSE_ASSUME_M_PRIME = true;
+            if (a == "--no-rewriting")
+                ENABLE_REWRITING = false;
 
             if (a.rfind("--expr-len=", 0) == 0)
                 LOG_EXPR_MAXLEN = std::stoul(a.substr(std::string("--expr-len=").size()));
@@ -2614,6 +3233,23 @@ int main(int argc, char **argv)
         std::vector<expr> asserts = parse_smt2_assertions(c, smt);
 
         LOG_TRACE(g_log, "parse", "Loaded " + std::to_string(asserts.size()) + " assertions.");
+
+        std::vector<expr> eqps_before;
+        for (auto &f : asserts)
+            collect_eqP_rec(f, eqps_before);
+        std::vector<expr> eqmods_before;
+        for (auto &f : asserts)
+            collect_eqmodP1_rec(f, eqmods_before);
+        const int generators_before = (int)eqps_before.size() + (int)eqmods_before.size();
+        const int unique_vars_before = count_rewrite_vars(asserts);
+
+        std::unordered_map<std::string, PolyRewriteRule> rewrite_rules;
+        if (ENABLE_REWRITING)
+        {
+            rewrite_rules = infer_poly_rewrite_rules(eqps_before);
+            std::vector<expr> rewritten_asserts = apply_poly_var_rewrite(asserts, rewrite_rules);
+            asserts.swap(rewritten_asserts);
+        }
 
         solver s(c);
 
@@ -2632,6 +3268,7 @@ int main(int argc, char **argv)
         std::vector<expr> eqps;
         for (auto &f : asserts)
             collect_eqP_rec(f, eqps);
+        eqps = dedup_and_drop_trivial_eqp(eqps);
 
         std::vector<expr> lhs, rhs;
         lhs.reserve(eqps.size());
@@ -2646,6 +3283,75 @@ int main(int argc, char **argv)
         std::vector<expr> eqmodsP1;
         for (auto &f : asserts)
             collect_eqmodP1_rec(f, eqmodsP1);
+
+        const int generators_after = (int)eqps.size() + (int)eqmodsP1.size();
+        const int unique_vars_after = count_rewrite_vars(asserts);
+        LOG_INFO(g_log, "rewrite",
+                 "[rewrite] BEFORE:\n"
+                 "  generators = " +
+                     std::to_string(generators_before) + "\n"
+                                                         "  unique_vars = " +
+                     std::to_string(unique_vars_before));
+        LOG_INFO(g_log, "rewrite",
+                 "[rewrite] AFTER:\n"
+                 "  generators = " +
+                     std::to_string(generators_after) + "\n"
+                                                        "  unique_vars = " +
+                     std::to_string(unique_vars_after));
+        LOG_INFO(g_log, "rewrite",
+                 "[rewrite] REDUCTION:\n"
+                 "  generators: " +
+                     std::to_string(generators_before) + " -> " + std::to_string(generators_after) +
+                     "  (delta = " + std::to_string(generators_after - generators_before) + ")\n"
+                                                                                               "  unique_vars: " +
+                     std::to_string(unique_vars_before) + " -> " + std::to_string(unique_vars_after) +
+                     " (delta = " + std::to_string(unique_vars_after - unique_vars_before) + ")");
+        LOG_INFO(g_log, "rewrite",
+                 std::string("[rewrite] mode: ") + (ENABLE_REWRITING ? "enabled" : "disabled"));
+
+        if (ENABLE_REWRITING && !rewrite_rules.empty())
+        {
+            std::vector<std::string> zero_lines;
+            std::vector<std::string> const_lines;
+            std::vector<std::string> alias_lines;
+            zero_lines.reserve(rewrite_rules.size());
+            const_lines.reserve(rewrite_rules.size());
+            alias_lines.reserve(rewrite_rules.size());
+
+            for (const auto &kv : rewrite_rules)
+            {
+                const std::string lhs = pretty_rewrite_atom_name(kv.first);
+                if (kv.second.to_zero)
+                {
+                    zero_lines.push_back("    " + lhs + " -> 0");
+                }
+                else if (kv.second.to_const)
+                {
+                    const_lines.push_back("    " + lhs + " -> " + kv.second.const_value.get_str());
+                }
+                else
+                {
+                    const std::string rhs = pretty_rewrite_atom_name(kv.second.target);
+                    alias_lines.push_back("    " + lhs + " -> " + rhs);
+                }
+            }
+            std::sort(zero_lines.begin(), zero_lines.end());
+            std::sort(const_lines.begin(), const_lines.end());
+            std::sort(alias_lines.begin(), alias_lines.end());
+
+            std::ostringstream oss;
+            oss << "[rewrite] substitutions (total = " << rewrite_rules.size() << "):\n";
+            oss << "  zero (" << zero_lines.size() << "):\n";
+            for (const auto &ln : zero_lines)
+                oss << ln << "\n";
+            oss << "  const (" << const_lines.size() << "):\n";
+            for (const auto &ln : const_lines)
+                oss << ln << "\n";
+            oss << "  alias (" << alias_lines.size() << "):\n";
+            for (const auto &ln : alias_lines)
+                oss << ln << "\n";
+            LOG_INFO(g_log, "rewrite", oss.str());
+        }
 
         for (size_t i = 0; i < eqmodsP1.size(); ++i)
         {
