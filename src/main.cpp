@@ -34,8 +34,8 @@ static bool SINGULAR_VERBOSE = true;
 static bool PRINT_RING_DETAIL = false;
 static bool PRINT_FIXED_ALL = true;
 static bool PRINT_PROPAGATE = true;
-static bool PRINT_POW_STATS = true;
-static bool PRINT_POW_BASE = true;
+static bool PRINT_POW_STATS = false;
+static bool PRINT_POW_BASE = false;
 static bool singular_initialized = false;
 static constexpr int64_t MAX_POW_EXPAND = 65536;
 static size_t LOG_EXPR_MAXLEN = 20000000;
@@ -3284,23 +3284,30 @@ int main(int argc, char **argv)
         for (auto &f : asserts)
             collect_eqmodP1_rec(f, eqmodsP1);
 
+        for (size_t i = 0; i < eqmodsP1.size(); ++i)
+        {
+            LOG_TRACE(g_log, "parse",
+                        "Found eqmodP1#" + std::to_string(i) +
+                            " constraint: " + eqmodsP1[i].to_string());
+        }
+
         const int generators_after = (int)eqps.size() + (int)eqmodsP1.size();
         const int unique_vars_after = count_rewrite_vars(asserts);
         LOG_INFO(g_log, "rewrite",
                  "[rewrite] BEFORE:\n"
-                 "  generators = " +
+                 "  terms = " +
                      std::to_string(generators_before) + "\n"
                                                          "  unique_vars = " +
                      std::to_string(unique_vars_before));
         LOG_INFO(g_log, "rewrite",
                  "[rewrite] AFTER:\n"
-                 "  generators = " +
+                 "  terms = " +
                      std::to_string(generators_after) + "\n"
                                                         "  unique_vars = " +
                      std::to_string(unique_vars_after));
         LOG_INFO(g_log, "rewrite",
                  "[rewrite] REDUCTION:\n"
-                 "  generators: " +
+                 "  terms: " +
                      std::to_string(generators_before) + " -> " + std::to_string(generators_after) +
                      "  (delta = " + std::to_string(generators_after - generators_before) + ")\n"
                                                                                                "  unique_vars: " +
@@ -3353,12 +3360,6 @@ int main(int argc, char **argv)
             LOG_INFO(g_log, "rewrite", oss.str());
         }
 
-        for (size_t i = 0; i < eqmodsP1.size(); ++i)
-        {
-            LOG_TRACE(g_log, "parse",
-                      "Found eqmodP1#" + std::to_string(i) +
-                          " constraint: " + eqmodsP1[i].to_string());
-        }
 
         std::vector<std::string> indets = collect_all_indets(asserts);
         IndetEnv env;
