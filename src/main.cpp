@@ -2503,6 +2503,60 @@ class PolyPropagator : public user_propagator_base
         return gens;
     }
 
+    void collect_true_eqp_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
+    {
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+        for (auto &ep : m_eqp)
+        {
+            if (ep.D_full == nullptr)
+                continue;
+            if (lbool_of(ep.atom) != Z3_L_TRUE)
+                continue;
+            gens_out.push_back(p_Copy(ep.D_full, R));
+            ants_out.push_back(ep.atom);
+        }
+    }
+
+    void collect_true_eqmod_true_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
+    {
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+        for (auto &cp : m_eqmodp)
+        {
+            if (cp.true_gen == nullptr)
+                continue;
+            if (lbool_of(cp.atom) != Z3_L_TRUE)
+                continue;
+            gens_out.push_back(p_Copy(cp.true_gen, R));
+            ants_out.push_back(cp.atom);
+        }
+    }
+
+    bool query_membership_with_groebner(const std::vector<poly> &gens, poly target, std::string &nf_out,
+                                        const std::string &ideal_label, const std::string &gb_label)
+    {
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        ideal I = ideal_from_polys(gens, m_RE);
+        print_ideal(ideal_label.c_str(), I, R);
+        LOG_INFO(g_log, "singular", "Computing Groebner basis " + gb_label + " = std(" + ideal_label + ") ...");
+        ideal G = groebner_std(I, R);
+        print_ideal(gb_label.c_str(), G, R);
+        poly nf = kNF(G, NULL, p_Copy(target, R), 0, 0);
+        bool in = nf_is_zero(nf);
+        nf_out = poly_to_string(nf, R);
+
+        if (nf)
+            p_Delete(&nf, R);
+        if (G)
+            idDelete(&G);
+        if (I)
+            idDelete(&I);
+        return in;
+    }
+
     void on_fixed_eqP(const expr &atom, Z3_lbool bv)
     {
         for (auto &cp : m_eqp)
@@ -2559,85 +2613,140 @@ class PolyPropagator : public user_propagator_base
                 return;
         }
 
-        if (!same_modulus_across_eqmodp())
-            return;
-
         ring R = m_RE.R;
         rChangeCurrRing(R);
+        bool same_modulus = same_modulus_across_eqmodp();
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation begin ===");
-
         std::vector<expr> true_eqp_atoms;
-        std::vector<poly> gens;
-        gens.reserve(1 + m_eqp.size());
-
-        gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
-
         for (auto &ep : m_eqp)
         {
-            if (ep.D_full == nullptr)
-                continue;
             if (lbool_of(ep.atom) != Z3_L_TRUE)
                 continue;
-
-            gens.push_back(p_Copy(ep.D_full, R));
             true_eqp_atoms.push_back(ep.atom);
         }
 
-        LOG_INFO(g_log, "singular", "Using " + std::to_string((int)true_eqp_atoms.size()) + " TRUE eqP equation(s) in ideal.");
-
-        ideal I = ideal_from_polys(gens, m_RE);
-        print_ideal("I", I, R);
-
-        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
-        ideal G = groebner_std(I, R);
-
-        print_ideal("G", G, R);
-
-        if (ALL_FALSE_ASSUME_M_PRIME)
+        if (same_modulus)
         {
-            // Product refutation under the assumption that R/<m> is an integral domain
-            // (e.g., m is prime / irreducible polynomial).
-            poly prod = nullptr;
+            std::vector<poly> gens;
+            gens.reserve(1 + m_eqp.size());
+            gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
+            for (auto &ep : m_eqp)
+            {
+                if (ep.D_full == nullptr)
+                    continue;
+                if (lbool_of(ep.atom) != Z3_L_TRUE)
+                    continue;
+                gens.push_back(p_Copy(ep.D_full, R));
+            }
+
+            LOG_INFO(g_log, "singular", "Using " + std::to_string((int)true_eqp_atoms.size()) + " TRUE eqP equation(s) in ideal.");
+
+            ideal I = ideal_from_polys(gens, m_RE);
+            print_ideal("I", I, R);
+
+            LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
+            ideal G = groebner_std(I, R);
+
+            print_ideal("G", G, R);
+
+            if (ALL_FALSE_ASSUME_M_PRIME)
+            {
+                // Product refutation under the assumption that R/<m> is an integral domain
+                // (e.g., m is prime / irreducible polynomial).
+                poly prod = nullptr;
+                for (auto &cp : m_eqmodp)
+                {
+                    if (!prod)
+                    {
+                        prod = p_Copy(cp.D, R);
+                    }
+                    else
+                    {
+                        poly next = poly_mul_clone(prod, cp.D, R);
+                        p_Delete(&prod, R);
+                        prod = next;
+                    }
+                }
+
+                poly nf = kNF(G, NULL, p_Copy(prod, R), 0, 0);
+                bool in = nf_is_zero(nf);
+
+                LOG_INFO(g_log, "singular",
+                         "Product query: P=" + poly_to_string(prod, R) +
+                             " ; NF_G(P)=" + poly_to_string(nf, R) +
+                             " ; P ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
+
+                if (in)
+                {
+                    LOG_INFO(g_log, "singular",
+                             "[eqmodP1] all-false product refute: P in <M, {TRUE eqP}>; all-false assignment is impossible");
+                    std::vector<expr> ants;
+                    ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
+                    for (auto &cp : m_eqmodp)
+                        ants.push_back(cp.atom);
+                    for (auto &a : true_eqp_atoms)
+                        ants.push_back(a);
+                    conflict_with(ants);
+                }
+
+                if (nf)
+                    p_Delete(&nf, R);
+                if (prod)
+                    p_Delete(&prod, R);
+                if (G)
+                    idDelete(&G);
+                if (I)
+                    idDelete(&I);
+
+                LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
+                return;
+            }
+
+            bool hit = false;
+            expr hit_atom = ctx().bool_val(false);
+
             for (auto &cp : m_eqmodp)
             {
-                if (!prod)
+                poly d = p_Copy(cp.D, R);
+                poly nf = kNF(G, NULL, d, 0, 0);
+                bool in = nf_is_zero(nf);
+
+                LOG_INFO(g_log, "singular",
+                         "Query instance: " + label_of(cp.atom) +
+                             " ; D=" + poly_to_string(cp.D, R) +
+                             " ; NF_G(D)=" + poly_to_string(nf, R) +
+                             " ; D ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
+
+                if (nf)
+                    p_Delete(&nf, R);
+                if (d)
+                    p_Delete(&d, R);
+
+                if (in)
                 {
-                    prod = p_Copy(cp.D, R);
-                }
-                else
-                {
-                    poly next = poly_mul_clone(prod, cp.D, R);
-                    p_Delete(&prod, R);
-                    prod = next;
+                    LOG_INFO(g_log, "singular",
+                             "[eqmodP1] all-false refute: " + label_of(cp.atom) +
+                                 " has D in <M, {TRUE eqP}>; cannot be FALSE");
+                    hit = true;
+                    hit_atom = cp.atom;
+                    break;
                 }
             }
 
-            poly nf = kNF(G, NULL, p_Copy(prod, R), 0, 0);
-            bool in = nf_is_zero(nf);
-
-            LOG_INFO(g_log, "singular",
-                     "Product query: P=" + poly_to_string(prod, R) +
-                         " ; NF_G(P)=" + poly_to_string(nf, R) +
-                         " ; P ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-            if (in)
+            if (hit)
             {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP1] all-false product refute: P in <M, {TRUE eqP}>; all-false assignment is impossible");
                 std::vector<expr> ants;
                 ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
                 for (auto &cp : m_eqmodp)
                     ants.push_back(cp.atom);
                 for (auto &a : true_eqp_atoms)
                     ants.push_back(a);
+                if (!hit_atom.is_false())
+                    ants.push_back(hit_atom);
                 conflict_with(ants);
             }
 
-            if (nf)
-                p_Delete(&nf, R);
-            if (prod)
-                p_Delete(&prod, R);
             if (G)
                 idDelete(&G);
             if (I)
@@ -2647,33 +2756,32 @@ class PolyPropagator : public user_propagator_base
             return;
         }
 
+        LOG_INFO(g_log, "singular", "all-false uses different moduli; running per-instance checks");
         bool hit = false;
         expr hit_atom = ctx().bool_val(false);
-
         for (auto &cp : m_eqmodp)
         {
-            poly d = p_Copy(cp.D, R);
+            std::vector<expr> eqp_ants;
+            std::vector<poly> gens;
+            gens.reserve(1 + m_eqp.size());
+            gens.push_back(p_Copy(cp.M_poly, R));
+            collect_true_eqp_generators(gens, eqp_ants);
 
-            poly nf = kNF(G, NULL, d, 0, 0);
-
-            bool in = nf_is_zero(nf);
-
+            std::string nf_s;
+            std::string idx = label_of(cp.atom);
+            std::string i_label = "I_all_false_diff_" + idx;
+            std::string g_label = "G_all_false_diff_" + idx;
+            bool in = query_membership_with_groebner(gens, cp.D, nf_s, i_label, g_label);
             LOG_INFO(g_log, "singular",
-                     "Query instance: " + label_of(cp.atom) +
+                     "Different-moduli query instance: " + label_of(cp.atom) +
                          " ; D=" + poly_to_string(cp.D, R) +
-                         " ; NF_G(D)=" + poly_to_string(nf, R) +
-                         " ; D ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-            if (nf)
-                p_Delete(&nf, R);
-            if (d)
-                p_Delete(&d, R);
-
+                         " ; NF_<mf,TRUE_eqP>(D)=" + nf_s +
+                         " ; D ∈ <m_f, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
             if (in)
             {
                 LOG_INFO(g_log, "singular",
-                         "[eqmodP1] all-false refute: " + label_of(cp.atom) +
-                             " has D in <M, {TRUE eqP}>; cannot be FALSE");
+                         "[eqmodP1] all-false(different-moduli) refute: " + label_of(cp.atom) +
+                             " has D in <m_f, {TRUE eqP}>; cannot be FALSE");
                 hit = true;
                 hit_atom = cp.atom;
                 break;
@@ -2684,22 +2792,14 @@ class PolyPropagator : public user_propagator_base
         {
             std::vector<expr> ants;
             ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
-
             for (auto &cp : m_eqmodp)
                 ants.push_back(cp.atom);
             for (auto &a : true_eqp_atoms)
                 ants.push_back(a);
-
             if (!hit_atom.is_false())
                 ants.push_back(hit_atom);
-
             conflict_with(ants);
         }
-
-        if (G)
-            idDelete(&G);
-        if (I)
-            idDelete(&I);
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
     }
@@ -2723,31 +2823,38 @@ class PolyPropagator : public user_propagator_base
                 return;
         }
 
-        if (!same_modulus_across_eqmodp())
-            return;
-
         ring R = m_RE.R;
         rChangeCurrRing(R);
+        bool same_modulus = same_modulus_across_eqmodp();
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(all-true) refutation begin ===");
-
         std::vector<expr> ants;
-        std::vector<poly> gens = collect_true_context_generators(ants);
-        if (gens.empty())
-            return;
+        std::vector<poly> gens;
+        if (same_modulus)
+        {
+            gens = collect_true_context_generators(ants);
+            if (gens.empty())
+                return;
+            LOG_INFO(g_log, "singular", "all-true uses same modulus context");
+        }
+        else
+        {
+            collect_true_eqmod_true_generators(gens, ants);
+            if (gens.empty())
+                return;
+            LOG_INFO(g_log, "singular", "all-true uses different moduli context: J=<p_t-u_t*m_t>");
+        }
 
         ideal J = ideal_from_polys(gens, m_RE);
-        print_ideal("J_all_true", J, R);
+        print_ideal(same_modulus ? "J_all_true" : "J_all_true_diffmod", J, R);
 
         LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
         ideal G = groebner_std(J, R);
 
-        print_ideal("G_all_true", G, R);
+        print_ideal(same_modulus ? "G_all_true" : "G_all_true_diffmod", G, R);
 
         poly one = poly_from_si(1, R);
-
         poly nf = kNF(G, NULL, one, 0, 0);
-
         bool unsat = nf_is_zero(nf);
 
         LOG_INFO(g_log, "singular",
@@ -2763,7 +2870,9 @@ class PolyPropagator : public user_propagator_base
 
         if (unsat)
         {
-            LOG_INFO(g_log, "singular", "[eqmodP1] all-true refute: 1 ∈ J");
+            LOG_INFO(g_log, "singular",
+                     same_modulus ? "[eqmodP1] all-true refute: 1 ∈ J"
+                                  : "[eqmodP1] all-true(different-moduli) refute: 1 ∈ J");
             conflict_with(ants);
         }
 
@@ -2798,74 +2907,147 @@ class PolyPropagator : public user_propagator_base
         if (!(has_true && has_false))
             return;
 
-        if (!same_modulus_across_eqmodp())
-            return;
-
         ring R = m_RE.R;
         rChangeCurrRing(R);
+        bool same_modulus = same_modulus_across_eqmodp();
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation begin ===");
+        if (same_modulus)
+        {
+            std::vector<expr> true_context_ants;
+            std::vector<poly> gens = collect_true_context_generators(true_context_ants);
+            if (gens.empty())
+                return;
 
-        std::vector<expr> true_context_ants;
-        std::vector<poly> gens = collect_true_context_generators(true_context_ants);
-        if (gens.empty())
+            ideal J = ideal_from_polys(gens, m_RE);
+            print_ideal("J_mixed", J, R);
+
+            LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
+            ideal G = groebner_std(J, R);
+
+            print_ideal("G_mixed", G, R);
+
+            bool hit = false;
+            expr hit_atom = ctx().bool_val(false);
+
+            for (auto &cp : m_eqmodp)
+            {
+                if (lbool_of(cp.atom) != Z3_L_FALSE)
+                    continue;
+
+                poly d = p_Copy(cp.D, R);
+                poly nf = kNF(G, NULL, d, 0, 0);
+                bool in = nf_is_zero(nf);
+
+                LOG_INFO(g_log, "singular",
+                         "MIXED query instance: " + label_of(cp.atom) +
+                             " ; D=" + poly_to_string(cp.D, R) +
+                             " ; NF_G(D)=" + poly_to_string(nf, R) +
+                             " ; D ∈ J ? " + std::string(in ? "YES" : "NO"));
+
+                if (nf)
+                    p_Delete(&nf, R);
+                if (d)
+                    p_Delete(&d, R);
+
+                if (in)
+                {
+                    LOG_INFO(g_log, "singular",
+                             "[eqmodP1] mixed refute: " + label_of(cp.atom) +
+                                 " has D in J; cannot be FALSE");
+                    hit = true;
+                    hit_atom = cp.atom;
+                    break;
+                }
+            }
+
+            if (G)
+                idDelete(&G);
+            if (J)
+                idDelete(&J);
+
+            if (hit)
+            {
+                std::vector<expr> ants = true_context_ants;
+                ants.push_back(hit_atom);
+                conflict_with(ants);
+            }
+
+            LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation end ===");
             return;
+        }
 
-        ideal J = ideal_from_polys(gens, m_RE);
-        print_ideal("J_mixed", J, R);
+        LOG_INFO(g_log, "singular", "mixed uses different moduli context");
 
-        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-        ideal G = groebner_std(J, R);
+        std::vector<expr> true_eqp_atoms;
+        std::vector<poly> true_eqp_gens;
+        collect_true_eqp_generators(true_eqp_gens, true_eqp_atoms);
 
-        print_ideal("G_mixed", G, R);
+        std::vector<expr> true_eqmod_atoms;
+        std::vector<poly> true_eqmod_gens;
+        collect_true_eqmod_true_generators(true_eqmod_gens, true_eqmod_atoms);
+
+        std::vector<poly> base_gens;
+        base_gens.reserve(true_eqp_gens.size() + true_eqmod_gens.size());
+        for (auto p : true_eqp_gens)
+            base_gens.push_back(p_Copy(p, R));
+        for (auto p : true_eqmod_gens)
+            base_gens.push_back(p_Copy(p, R));
+        for (auto &p : true_eqp_gens)
+            if (p)
+                p_Delete(&p, R);
+        for (auto &p : true_eqmod_gens)
+            if (p)
+                p_Delete(&p, R);
 
         bool hit = false;
         expr hit_atom = ctx().bool_val(false);
-
         for (auto &cp : m_eqmodp)
         {
             if (lbool_of(cp.atom) != Z3_L_FALSE)
                 continue;
 
-            poly d = p_Copy(cp.D, R);
+            std::vector<poly> gens;
+            gens.reserve(base_gens.size() + 1);
+            for (auto p : base_gens)
+                gens.push_back(p_Copy(p, R));
+            gens.push_back(p_Copy(cp.M_poly, R));
 
-            poly nf = kNF(G, NULL, d, 0, 0);
-
-            bool in = nf_is_zero(nf);
-
+            std::string nf_s;
+            std::string idx = label_of(cp.atom);
+            std::string i_label = "I_mixed_diff_" + idx;
+            std::string g_label = "G_mixed_diff_" + idx;
+            bool in = query_membership_with_groebner(gens, cp.D, nf_s, i_label, g_label);
             LOG_INFO(g_log, "singular",
-                     "MIXED query instance: " + label_of(cp.atom) +
+                     "MIXED different-moduli query: " + label_of(cp.atom) +
                          " ; D=" + poly_to_string(cp.D, R) +
-                         " ; NF_G(D)=" + poly_to_string(nf, R) +
-                         " ; D ∈ J ? " + std::string(in ? "YES" : "NO"));
-
-            if (nf)
-                p_Delete(&nf, R);
-            if (d)
-                p_Delete(&d, R);
-
+                         " ; NF_<m_f,J>(D)=" + nf_s +
+                         " ; D ∈ <m_f, J>? " + std::string(in ? "YES" : "NO"));
             if (in)
             {
                 LOG_INFO(g_log, "singular",
-                         "[eqmodP1] mixed refute: " + label_of(cp.atom) +
-                             " has D in J; cannot be FALSE");
+                         "[eqmodP1] mixed(different-moduli) refute: " + label_of(cp.atom) +
+                             " has D in <m_f, J>; cannot be FALSE");
                 hit = true;
                 hit_atom = cp.atom;
                 break;
             }
         }
 
-        if (G)
-            idDelete(&G);
-        if (J)
-            idDelete(&J);
-
         if (hit)
         {
-            std::vector<expr> ants = true_context_ants;
+            std::vector<expr> ants;
+            ants.reserve(true_eqp_atoms.size() + true_eqmod_atoms.size() + 1);
+            for (auto &a : true_eqp_atoms)
+                ants.push_back(a);
+            for (auto &a : true_eqmod_atoms)
+                ants.push_back(a);
             ants.push_back(hit_atom);
             conflict_with(ants);
         }
+        for (auto &p : base_gens)
+            if (p)
+                p_Delete(&p, R);
 
         LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation end ===");
     }
