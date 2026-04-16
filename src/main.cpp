@@ -1640,12 +1640,21 @@ static ideal ideal_from_polys(const std::vector<poly> &gens, RingEnv &RE)
     return I;
 }
 
-static ideal groebner_std(ideal I, const ring R)
+static ideal groebner_std(ideal I, const ring R, const std::string &label = "")
 {
     rChangeCurrRing(R);
+    auto t0 = clk::now();
     intvec *w0 = NULL;
     intvec **w = &w0;
     ideal G = kStd(I, NULL, testHomog, w, NULL, 0, 0, NULL);
+    auto t1 = clk::now();
+
+    std::ostringstream oss;
+    oss << "Groebner basis std";
+    if (!label.empty())
+        oss << " [" << label << "]";
+    oss << " finished in " << fmt_duration(t1 - t0);
+    LOG_INFO(g_log, "singular", oss.str());
     return G;
 }
 
@@ -2339,7 +2348,7 @@ class PolyPropagator : public user_propagator_base
                 std::vector<poly> gens;
                 gens.push_back(pM);
                 ideal I = ideal_from_polys(gens, m_RE);
-                ideal G = groebner_std(I, R);
+                ideal G = groebner_std(I, R, "final-fixed-value-check");
                 poly nf = kNF(G, NULL, pD, 0, 0);
 
                 semantic_truth = nf_is_zero(nf);
@@ -2542,7 +2551,7 @@ class PolyPropagator : public user_propagator_base
         ideal I = ideal_from_polys(gens, m_RE);
         print_ideal(ideal_label.c_str(), I, R);
         LOG_INFO(g_log, "singular", "Computing Groebner basis " + gb_label + " = std(" + ideal_label + ") ...");
-        ideal G = groebner_std(I, R);
+        ideal G = groebner_std(I, R, gb_label);
         print_ideal(gb_label.c_str(), G, R);
         poly nf = kNF(G, NULL, p_Copy(target, R), 0, 0);
         bool in = nf_is_zero(nf);
@@ -2646,7 +2655,7 @@ class PolyPropagator : public user_propagator_base
             print_ideal("I", I, R);
 
             LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
-            ideal G = groebner_std(I, R);
+            ideal G = groebner_std(I, R, "G_all_false");
 
             print_ideal("G", G, R);
 
@@ -2849,7 +2858,7 @@ class PolyPropagator : public user_propagator_base
         print_ideal(same_modulus ? "J_all_true" : "J_all_true_diffmod", J, R);
 
         LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-        ideal G = groebner_std(J, R);
+        ideal G = groebner_std(J, R, same_modulus ? "G_all_true" : "G_all_true_diffmod");
 
         print_ideal(same_modulus ? "G_all_true" : "G_all_true_diffmod", G, R);
 
@@ -2923,7 +2932,7 @@ class PolyPropagator : public user_propagator_base
             print_ideal("J_mixed", J, R);
 
             LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-            ideal G = groebner_std(J, R);
+            ideal G = groebner_std(J, R, "G_mixed");
 
             print_ideal("G_mixed", G, R);
 
