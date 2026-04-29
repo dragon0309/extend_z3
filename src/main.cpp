@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -67,7 +68,6 @@ protected:
     }
 };
 
-static bool ORDER = true;
 static bool ENV = false;
 static bool SKIP_ALL_TRUE = false; // unused now
 static bool ENABLE_ALL_FALSE = true;
@@ -75,6 +75,8 @@ static bool ENABLE_ALL_TRUE = true;
 static bool ENABLE_MIXED = true;
 static bool ALL_FALSE_ASSUME_M_PRIME = false;
 static bool ENABLE_REWRITING = true;
+static bool ENABLE_AUTO_LEMMAS = true;
+static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
 
 static void init_singular()
 {
@@ -2007,6 +2009,9 @@ class PolyPropagator : public user_propagator_base
     std::vector<EqPCompiled> m_eqp;
     std::vector<EqModPCompiled> m_eqmodp;
 
+    std::vector<poly> m_auto_zero_gens;
+    std::vector<std::string> m_auto_zero_labels;
+
     std::unordered_map<Z3_ast, Z3_lbool> m_bool_cache;
     std::unordered_map<Z3_ast, Z3_ast> m_fixed_ast_cache;
 
@@ -2509,6 +2514,10 @@ class PolyPropagator : public user_propagator_base
             ants_out.push_back(cp.atom);
         }
 
+        for (auto &p : m_auto_zero_gens)
+            if (p)
+                gens.push_back(p_Copy(p, R));
+
         return gens;
     }
 
@@ -2525,6 +2534,9 @@ class PolyPropagator : public user_propagator_base
             gens_out.push_back(p_Copy(ep.D_full, R));
             ants_out.push_back(ep.atom);
         }
+        for (auto &p : m_auto_zero_gens)
+            if (p)
+                gens_out.push_back(p_Copy(p, R));
     }
 
     void collect_true_eqmod_true_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
@@ -2603,6 +2615,117 @@ class PolyPropagator : public user_propagator_base
         }
     }
 
+    // ---------------- auto-lemma saturation ----------------
+    void clear_auto_zero_gens()
+    {
+        ring R = m_RE.R;
+        if (R)
+        {
+            rChangeCurrRing(R);
+            for (auto &p : m_auto_zero_gens)
+                if (p)
+                    p_Delete(&p, R);
+        }
+        m_auto_zero_gens.clear();
+        m_auto_zero_labels.clear();
+    }
+
+    void saturate_auto_lemmas()
+    {
+        clear_auto_zero_gens();
+        if (!ENABLE_AUTO_LEMMAS)
+            return;
+
+        ring R = m_RE.R;
+        if (R == nullptr)
+            return;
+        rChangeCurrRing(R);
+
+        std::vector<poly> base_gens;
+        for (auto &ep : m_eqp)
+        {
+            if (ep.D_full != nullptr && lbool_of(ep.atom) == Z3_L_TRUE)
+                base_gens.push_back(p_Copy(ep.D_full, R));
+        }
+        for (auto &cp : m_eqmodp)
+        {
+            if (cp.true_gen != nullptr && lbool_of(cp.atom) == Z3_L_TRUE)
+                base_gens.push_back(p_Copy(cp.true_gen, R));
+        }
+
+        if (base_gens.empty())
+            return;
+
+        std::map<unsigned, std::vector<size_t>> width_groups;
+        for (size_t i = 0; i < m_cmap.z3_bases.size(); ++i)
+        {
+            const z3::expr &base = m_cmap.z3_bases[i];
+            if (!is_bv_to_int_app(base))
+                continue;
+            unsigned w = base.arg(0).get_sort().bv_size();
+            if (w == 0 || w > 64)
+                continue;
+            width_groups[w].push_back(i);
+        }
+
+        if (width_groups.empty())
+        {
+            for (auto &g : base_gens)
+                if (g)
+                    p_Delete(&g, R);
+            return;
+        }
+
+        LOG_INFO(g_log, "singular", "=== auto-lemma saturation begin ===");
+
+        for (auto &kv : width_groups)
+        {
+            unsigned w = kv.first;
+            mpz_class m_bound = mpz_class(1) << w;
+
+            std::vector<poly> gens;
+            gens.reserve(1 + base_gens.size());
+            gens.push_back(poly_from_mpz(m_bound, R));
+            for (auto g : base_gens)
+                gens.push_back(p_Copy(g, R));
+
+            ideal I = ideal_from_polys(gens, m_RE);
+            ideal G = groebner_std(I, R);
+
+            for (size_t idx : kv.second)
+            {
+                poly v_poly = make_var_poly(m_RE, m_cmap.ring_names[idx]);
+                poly nf = kNF(G, NULL, p_Copy(v_poly, R), 0, 0);
+                bool is_zero = nf_is_zero(nf);
+                if (nf)
+                    p_Delete(&nf, R);
+
+                if (is_zero)
+                {
+                    m_auto_zero_gens.push_back(p_Copy(v_poly, R));
+                    m_auto_zero_labels.push_back(m_cmap.ring_names[idx]);
+                    LOG_INFO(g_log, "singular",
+                             "[auto-lemma] implied zero: " + m_cmap.ring_names[idx] +
+                                 " (bv width=" + std::to_string(w) + ")");
+                }
+                p_Delete(&v_poly, R);
+            }
+
+            if (G)
+                idDelete(&G);
+            if (I)
+                idDelete(&I);
+        }
+
+        for (auto &g : base_gens)
+            if (g)
+                p_Delete(&g, R);
+
+        LOG_INFO(g_log, "singular",
+                 "=== auto-lemma saturation end (count=" +
+                     std::to_string(m_auto_zero_gens.size()) + ") ===");
+    }
+
     // ---------------- eqmodP1: all-false ----------------
     void check_eqmodP1_all_false_refutation()
     {
@@ -2638,7 +2761,7 @@ class PolyPropagator : public user_propagator_base
         if (same_modulus)
         {
             std::vector<poly> gens;
-            gens.reserve(1 + m_eqp.size());
+            gens.reserve(1 + m_eqp.size() + m_auto_zero_gens.size());
             gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
             for (auto &ep : m_eqp)
             {
@@ -2648,6 +2771,9 @@ class PolyPropagator : public user_propagator_base
                     continue;
                 gens.push_back(p_Copy(ep.D_full, R));
             }
+            for (auto &p : m_auto_zero_gens)
+                if (p)
+                    gens.push_back(p_Copy(p, R));
 
             LOG_INFO(g_log, "singular", "Using " + std::to_string((int)true_eqp_atoms.size()) + " TRUE eqP equation(s) in ideal.");
 
@@ -3063,6 +3189,7 @@ class PolyPropagator : public user_propagator_base
 
     void check_eqmodP1_conflicts()
     {
+        saturate_auto_lemmas();
         check_eqmodP1_all_false_refutation();
         check_eqmodP1_all_true_refutation();
         check_eqmodP1_mixed_refutation();
@@ -3226,6 +3353,12 @@ public:
                     p_Delete(&ep.D_full, R);
                 ep.D_full = nullptr;
             }
+
+            for (auto &p : m_auto_zero_gens)
+                if (p)
+                    p_Delete(&p, R);
+            m_auto_zero_gens.clear();
+            m_auto_zero_labels.clear();
         }
     }
 
@@ -3322,7 +3455,8 @@ public:
     void final() override
     {
         // check_eqmodP1_conflicts_when_ready();
-        final_fixed_value_check_eqmodP1();
+        if (ENABLE_FINAL_FIXED_VALUE_CHECK)
+            final_fixed_value_check_eqmodP1();
         std::cout << "===== [final] =====\n";
     }
 
@@ -3331,26 +3465,6 @@ public:
         return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars, m_qvar_names);
     }
 };
-
-// ---------------- main ----------------
-static int coeff_priority_rank(const std::string &pretty)
-{
-    static const std::vector<std::string> pr = {
-        "r_final_1",
-        "r_sum_2",
-        "r_sum_1",
-        "r_diff_2",
-        "r_diff_1",
-        "r_m_1",
-        "a_0",
-        "b_0",
-        "c_1",
-    };
-    for (int i = 0; i < (int)pr.size(); ++i)
-        if (pretty == pr[i])
-            return i;
-    return 1000000;
-}
 
 int main(int argc, char **argv)
 {
@@ -3375,7 +3489,8 @@ int main(int argc, char **argv)
             std::cerr << "Usage: " << argv[0]
                       << " <input.smt2> [--quiet] [--ring-detail] [--no-pow-stats] [--no-pow-base]"
                          " [--expr-len=N] [--disable-all-false] [--disable-all-true] [--disable-mixed]"
-                         " [--m-prime]\n";
+                         " [--m-prime] [--disable-auto-lemmas]"
+                         " [--disable-final-fixed-value-check]\n";
             return 1;
         }
 
@@ -3390,8 +3505,6 @@ int main(int argc, char **argv)
                 PRINT_POW_STATS = false;
             if (a == "--no-pow-base")
                 PRINT_POW_BASE = false;
-            if (a == "--order")
-                ORDER = false;
             if (a == "--env")
                 ENV = true;
             if (a == "--skipal")
@@ -3409,6 +3522,10 @@ int main(int argc, char **argv)
                 ALL_FALSE_ASSUME_M_PRIME = true;
             if (a == "--no-rewriting")
                 ENABLE_REWRITING = false;
+            if (a == "--disable-auto-lemmas")
+                ENABLE_AUTO_LEMMAS = false;
+            if (a == "--disable-final-check")
+                ENABLE_FINAL_FIXED_VALUE_CHECK = false;
 
             if (a.rfind("--expr-len=", 0) == 0)
                 LOG_EXPR_MAXLEN = std::stoul(a.substr(std::string("--expr-len=").size()));
@@ -3567,26 +3684,11 @@ int main(int argc, char **argv)
         for (auto a : baseS)
             bases.emplace_back(c, a);
 
-        if (ORDER)
-        {
-            std::stable_sort(bases.begin(), bases.end(),
-                             [](const z3::expr &x, const z3::expr &y)
-                             {
-                                 std::string nx = coeff_base_pretty_name(x);
-                                 std::string ny = coeff_base_pretty_name(y);
-                                 int rx = coeff_priority_rank(nx);
-                                 int ry = coeff_priority_rank(ny);
-                                 if (rx != ry)
-                                     return rx < ry;
-                                 return x.to_string() < y.to_string();
-                             });
-        }
-        else
-        {
-            std::sort(bases.begin(), bases.end(),
-                      [](const z3::expr &x, const z3::expr &y)
-                      { return x.to_string() < y.to_string(); });
-        }
+
+        std::sort(bases.begin(), bases.end(),
+                    [](const z3::expr &x, const z3::expr &y)
+                    { return x.to_string() < y.to_string(); });
+        
 
         std::unordered_set<std::string> used;
 
