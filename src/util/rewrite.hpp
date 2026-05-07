@@ -30,8 +30,6 @@ struct RewriteOptions
     std::unordered_set<std::string> suppressed_lhs_keys;
 };
 
-using RewriteConfig = RewriteOptions;
-
 struct RewriteRule
 {
     enum class Kind
@@ -166,7 +164,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
 RewriteResult run_rewriting_pipeline(
     z3::context &ctx,
     const std::vector<z3::expr> &input_asserts,
-    const RewriteConfig &config,
+    const RewriteOptions &option,
     Logger &log);
 
 std::string rule_rhs_pretty(const PolyRewriteRule &rr);

@@ -1224,8 +1224,8 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
     poly pA = polyterm_to_singular_poly(A, env, indet_ring_names, RE, cmap, Nc, label + "/LHS");
     poly pB = polyterm_to_singular_poly(B, env, indet_ring_names, RE, cmap, Nc, label + "/RHS");
 
-    LOG_INFO(g_log, "singular", label + " LHS(poly) = " + poly_to_string(pA, R));
-    LOG_INFO(g_log, "singular", label + " RHS(poly) = " + poly_to_string(pB, R));
+    LOG_TRACE(g_log, "singular", label + " LHS(poly) = " + poly_to_string(pA, R));
+    LOG_TRACE(g_log, "singular", label + " RHS(poly) = " + poly_to_string(pB, R));
 
     number m1 = num_from_si(-1, R->cf);
     poly pBn = p_Mult_nn(pB, m1, R);
@@ -2949,12 +2949,12 @@ int main(int argc, char **argv)
 
         LOG_TRACE(g_log, "parse", "Loaded " + std::to_string(asserts.size()) + " assertions.");
 
-        RewriteConfig rwcfg;
-        rwcfg.enable_rewriting = ENABLE_REWRITING;
-        rwcfg.enable_expr_rewriting = ENABLE_EXPR_REWRITING;
-        rwcfg.suppress_expr_rhs_for_eqmodp1_atoms = SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS;
+        RewriteOptions rwopt;
+        rwopt.enable_rewriting = ENABLE_REWRITING;
+        rwopt.enable_expr_rewriting = ENABLE_EXPR_REWRITING;
+        rwopt.suppress_expr_rhs_for_eqmodp1_atoms = SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS;
 
-        RewriteResult rr = run_rewriting_pipeline(c, asserts, rwcfg, g_log);
+        RewriteResult rr = run_rewriting_pipeline(c, asserts, rwopt, g_log);
         asserts = std::move(rr.asserts);
 
         solver s(c);

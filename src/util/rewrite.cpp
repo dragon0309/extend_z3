@@ -1357,18 +1357,22 @@ namespace
                                                 const PolyDecls &d,
                                                 const RewriteOptions &options,
                                                 RewriteStats &stats,
-                                                std::vector<std::string> &diagnostics)
+                                                std::vector<std::string> &diagnostics,
+                                                const std::string &trace_scope)
     {
+        const std::string scope_prefix = trace_scope.empty() ? "" : trace_scope + "/";
+
         std::vector<GeneratorInfo> infos;
         infos.reserve(generators.size());
         for (std::size_t i = 0; i < generators.size(); ++i)
         {
+            const std::string glabel = scope_prefix + "gen#" + std::to_string(i);
             auto info = generator_to_polynomial(generators[i], moduli, d, options, stats, diagnostics,
-                                                "gen#" + std::to_string(i));
+                                                glabel);
             if (info)
                 infos.push_back(*info);
             else
-                diagnostics.push_back("gen#" + std::to_string(i) + ": unsupported generator");
+                diagnostics.push_back(glabel + ": unsupported generator");
         }
 
         struct Candidate
@@ -1503,16 +1507,16 @@ namespace
             changed = true;
             return r.rhs;
         }
-        if (is_ctor(r.lhs, "PConst", 1) && is_int_atom(r.lhs.arg(0)) &&
-            e.get_sort().is_int() && (same_ast(e, r.lhs.arg(0)) || expr_key(e) == expr_key(r.lhs.arg(0))))
-        {
-            expr rhs_int(e.ctx());
-            if (poly_to_int_expr(r.rhs, d, rhs_int))
-            {
-                changed = true;
-                return rhs_int;
-            }
-        }
+        // if (is_ctor(r.lhs, "PConst", 1) && is_int_atom(r.lhs.arg(0)) &&
+        //     e.get_sort().is_int() && (same_ast(e, r.lhs.arg(0)) || expr_key(e) == expr_key(r.lhs.arg(0))))
+        // {
+        //     expr rhs_int(e.ctx());
+        //     if (poly_to_int_expr(r.rhs, d, rhs_int))
+        //     {
+        //         changed = true;
+        //         return rhs_int;
+        //     }
+        // }
 
         if (!e.is_app())
             return e;
@@ -1652,7 +1656,8 @@ namespace
         for (std::size_t round = 0; round < options.max_rounds; ++round)
         {
             Extraction ex = extract_assignments_under_moduli(current, moduli, d, options,
-                                                             res.stats, res.diagnostics);
+                                                             res.stats, res.diagnostics,
+                                                             "dag-r" + std::to_string(round));
             if (ex.rules.empty())
             {
                 current = normalize_residuals(current, moduli, d, options, res.stats);
@@ -1701,7 +1706,7 @@ namespace
             poly = simplify_poly(apply_rules(poly, env, d), d);
 
             auto info = generator_to_polynomial(poly, moduli, d, options, res.stats, res.diagnostics,
-                                                "work#" + std::to_string(iterations));
+                                                "wl-i" + std::to_string(iterations));
             if (!info)
             {
                 residuals.push_back(poly);
@@ -1950,7 +1955,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
 
     std::vector<AnnotatedPolynomial> finished;
     std::deque<AnnotatedPolynomial> todo(out.ideal_polynomials.begin(), out.ideal_polynomials.end());
-    while (!todo.empty())
+    for (std::size_t tp_iter = 0; !todo.empty(); ++tp_iter)
     {
         AnnotatedPolynomial cur = todo.front();
         todo.pop_front();
@@ -1965,7 +1970,8 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
             others.insert(others.end(), p.moduli.begin(), p.moduli.end());
         }
 
-        GeneratorInfo info(cur.polynomial, simplify_poly(cur.polynomial, d), false, true, "two-phase");
+        GeneratorInfo info(cur.polynomial, simplify_poly(cur.polynomial, d), false, true,
+                           "tp-i" + std::to_string(tp_iter));
         auto pat = extract_one_assignment(info, others, moduli, d, options, out.stats, out.diagnostics);
         if (!pat)
         {
@@ -1992,7 +1998,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
 
 RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                      const std::vector<z3::expr> &input_asserts,
-                                     const RewriteConfig &config,
+                                     const RewriteOptions &option,
                                      Logger &log)
 {
     expr zero = ctx.int_val(0);
@@ -2009,7 +2015,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     out.generators_before = (int)(eqps_before.size() + eqmods_before.size());
     out.unique_vars_before = count_rewrite_vars(input_asserts);
 
-    if (!config.enable_rewriting)
+    if (!option.enable_rewriting)
     {
         out.generators_after = out.generators_before;
         out.unique_vars_after = out.unique_vars_before;
@@ -2026,9 +2032,9 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     }
     expr poly_zero = mk_pconst_mpz(d, ctx, 0);
 
-    RewriteOptions options = config;
-    options.use_subexpression_rules = config.use_subexpression_rules && config.enable_expr_rewriting;
-    if (config.suppress_expr_rhs_for_eqmodp1_atoms)
+    RewriteOptions options = option;
+    options.use_subexpression_rules = option.use_subexpression_rules && option.enable_expr_rewriting;
+    if (option.suppress_expr_rhs_for_eqmodp1_atoms)
     {
         std::unordered_set<std::string> suppressed;
         for (const expr &em : eqmods_before)
@@ -2121,11 +2127,8 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         if (!out.rewrite_skipped_log.empty())
         {
             oss << "  skipped (" << out.rewrite_skipped_log.size() << "):\n";
-            const std::size_t limit = std::min<std::size_t>(out.rewrite_skipped_log.size(), 32);
-            for (std::size_t i = 0; i < limit; ++i)
-                oss << "    " << out.rewrite_skipped_log[i] << "\n";
-            if (out.rewrite_skipped_log.size() > limit)
-                oss << "    ... " << (out.rewrite_skipped_log.size() - limit) << " more\n";
+            for (const std::string &sk : out.rewrite_skipped_log)
+                oss << "    " << sk << "\n";
         }
         LOG_INFO(log, "rewrite", oss.str());
     }
