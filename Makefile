@@ -1,5 +1,13 @@
-CXX = g++
-CXXFLAGS = -std=c++20 -Wall
+CXX ?= g++
+TARGET ?= bin/main
+BUILD_DIR ?= .build
+
+SRCS := src/main.cpp src/util/rewrite.cpp
+OBJS := $(SRCS:%.cpp=$(BUILD_DIR)/%.o)
+DEPS := $(OBJS:.o=.d)
+
+CPPFLAGS += -Isrc
+CXXFLAGS += -std=c++20 -Wall -MMD -MP
 
 # Z3 (your local build)
 Z3_ROOT    = $(CURDIR)/z3
@@ -8,33 +16,45 @@ Z3_INC_C   = $(Z3_ROOT)/src/api
 Z3_LIBDIR  = $(Z3_ROOT)/build
 
 # Singular via pkg-config (installs headers/libs in /usr/include, /usr/lib)
-SINGULAR_PKG = $(shell pkg-config --cflags --libs Singular)
+SINGULAR_CFLAGS := $(patsubst -I%,-isystem %,$(shell pkg-config --cflags Singular))
+SINGULAR_LIBS   := $(shell pkg-config --libs Singular)
 
 # GMP (Ubuntu packages usually place headers in /usr/include and libs in /usr/lib)
 GMP_LIB = -lgmp
 
 # Include paths
-INCLUDES = -I$(Z3_INC_CXX) -I$(Z3_INC_C) -Isrc
+CPPFLAGS += -isystem $(Z3_INC_CXX) -isystem $(Z3_INC_C) $(SINGULAR_CFLAGS)
 
 # Link flags:
 # - use Z3 build dir
 # - embed rpath so the executable can find libz3.so at runtime
-LDFLAGS = -L$(Z3_LIBDIR) -Wl,-rpath,$(Z3_LIBDIR) -lz3
+LDFLAGS += -L$(Z3_LIBDIR) -Wl,-rpath,$(Z3_LIBDIR)
+LDLIBS  += -lz3 $(SINGULAR_LIBS) $(GMP_LIB)
 
-MAIN_SRC := src/main.cpp src/util/rewrite.cpp
+.PHONY: all run clean
+.DEFAULT_GOAL := all
 
-# What to build = goals you typed, except clean. Bare `make` → main.
-BIN_TARGETS := $(filter-out clean,$(MAKECMDGOALS))
-ifeq ($(strip $(BIN_TARGETS)),)
-BIN_TARGETS := main
-endif
+all: $(TARGET)
 
-.PHONY: clean
-
-# One recipe for whatever path(s) you pass: make src/main, make build/foo, ...
-$(BIN_TARGETS): $(MAIN_SRC)
+$(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $(MAIN_SRC) $(LDFLAGS) $(SINGULAR_PKG) $(GMP_LIB)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+run: $(TARGET)
+	./$(TARGET)
+
+# Compatibility for old commands that built ./main or ./src/main directly.
+main src/main: $(TARGET)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(BUILD_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(OBJS): Makefile
 
 clean:
-	rm -f main src/main
+	rm -rf $(BUILD_DIR) bin main src/main
+
+-include $(DEPS)
