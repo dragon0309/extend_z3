@@ -12,6 +12,9 @@
 #include <unordered_map>
 #include <utility>
 
+namespace util
+{
+
 enum class LogLevel : int
 {
     Error = 0,
@@ -20,6 +23,9 @@ enum class LogLevel : int
     Debug = 3,
     Trace = 4
 };
+
+namespace detail
+{
 
 inline std::string_view loglevel_name(LogLevel lv)
 {
@@ -39,6 +45,15 @@ inline std::string_view loglevel_name(LogLevel lv)
     return "UNKWN";
 }
 
+inline void write_log_line(std::ostream &os, LogLevel lv, std::string_view module, std::string_view msg)
+{
+    os << "[" << loglevel_name(lv) << "]"
+       << "[" << std::setw(10) << std::left << module << std::right << "] "
+       << msg << "\n";
+}
+
+} // namespace detail
+
 class Logger
 {
 public:
@@ -54,6 +69,8 @@ private:
     std::optional<std::string> file_path_;
     std::ofstream file_;
     bool file_flush_on_write_ = false;
+    std::ostream *out_ = &std::cout;
+    std::ostream *err_ = &std::cerr;
 
     mutable std::mutex mu_;
 
@@ -65,15 +82,9 @@ private:
         return global_;
     }
 
-    void write_one(std::ostream &os, LogLevel lv, std::string_view module, std::string_view msg)
-    {
-        os << "[" << loglevel_name(lv) << "]"
-           << "[" << std::setw(10) << std::left << module << std::right << "] "
-           << msg << "\n";
-    }
-
 public:
     Logger() = default;
+    Logger(std::ostream &out, std::ostream &err) : out_(&out), err_(&err) {}
 
     void set_global(LogLevel lv)
     {
@@ -144,8 +155,8 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         if (file_.is_open())
             file_.flush();
-        std::cout.flush();
-        std::cerr.flush();
+        out_->flush();
+        err_->flush();
     }
 
     void log(LogLevel lv, std::string_view module, std::string_view msg)
@@ -156,24 +167,26 @@ public:
             return;
 
         // console
-        std::ostream *os = &std::cout;
+        std::ostream *os = out_;
         if (use_stderr_for_warn_ && ((int)lv <= (int)LogLevel::Warn))
-            os = &std::cerr;
-        write_one(*os, lv, module, msg);
+            os = err_;
+        detail::write_log_line(*os, lv, module, msg);
 
         // file (optional)
         if (file_.is_open())
         {
-            write_one(file_, lv, module, msg);
+            detail::write_log_line(file_, lv, module, msg);
             if (file_flush_on_write_)
                 file_.flush();
         }
     }
 };
 
+} // namespace util
+
 // Macros
-#define LOG_ERROR(LG, MOD, MSG) (LG).log(LogLevel::Error, (MOD), (MSG))
-#define LOG_WARN(LG, MOD, MSG) (LG).log(LogLevel::Warn, (MOD), (MSG))
-#define LOG_INFO(LG, MOD, MSG) (LG).log(LogLevel::Info, (MOD), (MSG))
-#define LOG_DEBUG(LG, MOD, MSG) (LG).log(LogLevel::Debug, (MOD), (MSG))
-#define LOG_TRACE(LG, MOD, MSG) (LG).log(LogLevel::Trace, (MOD), (MSG))
+#define LOG_ERROR(LG, MOD, MSG) (LG).log(::util::LogLevel::Error, (MOD), (MSG))
+#define LOG_WARN(LG, MOD, MSG) (LG).log(::util::LogLevel::Warn, (MOD), (MSG))
+#define LOG_INFO(LG, MOD, MSG) (LG).log(::util::LogLevel::Info, (MOD), (MSG))
+#define LOG_DEBUG(LG, MOD, MSG) (LG).log(::util::LogLevel::Debug, (MOD), (MSG))
+#define LOG_TRACE(LG, MOD, MSG) (LG).log(::util::LogLevel::Trace, (MOD), (MSG))

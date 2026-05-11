@@ -41,7 +41,7 @@ static bool PRINT_POW_STATS = false;
 static bool PRINT_POW_BASE = false;
 static constexpr int64_t MAX_POW_EXPAND = 65536;
 static size_t LOG_EXPR_MAXLEN = 20000000;
-static Logger g_log;
+static util::Logger g_log;
 
 class TeeStreamBuf : public std::streambuf
 {
@@ -75,16 +75,26 @@ static bool ENABLE_ALL_TRUE = true;
 static bool ENABLE_MIXED = true;
 static bool ALL_FALSE_ASSUME_M_PRIME = false;
 static bool ENABLE_REWRITING = true;
-// The OCaml-style rewriter can extract variable assignments and conservative
-// separable sub-expression assignments.  Two safety knobs remain exposed:
+// The OCaml-style rewriter extracts variable assignments by default. Optional
+// safety/coverage knobs remain exposed:
 //   * SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS (default true): never extract a
 //     rule whose LHS appears in any eqmodP1 atom.  Keeps every other ExprRhs
 //     benefit but leaves the modular target polynomial alone.
 //   * ENABLE_EXPR_REWRITING (default true): full opt-out of ExprRhs rules.
 //     Setting this false disables sub-expression assignment extraction.
+//   * ENABLE_SUBEXPRESSION_RULES (default false): opt into separable
+//     sub-expression assignment extraction.
+//   * ENABLE_EXPRESSION_GROWTH_CHECK (default false): skip rewrite rules whose
+//     RHS grows beyond RewriteOptions::max_expression_growth.
+//   * REJECT_DUPLICATE_LHS / REJECT_CONFLICTING_LHS (default false): opt into
+//     dropping duplicate or conflicting rewrite candidates.
 static bool ENABLE_EXPR_REWRITING = true;
 static bool SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS = true;
-static bool ENABLE_AUTO_LEMMAS = true;
+static bool ENABLE_SUBEXPRESSION_RULES = false;
+static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
+static bool REJECT_DUPLICATE_LHS = false;
+static bool REJECT_CONFLICTING_LHS = false;
+static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
 
 static void init_singular()
@@ -105,20 +115,22 @@ static void dump_ring(const ring R)
 static void print_ideal(const char *label, ideal I, const ring R)
 {
 
-    std::cout << "[INFO ][singular  ] " << label << " = {";
+    std::ostringstream oss;
+    oss << label << " = {";
     bool first = true;
     for (int i = 0; i < I->ncols; ++i)
     {
         if (I->m[i] == nullptr)
             continue;
         if (!first)
-            std::cout << ", ";
+            oss << ", ";
         char *s = p_String(I->m[i], R);
-        std::cout << s;
+        oss << s;
         omFree(s);
         first = false;
     }
-    std::cout << "}\n";
+    oss << "}";
+    LOG_INFO(g_log, "singular", oss.str());
 }
 
 static std::string poly_to_string(poly p, const ring R)
@@ -960,11 +972,8 @@ static poly polyterm_to_singular_poly(const expr &p,
                     int uidx = RE.ensure_var_idx(u_ring);
                     deg_u = poly_max_exp_in_var(base, R, uidx);
                 }
-                auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-                double ms = us / 1000.0;
-
                 std::cout << "[pow][" << tag << "] k=" << k
-                          << " time=" << us << "us (" << ms << "ms)"
+                          << " time=" << util::fmt_duration(t1 - t0)
                           << " terms=" << terms
                           << " deg_u=" << ((deg_u >= 0) ? std::to_string(deg_u) : "NA");
                 if (PRINT_POW_BASE)
@@ -1013,11 +1022,8 @@ static poly polyterm_to_singular_poly(const expr &p,
                 int uidx = RE.ensure_var_idx(u_ring);
                 deg_u = poly_max_exp_in_var(res, R, uidx);
             }
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            double ms = us / 1000.0;
-
             std::cout << "[pow][" << tag << "] k=" << k
-                      << " time=" << us << "us (" << ms << "ms)"
+                      << " time=" << util::fmt_duration(t1 - t0)
                       << " terms=" << terms
                       << " deg_u=" << ((deg_u >= 0) ? std::to_string(deg_u) : "NA");
             if (PRINT_POW_BASE)
@@ -1055,7 +1061,7 @@ static ideal groebner_std(ideal I, const ring R, const std::string &label = "")
     oss << "Groebner basis std";
     if (!label.empty())
         oss << " [" << label << "]";
-    oss << " finished in " << fmt_duration(t1 - t0);
+    oss << " finished in " << util::fmt_duration(t1 - t0);
     LOG_INFO(g_log, "singular", oss.str());
     return G;
 }
@@ -2897,6 +2903,9 @@ int main(int argc, char **argv)
                          " [--m-prime] [--disable-auto-lemmas]"
                          " [--no-rewriting] [--no-expr-rewriting]"
                          " [--allow-expr-rewriting-in-eqmodp1]"
+                         " [--enable-subexpression-rules]"
+                         " [--enable-expression-growth-check]"
+                         " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
                          " [--disable-final-fixed-value-check]\n";
             return 1;
         }
@@ -2913,7 +2922,7 @@ int main(int argc, char **argv)
             if (a == "--env")
                 ENV = true;
             if (a == "--no-trace")
-                g_log.set_global(LogLevel::Debug);
+                g_log.set_global(util::LogLevel::Debug);
 
             if (a == "--disable-all-false")
                 ENABLE_ALL_FALSE = false;
@@ -2929,6 +2938,14 @@ int main(int argc, char **argv)
                 ENABLE_EXPR_REWRITING = false;
             if (a == "--allow-expr-rewriting-in-eqmodp1")
                 SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS = false;
+            if (a == "--enable-subexpression-rules")
+                ENABLE_SUBEXPRESSION_RULES = true;
+            if (a == "--enable-expression-growth-check")
+                ENABLE_EXPRESSION_GROWTH_CHECK = true;
+            if (a == "--reject-duplicate-lhs")
+                REJECT_DUPLICATE_LHS = true;
+            if (a == "--reject-conflicting-lhs")
+                REJECT_CONFLICTING_LHS = true;
             if (a == "--disable-auto-lemmas")
                 ENABLE_AUTO_LEMMAS = false;
             if (a == "--disable-final-check")
@@ -2939,6 +2956,7 @@ int main(int argc, char **argv)
         }
 
         LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
+        LOG_INFO(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
 
         context c;
 
@@ -2952,7 +2970,11 @@ int main(int argc, char **argv)
         RewriteOptions rwopt;
         rwopt.enable_rewriting = ENABLE_REWRITING;
         rwopt.enable_expr_rewriting = ENABLE_EXPR_REWRITING;
+        rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
         rwopt.suppress_expr_rhs_for_eqmodp1_atoms = SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS;
+        rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
+        rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
+        rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
 
         RewriteResult rr = run_rewriting_pipeline(c, asserts, rwopt, g_log);
         asserts = std::move(rr.asserts);
@@ -3068,7 +3090,7 @@ int main(int argc, char **argv)
         if (SHOW_MODEL && r == sat)
             print_model_filtered(s.get_model());
 
-        std::cout << "[timer] z3.check() = " << fmt_duration(t1 - t0) << "\n";
+        std::cout << "[timer] z3.check() = " << util::fmt_duration(t1 - t0) << "\n";
         std::cout.flush();
         std::cerr.flush();
         std::cout.rdbuf(orig_cout);

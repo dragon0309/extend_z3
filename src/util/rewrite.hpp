@@ -11,14 +11,20 @@
 #include <unordered_set>
 #include <vector>
 
+namespace util
+{
 class Logger;
+}
 
 struct RewriteOptions
 {
     bool enable_rewriting = true;
     bool use_singular_normalization = true;
-    bool use_subexpression_rules = true;
+    bool use_subexpression_rules = false;
     bool conservative_mode = true;
+    bool enable_expression_growth_check = false;
+    bool reject_duplicate_lhs = false;
+    bool reject_conflicting_lhs = false;
     std::size_t max_rounds = 100;
     std::size_t max_expression_growth = 4096;
 
@@ -165,7 +171,7 @@ RewriteResult run_rewriting_pipeline(
     z3::context &ctx,
     const std::vector<z3::expr> &input_asserts,
     const RewriteOptions &option,
-    Logger &log);
+    util::Logger &log);
 
 std::string rule_rhs_pretty(const PolyRewriteRule &rr);
 

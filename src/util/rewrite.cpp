@@ -690,6 +690,11 @@ namespace
         return true;
     }
 
+    bool is_unit_coefficient(const mpz_class &k)
+    {
+        return k == 1 || k == -1;
+    }
+
     bool contains_multiplicative_or_power(const expr &e)
     {
         if (is_ctor(e, "PMul", 2) || is_ctor(e, "PPow", 2))
@@ -741,7 +746,8 @@ namespace
             diagnostics.push_back(label + ": skipped common lhs occurs in rhs");
             return std::nullopt;
         }
-        if (expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
+        if (options.enable_expression_growth_check &&
+            expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
         {
             ++stats.skipped_expression_growth;
             diagnostics.push_back(label + ": skipped common expression growth");
@@ -827,16 +833,12 @@ namespace
         }
         if (a.coeffs.empty())
             return std::nullopt;
-        if (!affine_has_only_unit_coefficients(a))
-        {
-            ++stats.skipped_unsafe_coefficient;
-            diagnostics.push_back(label + ": skipped unsafe coefficient");
-            return std::nullopt;
-        }
 
         std::vector<std::string> candidates;
         for (const auto &kv : a.coeffs)
         {
+            if (!is_unit_coefficient(kv.second))
+                continue;
             auto it = a.var_exprs.find(kv.first);
             if (it == a.var_exprs.end())
                 continue;
@@ -844,7 +846,11 @@ namespace
                 candidates.push_back(kv.first);
         }
         if (candidates.empty())
+        {
+            ++stats.skipped_unsafe_coefficient;
+            diagnostics.push_back(label + ": skipped unsafe coefficient");
             return std::nullopt;
+        }
         std::sort(candidates.begin(), candidates.end());
 
         for (const std::string &key : candidates)
@@ -868,7 +874,8 @@ namespace
                 diagnostics.push_back(label + ": skipped lhs occurs in rhs");
                 continue;
             }
-            if (expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
+            if (options.enable_expression_growth_check &&
+                expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
             {
                 ++stats.skipped_expression_growth;
                 diagnostics.push_back(label + ": skipped expression growth");
@@ -990,7 +997,8 @@ namespace
                     diagnostics.push_back(label + ": skipped subexpression lhs occurs in rhs");
                     continue;
                 }
-                if (expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
+                if (options.enable_expression_growth_check &&
+                    expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
                 {
                     ++stats.skipped_expression_growth;
                     diagnostics.push_back(label + ": skipped subexpression growth");
@@ -1405,17 +1413,21 @@ namespace
         for (auto &kv : grouped)
         {
             auto &cands = kv.second;
-            if (cands.size() > 1)
+            const bool has_duplicate_lhs = cands.size() > 1;
+            if (has_duplicate_lhs && options.reject_duplicate_lhs)
                 stats.duplicate_lhs += cands.size() - 1;
 
             bool conflict = false;
-            for (std::size_t i = 1; i < cands.size(); ++i)
+            if (has_duplicate_lhs && options.reject_conflicting_lhs)
             {
-                if (!equivalent_poly(cands[0].pattern.rule.rhs, cands[i].pattern.rule.rhs,
-                                     moduli, d, options, stats))
+                for (std::size_t i = 1; i < cands.size(); ++i)
                 {
-                    conflict = true;
-                    break;
+                    if (!equivalent_poly(cands[0].pattern.rule.rhs, cands[i].pattern.rule.rhs,
+                                         moduli, d, options, stats))
+                    {
+                        conflict = true;
+                        break;
+                    }
                 }
             }
             if (conflict)
@@ -1426,11 +1438,17 @@ namespace
                     consumed[c.index] = false;
                 continue;
             }
+            if (has_duplicate_lhs && options.reject_duplicate_lhs)
+            {
+                diagnostics.push_back("duplicate lhs: " + pretty_rewrite_atom_name(kv.first));
+                for (const Candidate &c : cands)
+                    consumed[c.index] = false;
+                continue;
+            }
 
             out.rules.push_back(cands[0].pattern.rule);
             ++stats.rules_extracted;
-            for (const Candidate &c : cands)
-                consumed[c.index] = true;
+            consumed[cands[0].index] = true;
         }
 
         std::sort(out.rules.begin(), out.rules.end(),
@@ -1725,8 +1743,27 @@ namespace
             auto existing = env_index.find(pat->lhs_key);
             if (existing != env_index.end())
             {
-                if (!equivalent_poly(env[existing->second].rhs, pat->rule.rhs, moduli, d, options, res.stats))
+                bool conflict = false;
+                if (options.reject_conflicting_lhs)
+                {
+                    conflict = !equivalent_poly(env[existing->second].rhs, pat->rule.rhs,
+                                                moduli, d, options, res.stats);
+                }
+                if (conflict)
+                {
+                    ++res.stats.conflicting_lhs;
+                    res.diagnostics.push_back("duplicate lhs conflict: " + pretty_rewrite_atom_name(pat->lhs_key));
                     residuals.push_back(info->polynomial);
+                    continue;
+                }
+                if (options.reject_duplicate_lhs)
+                {
+                    ++res.stats.duplicate_lhs;
+                    res.diagnostics.push_back("duplicate lhs: " + pretty_rewrite_atom_name(pat->lhs_key));
+                    residuals.push_back(info->polynomial);
+                    continue;
+                }
+                residuals.push_back(info->polynomial);
                 continue;
             }
 
@@ -1779,6 +1816,20 @@ namespace
         }
         for (unsigned i = 0; i < e.num_args(); ++i)
             collect_eqP_rec(e.arg(i), atoms);
+    }
+
+    bool is_eqP_atom(const expr &e)
+    {
+        return e.is_app() && e.decl().name().str() == "eqP" && e.num_args() == 2;
+    }
+
+    void collect_direct_asserted_eqP(const std::vector<expr> &asserts, std::vector<expr> &atoms)
+    {
+        for (const expr &a : asserts)
+        {
+            if (is_eqP_atom(a))
+                atoms.push_back(a);
+        }
     }
 
     void collect_eqmodP1_rec(const expr &e, std::vector<expr> &atoms)
@@ -1999,19 +2050,21 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
 RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                      const std::vector<z3::expr> &input_asserts,
                                      const RewriteOptions &option,
-                                     Logger &log)
+                                     util::Logger &log)
 {
     expr zero = ctx.int_val(0);
     RewriteResult out(zero);
     out.asserts = input_asserts;
 
     std::vector<expr> eqps_before;
+    std::vector<expr> direct_eqps_before;
     std::vector<expr> eqmods_before;
     for (const expr &a : input_asserts)
     {
         collect_eqP_rec(a, eqps_before);
         collect_eqmodP1_rec(a, eqmods_before);
     }
+    collect_direct_asserted_eqP(input_asserts, direct_eqps_before);
     out.generators_before = (int)(eqps_before.size() + eqmods_before.size());
     out.unique_vars_before = count_rewrite_vars(input_asserts);
 
@@ -2046,12 +2099,14 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         options.suppressed_lhs_keys = std::move(suppressed);
     }
 
-    // Assertion-level rewriting extracts assignments from eqP atoms only.
+    // Assertion-level rewriting extracts assignments only from directly asserted
+    // eqP atoms.  Nested eqP atoms inside Boolean structure are not known true
+    // until the solver fixes them to true; the propagator handles those later.
     // eqmodP1 is rewritten by the resulting environment but is not used as an
     // equality assignment because that would be unsound as an SMT assertion.
     std::vector<expr> ideal;
-    ideal.reserve(eqps_before.size());
-    for (const expr &eqp : eqps_before)
+    ideal.reserve(direct_eqps_before.size());
+    for (const expr &eqp : direct_eqps_before)
         ideal.push_back(mk_psub(d, eqp.arg(0), eqp.arg(1)));
 
     RewriteResult core(poly_zero);
@@ -2104,6 +2159,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
 
     std::ostringstream summary;
     summary << "[rewrite] input_generators=" << out.generators_before
+            << " direct_eqP=" << direct_eqps_before.size()
             << " assignments=" << out.rules_used.size()
             << " residual_generators=" << out.residual_generators.size()
             << " dag_rounds=" << out.dag_rounds
@@ -2223,7 +2279,7 @@ namespace
                           const std::string &target_expr,
                           const std::string &expected_expr,
                           bool expect_rule,
-                          bool subexpr_rules = true)
+                          bool subexpr_rules = false)
     {
         std::cout << "[selftest] " << name << "\n";
         context ctx;
@@ -2277,10 +2333,10 @@ int run_rewrite_selftests()
                          "(assert (eqP (PSub (PAdd (PConst x) (PConst y)) (PConst z)) (PConst 0)))",
                          "(PConst x)", "(PSub (PConst z) (PConst y))", true));
 
-    run(test_rule_target("x + x - y gives no assignment",
+    run(test_rule_target("x + x - y gives y := 2*x",
                          "(declare-const x Int)(declare-const y Int)"
                          "(assert (eqP (PSub (PAdd (PConst x) (PConst x)) (PConst y)) (PConst 0)))",
-                         "(PConst x)", "(PConst x)", false, false));
+                         "(PConst y)", "(PMul (PConst 2) (PConst x))", true, false));
 
     run(test_rule_target("x*y - z gives no assignment",
                          "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
@@ -2292,10 +2348,10 @@ int run_rewrite_selftests()
                          "(assert (eqP (PSub (PPow (PConst x) 2) (PConst y)) (PConst 0)))",
                          "(PConst y)", "(PConst y)", false, false));
 
-    run(test_rule_target("2*x - y gives no assignment",
+    run(test_rule_target("2*x - y gives y := 2*x",
                          "(declare-const x Int)(declare-const y Int)"
                          "(assert (eqP (PSub (PMul (PConst 2) (PConst x)) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PConst y)", false, false));
+                         "(PConst y)", "(PMul (PConst 2) (PConst x))", true, false));
 
     {
         std::cout << "[selftest] DAG chain rewrites x to 2\n";
@@ -2338,9 +2394,9 @@ int run_rewrite_selftests()
         expr target_poly = mk_padd(d, mk_decl_app(ctx, d.pconst, {ctx.int_const("x")}),
                                    mk_decl_app(ctx, d.pconst, {ctx.int_const("z")}));
         RewriteResult rr = rewrite_assignments(ideal, target_poly, {}, opts);
-        expr expected = mk_padd(d, mk_padd(d, mk_decl_app(ctx, d.pconst, {ctx.int_const("y")}), mk_pconst_mpz(d, ctx, 1)), mk_decl_app(ctx, d.pconst, {ctx.int_const("z")}));
-        bool ok = check(!rr.residual_generators.empty(), "missing residual");
-        ok &= check(equivalent_for_test(rr.rewritten_target, expected, d), "target not rewritten through residual assignment");
+        expr expected = mk_pmul(d, mk_pconst_mpz(d, ctx, -2), mk_decl_app(ctx, d.pconst, {ctx.int_const("y")}));
+        bool ok = check(rr.residual_generators.empty(), "residual was not fully rewritten");
+        ok &= check(equivalent_for_test(rr.rewritten_target, expected, d), "target not fully rewritten through affine assignments");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
@@ -2382,15 +2438,46 @@ int run_rewrite_selftests()
             collect_eqP_rec(a, eqps);
         RewriteOptions opts;
         opts.use_singular_normalization = false;
-        RewriteResult same = rewrite_assignments({mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
-                                                  mk_psub(d, eqps[1].arg(0), eqps[1].arg(1))},
-                                                 eqps[0].arg(0), {}, opts);
-        RewriteResult conflict = rewrite_assignments({mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
-                                                      mk_psub(d, eqps[2].arg(0), eqps[2].arg(1))},
-                                                     eqps[0].arg(0), {}, opts);
-        bool ok = check(same.rules_used.size() == 1, "equivalent duplicate did not keep one rule");
-        ok &= check(conflict.rules_used.empty() && conflict.residual_generators.size() == 2,
-                    "conflicting duplicate was not rejected");
+        std::vector<expr> same_input{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
+                                     mk_psub(d, eqps[1].arg(0), eqps[1].arg(1))};
+        std::vector<expr> conflict_input{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
+                                         mk_psub(d, eqps[2].arg(0), eqps[2].arg(1))};
+        RewriteResult same = rewrite_assignments(same_input, eqps[0].arg(0), {}, opts);
+        RewriteResult conflict_default = rewrite_assignments(conflict_input, eqps[0].arg(0), {}, opts);
+
+        RewriteOptions reject_dups = opts;
+        reject_dups.reject_duplicate_lhs = true;
+        RewriteResult duplicate_rejected = rewrite_assignments(same_input, eqps[0].arg(0), {}, reject_dups);
+
+        RewriteOptions reject_conflicts = opts;
+        reject_conflicts.reject_conflicting_lhs = true;
+        RewriteResult conflict_rejected = rewrite_assignments(conflict_input, eqps[0].arg(0), {}, reject_conflicts);
+
+        bool ok = check(same.rules_used.size() == 1, "equivalent duplicate did not keep one rule by default");
+        ok &= check(conflict_default.rules_used.size() == 1 && !conflict_default.residual_generators.empty(),
+                    "conflicting duplicate was dropped by default");
+        ok &= check(duplicate_rejected.rules_used.empty() && !duplicate_rejected.residual_generators.empty(),
+                    "duplicate lhs option did not reject duplicates");
+        ok &= check(conflict_rejected.rules_used.empty() && conflict_rejected.residual_generators.size() == 2,
+                    "conflicting lhs option did not reject conflicts");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] assertion rewrite ignores nested eqP until fixed true\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const guard Bool)"
+                                        "(assert (or guard (eqP (PConst x) (PConst 0))))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool ok = check(rr.rules_used.empty(), "nested eqP was used as an unconditional rewrite");
+        ok &= check(rr.asserts.size() == asserts.size(), "nested eqP assertion was rewritten away");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
@@ -2416,10 +2503,12 @@ int run_rewrite_selftests()
         run(ok);
     }
 
-    run(test_rule_target("subexpression rule extracts separable x+x",
+    run(test_rule_target("subexpression rule extracts separable x+x when enabled",
                          "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                         "(assert (eqP (PSub (PAdd (PAdd (PConst x) (PConst x)) (PConst y)) (PConst z)) (PConst 0)))",
-                         "(PAdd (PConst x) (PConst x))", "(PSub (PConst z) (PConst y))", true, true));
+                         "(assert (eqP (PSub (PAdd (PAdd (PConst x) (PConst x)) (PAdd (PConst y) (PConst y))) (PAdd (PConst z) (PConst z))) (PConst 0)))",
+                         "(PAdd (PConst x) (PConst x))",
+                         "(PSub (PAdd (PConst z) (PConst z)) (PAdd (PConst y) (PConst y)))",
+                         true, true));
 
     {
         std::cout << "[selftest] Singular drops residual reducible by modulus\n";
