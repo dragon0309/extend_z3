@@ -1294,6 +1294,133 @@ namespace
         return false;
     }
 
+    bool affine_scalar_multiple_of(const expr &p, const expr &modulus, const PolyDecls &d)
+    {
+        Affine ap(p.ctx()), am(p.ctx());
+        if (!affine_extract_poly(p, d, ap) || !affine_extract_poly(modulus, d, am))
+            return false;
+        if (am.coeffs.empty() && am.constant == 0)
+            return false;
+
+        mpz_class numerator;
+        mpz_class denominator;
+        bool have_ratio = false;
+        auto take_ratio = [&](const mpz_class &pv, const mpz_class &mv) -> bool
+        {
+            if (mv == 0)
+                return pv == 0;
+            if (!have_ratio)
+            {
+                numerator = pv;
+                denominator = mv;
+                have_ratio = true;
+                return true;
+            }
+            return pv * denominator == numerator * mv;
+        };
+
+        std::set<std::string> keys;
+        for (const auto &kv : ap.coeffs)
+            keys.insert(kv.first);
+        for (const auto &kv : am.coeffs)
+            keys.insert(kv.first);
+
+        for (const std::string &key : keys)
+        {
+            mpz_class pv = 0;
+            mpz_class mv = 0;
+            if (auto it = ap.coeffs.find(key); it != ap.coeffs.end())
+                pv = it->second;
+            if (auto it = am.coeffs.find(key); it != am.coeffs.end())
+                mv = it->second;
+            if (!take_ratio(pv, mv))
+                return false;
+        }
+        if (!take_ratio(ap.constant, am.constant))
+            return false;
+        if (!have_ratio)
+            return false;
+        return numerator % denominator == 0;
+    }
+
+    bool affine_multiple_of_any_modulus(const expr &p, const std::vector<expr> &moduli, const PolyDecls &d)
+    {
+        for (const expr &m : moduli)
+            if (affine_scalar_multiple_of(p, m, d))
+                return true;
+        return false;
+    }
+
+    expr finish_moduli_normalized(const expr &e,
+                                  const std::vector<expr> &moduli,
+                                  const PolyDecls &d)
+    {
+        expr s = simplify_poly(e, d);
+        if (moduli.empty() || !is_poly_ctor(s))
+            return s;
+
+        context &ctx = s.ctx();
+        if (structurally_subsumed_by_moduli(s, moduli) || affine_multiple_of_any_modulus(s, moduli, d))
+            return mk_pconst_mpz(d, ctx, 0);
+        return s;
+    }
+
+    expr normalize_poly_under_moduli(const expr &e,
+                                     const std::vector<expr> &moduli,
+                                     const PolyDecls &d,
+                                     const RewriteOptions &options,
+                                     RewriteStats &stats)
+    {
+        expr s = is_poly_ctor(e) ? simplify_poly(e, d) : e.simplify();
+        if (moduli.empty() || !is_poly_ctor(s))
+            return s;
+
+        context &ctx = s.ctx();
+        if (structurally_subsumed_by_moduli(s, moduli) || affine_multiple_of_any_modulus(s, moduli, d))
+            return mk_pconst_mpz(d, ctx, 0);
+
+        if (is_ctor(s, "PNeg", 1))
+            return finish_moduli_normalized(simplify_pneg(normalize_poly_under_moduli(s.arg(0), moduli, d, options, stats), d),
+                                            moduli, d);
+
+        if (is_ctor(s, "PAdd", 2))
+        {
+            expr a = normalize_poly_under_moduli(s.arg(0), moduli, d, options, stats);
+            expr b = normalize_poly_under_moduli(s.arg(1), moduli, d, options, stats);
+            return finish_moduli_normalized(mk_padd(d, a, b), moduli, d);
+        }
+
+        if (is_ctor(s, "PSub", 2))
+        {
+            expr a = normalize_poly_under_moduli(s.arg(0), moduli, d, options, stats);
+            expr b = normalize_poly_under_moduli(s.arg(1), moduli, d, options, stats);
+            return finish_moduli_normalized(mk_psub(d, a, b), moduli, d);
+        }
+
+        if (is_ctor(s, "PMul", 2))
+        {
+            expr a = normalize_poly_under_moduli(s.arg(0), moduli, d, options, stats);
+            expr b = normalize_poly_under_moduli(s.arg(1), moduli, d, options, stats);
+            expr r = simplify_poly(mk_pmul(d, a, b), d);
+            if (structurally_subsumed_by_moduli(r, moduli) || affine_multiple_of_any_modulus(r, moduli, d))
+                return mk_pconst_mpz(d, ctx, 0);
+            return finish_moduli_normalized(r, moduli, d);
+        }
+
+        if (is_ctor(s, "PPow", 2))
+        {
+            expr base = normalize_poly_under_moduli(s.arg(0), moduli, d, options, stats);
+            int64_t k = -1;
+            if (is_zero_poly(base, d) && get_int64_numeral(s.arg(1), k) && k > 0)
+                return mk_pconst_mpz(d, ctx, 0);
+            expr r = simplify_poly(mk_ppow(d, base, s.arg(1)), d);
+            if (structurally_subsumed_by_moduli(r, moduli) || affine_multiple_of_any_modulus(r, moduli, d))
+                return mk_pconst_mpz(d, ctx, 0);
+            return finish_moduli_normalized(r, moduli, d);
+        }
+        return s;
+    }
+
     struct GeneratorInfo
     {
         expr residual;
@@ -1319,6 +1446,7 @@ namespace
         if (g.is_app() && g.decl().name().str() == "eqP" && g.num_args() == 2)
         {
             expr p = simplify_poly(mk_psub(d, g.arg(0), g.arg(1)), d);
+            p = normalize_poly_under_moduli(p, moduli, d, options, stats);
             return GeneratorInfo(p, p, false, true, label);
         }
         if (g.is_app() && g.decl().name().str() == "eqmodP1" && g.num_args() == 3)
@@ -1330,10 +1458,14 @@ namespace
                 return GeneratorInfo(g, g, true, false, label);
             }
             expr p = simplify_poly(mk_psub(d, g.arg(0), g.arg(1)), d);
+            p = normalize_poly_under_moduli(p, moduli, d, options, stats);
             return GeneratorInfo(p, p, true, true, label);
         }
         if (is_poly_ctor(g))
-            return GeneratorInfo(g, simplify_poly(g, d), false, true, label);
+        {
+            expr p = normalize_poly_under_moduli(g, moduli, d, options, stats);
+            return GeneratorInfo(g, p, false, true, label);
+        }
         return std::nullopt;
     }
 
@@ -1769,7 +1901,7 @@ namespace
         std::unordered_set<std::string> seen;
         for (const expr &r0 : residuals)
         {
-            expr r = is_poly_ctor(r0) ? simplify_poly(r0, d) : r0.simplify();
+            expr r = normalize_poly_under_moduli(r0, moduli, d, options, stats);
             if (is_poly_ctor(r) && poly_equiv_zero(r, moduli, d, options, stats))
                 continue;
             if (seen.insert(r.to_string()).second)
@@ -1807,13 +1939,15 @@ namespace
             std::vector<expr> rewritten_residuals;
             rewritten_residuals.reserve(ex.residuals.size());
             for (const expr &r : ex.residuals)
-                rewritten_residuals.push_back(simplify_poly(apply_rules(r, env, d), d));
+                rewritten_residuals.push_back(normalize_poly_under_moduli(apply_rules(r, env, d),
+                                                                          moduli, d, options, res.stats));
             current = normalize_residuals(rewritten_residuals, moduli, d, options, res.stats);
-            current_target = simplify_poly(apply_rules(current_target, env, d), d);
+            current_target = normalize_poly_under_moduli(apply_rules(current_target, env, d),
+                                                         moduli, d, options, res.stats);
         }
 
         res.residual_generators = std::move(current);
-        res.rewritten_target = current_target;
+        res.rewritten_target = normalize_poly_under_moduli(current_target, moduli, d, options, res.stats);
         return res;
     }
 
@@ -1838,7 +1972,7 @@ namespace
         {
             expr poly = stack.front();
             stack.pop_front();
-            poly = simplify_poly(apply_rules(poly, env, d), d);
+            poly = normalize_poly_under_moduli(apply_rules(poly, env, d), moduli, d, options, res.stats);
 
             auto info = generator_to_polynomial(poly, moduli, d, options, res.stats, res.diagnostics,
                                                 "wl-i" + std::to_string(iterations));
@@ -1909,14 +2043,17 @@ namespace
 
         std::vector<expr> final_residuals;
         for (const expr &r : residuals)
-            final_residuals.push_back(simplify_poly(apply_rules(r, env, d), d));
+            final_residuals.push_back(normalize_poly_under_moduli(apply_rules(r, env, d),
+                                                                  moduli, d, options, res.stats));
         while (!stack.empty())
         {
-            final_residuals.push_back(simplify_poly(apply_rules(stack.front(), env, d), d));
+            final_residuals.push_back(normalize_poly_under_moduli(apply_rules(stack.front(), env, d),
+                                                                  moduli, d, options, res.stats));
             stack.pop_front();
         }
         res.residual_generators = normalize_residuals(final_residuals, moduli, d, options, res.stats);
-        res.rewritten_target = simplify_poly(apply_rules(target, env, d), d);
+        res.rewritten_target = normalize_poly_under_moduli(apply_rules(target, env, d),
+                                                           moduli, d, options, res.stats);
         return res;
     }
 
@@ -1997,10 +2134,11 @@ namespace
         }
         if (e.decl().name().str() == "eqmodP1" && e.num_args() == 3)
         {
-            expr a = simplify_poly(e.arg(0), d);
-            expr b = simplify_poly(e.arg(1), d);
             expr m = simplify_poly(e.arg(2), d);
-            if (same_ast(a, b) || expr_key(a) == expr_key(b))
+            std::vector<expr> active_moduli{m};
+            expr a = normalize_poly_under_moduli(e.arg(0), active_moduli, d, options, stats);
+            expr b = normalize_poly_under_moduli(e.arg(1), active_moduli, d, options, stats);
+            if (equivalent_poly(a, b, active_moduli, d, options, stats))
                 return e.ctx().bool_val(true);
             return mk_eqmodp1(d, a, b, m);
         }
@@ -2116,7 +2254,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
     RewriteOptions options)
 {
     RewriteTwoPhaseResult out{ideal_polynomials, postconditions, {}, {}, {}};
-    if (!options.enable_rewriting || ideal_polynomials.empty())
+    if (!options.enable_rewriting)
         return out;
 
     std::vector<expr> roots;
@@ -2129,7 +2267,23 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
         roots.insert(roots.end(), p.moduli.begin(), p.moduli.end());
     }
     roots.insert(roots.end(), moduli.begin(), moduli.end());
+    if (roots.empty())
+        return out;
     PolyDecls d = collect_decls(roots);
+    if (!d.pconst)
+        return out;
+
+    auto post_moduli = [&](const AnnotatedPostcondition &p)
+    {
+        std::vector<expr> active = moduli;
+        active.insert(active.end(), p.moduli.begin(), p.moduli.end());
+        return active;
+    };
+
+    for (auto &p : out.postconditions)
+        p.polynomial = normalize_poly_under_moduli(p.polynomial, post_moduli(p), d, options, out.stats);
+    if (ideal_polynomials.empty())
+        return out;
 
     std::vector<AnnotatedPolynomial> finished;
     std::deque<AnnotatedPolynomial> todo(out.ideal_polynomials.begin(), out.ideal_polynomials.end());
@@ -2160,14 +2314,17 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
         std::vector<RewriteRule> single{pat->rule};
         out.rules_used.push_back(pat->rule);
         for (auto &p : finished)
-            p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d), d);
+            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d),
+                                                       moduli, d, options, out.stats);
         for (auto &p : todo)
-            p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d), d);
+            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d),
+                                                       moduli, d, options, out.stats);
         for (auto &p : out.postconditions)
         {
             p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d), d);
             for (auto &m : p.moduli)
                 m = simplify_poly(apply_rules(m, single, d), d);
+            p.polynomial = normalize_poly_under_moduli(p.polynomial, post_moduli(p), d, options, out.stats);
         }
     }
     out.ideal_polynomials = std::move(finished);
@@ -2738,6 +2895,110 @@ int run_rewrite_selftests()
         ok &= check(equivalent_for_test(active.rewritten_target,
                                         eqps[0].arg(0).arg(0).arg(0), d),
                     "active modular common pattern did not rewrite y to x");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] active modulus rewrites target multiples to zero\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const m Int)"
+                                        "(assert (eqP (PConst x) (PConst 0)))");
+        PolyDecls d = collect_decls(asserts);
+        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
+        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
+        expr target = mk_padd(d, x, mk_pmul(d, mk_pconst_mpz(d, ctx, 3), m));
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        RewriteResult rr = rewrite_assignments({}, target, {m}, opts);
+        bool ok = check(equivalent_for_test(rr.rewritten_target, x, d),
+                        "target multiple of active modulus was not rewritten to zero");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] active modulus rewrites affine scalar multiples to zero\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const y Int)"
+                                        "(assert (eqP (PConst x) (PConst 0)))");
+        PolyDecls d = collect_decls(asserts);
+        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
+        expr y = mk_decl_app(ctx, d.pconst, {ctx.int_const("y")});
+        expr two = mk_pconst_mpz(d, ctx, 2);
+        expr target = mk_psub(d, mk_pmul(d, two, x), mk_pmul(d, two, y));
+        expr modulus = mk_psub(d, x, y);
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        RewriteResult rr = rewrite_assignments({}, target, {modulus}, opts);
+        bool ok = check(equivalent_for_test(rr.rewritten_target, mk_pconst_mpz(d, ctx, 0), d),
+                        "affine multiple 2*x - 2*y was not rewritten to zero under modulus x-y");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] active modulus simplifies generators before extracting rules\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const m Int)(declare-const z Int)"
+                                        "(assert (eqP (PSub (PAdd (PConst x) (PMul (PConst 3) (PConst m))) (PConst z)) (PConst 0)))");
+        PolyDecls d = collect_decls(asserts);
+        std::vector<expr> eqps;
+        for (const expr &a : asserts)
+            collect_eqP_rec(a, eqps);
+        expr residual = mk_psub(d, eqps[0].arg(0), eqps[0].arg(1));
+        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
+        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
+        expr z = mk_decl_app(ctx, d.pconst, {ctx.int_const("z")});
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        RewriteResult rr = rewrite_assignments({residual}, z, {m}, opts);
+        bool ok = check(equivalent_for_test(rr.rewritten_target, x, d),
+                        "generator multiple of active modulus was kept in extracted rule");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] eqmodP1 arguments rewrite by their own modulus\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const m Int)"
+                                        "(assert (eqmodP1 (PAdd (PConst x) (PMul (PConst 3) (PConst m))) (PConst x) (PConst m)))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool ok = check(rr.asserts.empty(), "eqmodP1 did not reduce to true after dropping modulus multiple");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] two-phase postcondition rewrites by its modulus\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const m Int)"
+                                        "(assert (eqP (PConst x) (PConst 0)))");
+        PolyDecls d = collect_decls(asserts);
+        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
+        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
+        expr post_poly = mk_padd(d, x, mk_pmul(d, mk_pconst_mpz(d, ctx, 3), m));
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        RewriteTwoPhaseResult rr = rewrite_assignments_two_phase({}, {AnnotatedPostcondition(asserts[0], post_poly, {m})}, {}, opts);
+        bool ok = check(rr.postconditions.size() == 1 &&
+                            equivalent_for_test(rr.postconditions[0].polynomial, x, d),
+                        "two-phase postcondition kept multiple of its modulus");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
