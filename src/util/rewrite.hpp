@@ -21,17 +21,15 @@ struct RewriteOptions
     bool enable_rewriting = true;
     bool use_singular_normalization = true;
     bool use_subexpression_rules = false;
-    bool conservative_mode = true;
     bool enable_expression_growth_check = false;
     bool reject_duplicate_lhs = false;
     bool reject_conflicting_lhs = false;
     std::size_t max_rounds = 100;
     std::size_t max_expression_growth = 4096;
 
-    // Compatibility knobs accepted by main.cpp. The old heuristic pipeline is
-    // gone; these are mapped onto the OCaml-style extractor where meaningful.
-    bool enable_expr_rewriting = true;
-    bool suppress_expr_rhs_for_eqmodp1_atoms = true;
+    // Preserve variables that occur in eqmodP1 atoms by preventing them from
+    // becoming rewrite-rule left-hand sides.
+    bool preserve_eqmodp1_vars = false;
 
     std::unordered_set<std::string> suppressed_lhs_keys;
 };

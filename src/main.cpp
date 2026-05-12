@@ -37,10 +37,7 @@ static bool SHOW_MODEL = true;
 static bool PRINT_RING_DETAIL = false;
 static bool PRINT_FIXED_ALL = true;
 static bool PRINT_PROPAGATE = true;
-static bool PRINT_POW_STATS = false;
-static bool PRINT_POW_BASE = false;
 static constexpr int64_t MAX_POW_EXPAND = 65536;
-static size_t LOG_EXPR_MAXLEN = 20000000;
 static util::Logger g_log;
 
 class TeeStreamBuf : public std::streambuf
@@ -69,6 +66,21 @@ protected:
     }
 };
 
+class ScopedStreamBuf
+{
+    std::ostream &stream_;
+    std::streambuf *old_;
+
+public:
+    ScopedStreamBuf(std::ostream &stream, std::streambuf *next)
+        : stream_(stream), old_(stream.rdbuf(next)) {}
+
+    ~ScopedStreamBuf()
+    {
+        stream_.rdbuf(old_);
+    }
+};
+
 static bool ENV = false;
 static bool ENABLE_ALL_FALSE = true;
 static bool ENABLE_ALL_TRUE = true;
@@ -77,24 +89,24 @@ static bool ALL_FALSE_ASSUME_M_PRIME = false;
 static bool ENABLE_REWRITING = true;
 // The OCaml-style rewriter extracts variable assignments by default. Optional
 // safety/coverage knobs remain exposed:
-//   * SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS (default true): never extract a
-//     rule whose LHS appears in any eqmodP1 atom.  Keeps every other ExprRhs
-//     benefit but leaves the modular target polynomial alone.
-//   * ENABLE_EXPR_REWRITING (default true): full opt-out of ExprRhs rules.
-//     Setting this false disables sub-expression assignment extraction.
+//   * PRESERVE_EQMODP1_VARS (default false): opt back into the older
+//     conservative mode that never extracts a rule whose LHS appears in any
+//     eqmodP1 atom.
 //   * ENABLE_SUBEXPRESSION_RULES (default false): opt into separable
 //     sub-expression assignment extraction.
 //   * ENABLE_EXPRESSION_GROWTH_CHECK (default false): skip rewrite rules whose
 //     RHS grows beyond RewriteOptions::max_expression_growth.
 //   * REJECT_DUPLICATE_LHS / REJECT_CONFLICTING_LHS (default false): opt into
 //     dropping duplicate or conflicting rewrite candidates.
-static bool ENABLE_EXPR_REWRITING = true;
-static bool SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS = true;
+//   * ENABLE_REWRITE_SINGULAR_NF (default true): allow Singular-backed zero
+//     checks during rewrite normalization.
+static bool PRESERVE_EQMODP1_VARS = false;
 static bool ENABLE_SUBEXPRESSION_RULES = false;
 static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
 static bool REJECT_DUPLICATE_LHS = false;
 static bool REJECT_CONFLICTING_LHS = false;
-static bool ENABLE_AUTO_LEMMAS = false;
+static bool ENABLE_REWRITE_SINGULAR_NF = true;
+static bool ENABLE_AUTO_LEMMAS = true;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
 
 static void init_singular()
@@ -834,26 +846,6 @@ static poly expr_to_poly_anyring(const expr &e, RingEnv &RE, const CoeffVarMap &
 }
 
 // ---------------- Poly(Int) term -> Singular poly ----------------
-static int poly_num_terms(poly P)
-{
-    int n = 0;
-    for (poly t = P; t != nullptr; t = pNext(t))
-        ++n;
-    return n;
-}
-
-static int poly_max_exp_in_var(poly P, const ring R, int var_idx_1based)
-{
-    int mx = 0;
-    for (poly t = P; t != nullptr; t = pNext(t))
-    {
-        int e = p_GetExp(t, var_idx_1based, R);
-        if (e > mx)
-            mx = e;
-    }
-    return mx;
-}
-
 static poly polyterm_to_singular_poly(const expr &p,
                                       const IndetEnv &env,
                                       const std::vector<std::string> &indet_ring_names,
@@ -953,35 +945,10 @@ static poly polyterm_to_singular_poly(const expr &p,
             std::exit(2);
         }
 
-        const std::string base_s = PRINT_POW_BASE ? p.arg(0).to_string() : std::string();
-        auto t0 = clk::now();
-
         poly base = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
 
         if (k == 1)
-        {
-            auto t1 = clk::now();
-            if (PRINT_POW_STATS)
-            {
-                int terms = poly_num_terms(base);
-                int deg_u = -1;
-                auto itu = env.idx.find("u");
-                if (itu != env.idx.end())
-                {
-                    const std::string &u_ring = indet_ring_names[itu->second];
-                    int uidx = RE.ensure_var_idx(u_ring);
-                    deg_u = poly_max_exp_in_var(base, R, uidx);
-                }
-                std::cout << "[pow][" << tag << "] k=" << k
-                          << " time=" << util::fmt_duration(t1 - t0)
-                          << " terms=" << terms
-                          << " deg_u=" << ((deg_u >= 0) ? std::to_string(deg_u) : "NA");
-                if (PRINT_POW_BASE)
-                    std::cout << " base=" << base_s;
-                std::cout << "\n";
-            }
             return base;
-        }
 
         poly res = poly_from_si(1, R);
         uint64_t e = (uint64_t)k;
@@ -1008,28 +975,6 @@ static poly polyterm_to_singular_poly(const expr &p,
 
         if (base_cur)
             p_Delete(&base_cur, R);
-
-        auto t1 = clk::now();
-
-        if (PRINT_POW_STATS)
-        {
-            int terms = poly_num_terms(res);
-            int deg_u = -1;
-            auto itu = env.idx.find("u");
-            if (itu != env.idx.end())
-            {
-                const std::string &u_ring = indet_ring_names[itu->second];
-                int uidx = RE.ensure_var_idx(u_ring);
-                deg_u = poly_max_exp_in_var(res, R, uidx);
-            }
-            std::cout << "[pow][" << tag << "] k=" << k
-                      << " time=" << util::fmt_duration(t1 - t0)
-                      << " terms=" << terms
-                      << " deg_u=" << ((deg_u >= 0) ? std::to_string(deg_u) : "NA");
-            if (PRINT_POW_BASE)
-                std::cout << " base=" << base_s;
-            std::cout << "\n";
-        }
 
         return res;
     }
@@ -2886,24 +2831,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::streambuf *orig_cout = std::cout.rdbuf();
-    std::streambuf *orig_cerr = std::cerr.rdbuf();
-    TeeStreamBuf tee_cout(orig_cout, runlog.rdbuf());
-    TeeStreamBuf tee_cerr(orig_cerr, runlog.rdbuf());
-    std::cout.rdbuf(&tee_cout);
-    std::cerr.rdbuf(&tee_cerr);
+    TeeStreamBuf tee_cout(std::cout.rdbuf(), runlog.rdbuf());
+    TeeStreamBuf tee_cerr(std::cerr.rdbuf(), runlog.rdbuf());
+    ScopedStreamBuf restore_cout(std::cout, &tee_cout);
+    ScopedStreamBuf restore_cerr(std::cerr, &tee_cerr);
 
     try
     {
         if (argc < 2)
         {
             std::cerr << "Usage: " << argv[0]
-                      << " <input.smt2> [--ring-detail] [--no-pow-stats] [--no-pow-base]"
-                         " [--expr-len=N] [--disable-all-false] [--disable-all-true] [--disable-mixed]"
+                      << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
+                         " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
                          " [--m-prime] [--disable-auto-lemmas]"
-                         " [--no-rewriting] [--no-expr-rewriting]"
-                         " [--allow-expr-rewriting-in-eqmodp1]"
-                         " [--enable-subexpression-rules]"
+                         " [--no-rewriting] [--no-singular-nf]"
+                         " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
                          " [--enable-expression-growth-check]"
                          " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
                          " [--disable-final-fixed-value-check]\n";
@@ -2915,44 +2857,41 @@ int main(int argc, char **argv)
             std::string a = argv[i];
             if (a == "--ring-detail")
                 PRINT_RING_DETAIL = true;
-            if (a == "--no-pow-stats")
-                PRINT_POW_STATS = false;
-            if (a == "--no-pow-base")
-                PRINT_POW_BASE = false;
-            if (a == "--env")
+            else if (a == "--env")
                 ENV = true;
-            if (a == "--no-trace")
+            else if (a == "--no-trace")
                 g_log.set_global(util::LogLevel::Debug);
-
-            if (a == "--disable-all-false")
+            else if (a == "--disable-all-false")
                 ENABLE_ALL_FALSE = false;
-            if (a == "--disable-all-true")
+            else if (a == "--disable-all-true")
                 ENABLE_ALL_TRUE = false;
-            if (a == "--disable-mixed")
+            else if (a == "--disable-mixed")
                 ENABLE_MIXED = false;
-            if (a == "--m-prime")
+            else if (a == "--m-prime")
                 ALL_FALSE_ASSUME_M_PRIME = true;
-            if (a == "--no-rewriting")
+            else if (a == "--no-rewriting")
                 ENABLE_REWRITING = false;
-            if (a == "--no-expr-rewriting")
-                ENABLE_EXPR_REWRITING = false;
-            if (a == "--allow-expr-rewriting-in-eqmodp1")
-                SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS = false;
-            if (a == "--enable-subexpression-rules")
+            else if (a == "--no-singular-nf")
+                ENABLE_REWRITE_SINGULAR_NF = false;
+            else if (a == "--preserve-eqmodp1-vars")
+                PRESERVE_EQMODP1_VARS = true;
+            else if (a == "--enable-subexpression-rules")
                 ENABLE_SUBEXPRESSION_RULES = true;
-            if (a == "--enable-expression-growth-check")
+            else if (a == "--enable-expression-growth-check")
                 ENABLE_EXPRESSION_GROWTH_CHECK = true;
-            if (a == "--reject-duplicate-lhs")
+            else if (a == "--reject-duplicate-lhs")
                 REJECT_DUPLICATE_LHS = true;
-            if (a == "--reject-conflicting-lhs")
+            else if (a == "--reject-conflicting-lhs")
                 REJECT_CONFLICTING_LHS = true;
-            if (a == "--disable-auto-lemmas")
+            else if (a == "--disable-auto-lemmas")
                 ENABLE_AUTO_LEMMAS = false;
-            if (a == "--disable-final-check")
+            else if (a == "--disable-final-fixed-value-check")
                 ENABLE_FINAL_FIXED_VALUE_CHECK = false;
-
-            if (a.rfind("--expr-len=", 0) == 0)
-                LOG_EXPR_MAXLEN = std::stoul(a.substr(std::string("--expr-len=").size()));
+            else
+            {
+                std::cerr << "Unknown option: " << a << "\n";
+                return 1;
+            }
         }
 
         LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
@@ -2969,9 +2908,9 @@ int main(int argc, char **argv)
 
         RewriteOptions rwopt;
         rwopt.enable_rewriting = ENABLE_REWRITING;
-        rwopt.enable_expr_rewriting = ENABLE_EXPR_REWRITING;
+        rwopt.use_singular_normalization = ENABLE_REWRITE_SINGULAR_NF;
         rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
-        rwopt.suppress_expr_rhs_for_eqmodp1_atoms = SUPPRESS_EXPR_RHS_FOR_EQMODP1_ATOMS;
+        rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
         rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
         rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
         rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
@@ -3093,23 +3032,17 @@ int main(int argc, char **argv)
         std::cout << "[timer] z3.check() = " << util::fmt_duration(t1 - t0) << "\n";
         std::cout.flush();
         std::cerr.flush();
-        std::cout.rdbuf(orig_cout);
-        std::cerr.rdbuf(orig_cerr);
         runlog.flush();
 
         return 0;
     }
     catch (const z3::exception &ex)
     {
-        std::cout.rdbuf(orig_cout);
-        std::cerr.rdbuf(orig_cerr);
         std::cerr << "Z3 error: " << ex.msg() << "\n";
         return 1;
     }
     catch (const std::exception &ex)
     {
-        std::cout.rdbuf(orig_cout);
-        std::cerr.rdbuf(orig_cerr);
         std::cerr << "Error: " << ex.what() << "\n";
         return 1;
     }
