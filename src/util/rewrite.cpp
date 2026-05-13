@@ -672,16 +672,17 @@ namespace
         Pattern(const RewriteRule &r, std::string k) : rule(r), lhs_key(std::move(k)) {}
     };
 
-    std::optional<Pattern> make_common_assignment(const expr &lhs,
-                                                  const expr &rhs0,
-                                                  const expr &poly,
-                                                  const expr &source,
-                                                  const PolyDecls &d,
-                                                  bool modular,
-                                                  const RewriteOptions &options,
-                                                  RewriteStats &stats,
-                                                  std::vector<std::string> &diagnostics,
-                                                  const std::string &label)
+    std::optional<Pattern> make_variable_assignment(const expr &lhs,
+                                                    const expr &rhs0,
+                                                    const expr &poly,
+                                                    const expr &source,
+                                                    const PolyDecls &d,
+                                                    bool modular,
+                                                    const RewriteOptions &options,
+                                                    RewriteStats &stats,
+                                                    std::vector<std::string> &diagnostics,
+                                                    const std::string &label,
+                                                    const char *diagnostic_tag)
     {
         if (!is_poly_variable(lhs))
             return std::nullopt;
@@ -692,14 +693,14 @@ namespace
         if (collect_vars(rhs).count(key) || contains_expr(rhs, lhs))
         {
             ++stats.skipped_lhs_occurs_in_rhs;
-            diagnostics.push_back(label + ": skipped common lhs occurs in rhs");
+            diagnostics.push_back(label + ": skipped " + diagnostic_tag + " lhs occurs in rhs");
             return std::nullopt;
         }
         if (options.enable_expression_growth_check &&
             expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
         {
             ++stats.skipped_expression_growth;
-            diagnostics.push_back(label + ": skipped common expression growth");
+            diagnostics.push_back(label + ": skipped " + diagnostic_tag + " expression growth");
             return std::nullopt;
         }
         RewriteRule r(lhs, rhs, source, RewriteRule::Kind::Variable, modular, label);
@@ -711,40 +712,6 @@ namespace
                             const PolyDecls &d,
                             const RewriteOptions &options,
                             RewriteStats &stats);
-
-    std::optional<Pattern> make_separable_assignment(const expr &lhs,
-                                                     const expr &rhs0,
-                                                     const expr &poly,
-                                                     const expr &source,
-                                                     const PolyDecls &d,
-                                                     bool modular,
-                                                     const RewriteOptions &options,
-                                                     RewriteStats &stats,
-                                                     std::vector<std::string> &diagnostics,
-                                                     const std::string &label)
-    {
-        if (!is_poly_variable(lhs))
-            return std::nullopt;
-        const std::string key = variable_key(lhs);
-        if (options.suppressed_lhs_keys.count(key))
-            return std::nullopt;
-        expr rhs = simplify_poly(rhs0, d);
-        if (collect_vars(rhs).count(key) || contains_expr(rhs, lhs))
-        {
-            ++stats.skipped_lhs_occurs_in_rhs;
-            diagnostics.push_back(label + ": skipped separable lhs occurs in rhs");
-            return std::nullopt;
-        }
-        if (options.enable_expression_growth_check &&
-            expr_size(rhs) > expr_size(poly) + options.max_expression_growth)
-        {
-            ++stats.skipped_expression_growth;
-            diagnostics.push_back(label + ": skipped separable expression growth");
-            return std::nullopt;
-        }
-        RewriteRule r(lhs, rhs, source, RewriteRule::Kind::Variable, modular, label);
-        return Pattern(r, key);
-    }
 
     void collect_additive_variable_candidates(const expr &e, std::vector<expr> &out)
     {
@@ -812,8 +779,8 @@ namespace
             {
                 expr zero = mk_pconst_mpz(d, poly.ctx(), 0);
                 expr rhs = simplify_poly(isolate_additive_variable(lhs, poly, zero, d), d);
-                if (auto pat = make_separable_assignment(lhs, rhs, poly, source, d, modular,
-                                                         options, stats, diagnostics, label))
+                if (auto pat = make_variable_assignment(lhs, rhs, poly, source, d, modular,
+                                                        options, stats, diagnostics, label, "separable"))
                     return pat;
             }
             catch (const std::exception &)
@@ -824,8 +791,8 @@ namespace
         return std::nullopt;
     }
 
-    // Fast path for common assignment shapes before the OCaml-style general
-    // get_rewrite_pattern fallback.
+    // Priority path for the instruction-shaped patterns used by rewrite.ml
+    // before the general separable fallback tries candidates in sorted order.
     std::optional<Pattern> extract_common_assignment(const expr &poly,
                                                      const expr &source,
                                                      const std::vector<expr> &moduli,
@@ -846,43 +813,47 @@ namespace
         {
             const expr inner_l = a.arg(0);
             const expr inner_r = a.arg(1);
-            if (is_poly_variable(inner_r) && !contains_expr(b, inner_r))
-                return make_common_assignment(inner_r, inner_l, poly, source, d, true, options, stats,
-                                              diagnostics, label);
             if (is_poly_variable(inner_l) && !contains_expr(b, inner_l))
-                return make_common_assignment(inner_l, inner_r, poly, source, d, true, options, stats,
-                                              diagnostics, label);
+                return make_variable_assignment(inner_l, inner_r, poly, source, d, true, options, stats,
+                                                diagnostics, label, "common");
+            if (is_poly_variable(inner_r) && !contains_expr(b, inner_r))
+                return make_variable_assignment(inner_r, inner_l, poly, source, d, true, options, stats,
+                                                diagnostics, label, "common");
         }
 
-        if (is_poly_variable(b))
-            return make_common_assignment(b, a, poly, source, d, modular, options, stats, diagnostics, label);
-        if (is_poly_variable(a))
-            return make_common_assignment(a, b, poly, source, d, modular, options, stats, diagnostics, label);
+        if (is_poly_variable(a) && !contains_expr(b, a))
+            return make_variable_assignment(a, b, poly, source, d, modular, options, stats, diagnostics, label, "common");
+        if (is_poly_variable(b) && !contains_expr(a, b))
+            return make_variable_assignment(b, a, poly, source, d, modular, options, stats, diagnostics, label, "common");
 
         if (is_ctor(a, "PAdd", 2))
         {
-            if (is_poly_variable(a.arg(0)))
-                return make_common_assignment(a.arg(0), mk_psub(d, b, a.arg(1)), poly, source, d, modular,
-                                              options, stats, diagnostics, label);
+            const expr add_l = a.arg(0);
+            const expr add_r = a.arg(1);
+            if (is_poly_variable(add_l) && !contains_expr(add_r, add_l) && !contains_expr(b, add_l))
+                return make_variable_assignment(add_l, mk_psub(d, b, add_r), poly, source, d, modular,
+                                                options, stats, diagnostics, label, "common");
         }
         if (is_ctor(b, "PAdd", 2))
         {
-            if (is_poly_variable(b.arg(0)))
-                return make_common_assignment(b.arg(0), mk_psub(d, a, b.arg(1)), poly, source, d, modular,
-                                              options, stats, diagnostics, label);
+            const expr add_l = b.arg(0);
+            const expr add_r = b.arg(1);
+            if (is_poly_variable(add_l) && !contains_expr(add_r, add_l) && !contains_expr(a, add_l))
+                return make_variable_assignment(add_l, mk_psub(d, a, add_r), poly, source, d, modular,
+                                                options, stats, diagnostics, label, "common");
         }
         return std::nullopt;
     }
 
-    std::optional<Pattern> extract_ocaml_style_assignment(const expr &poly,
-                                                          const expr &source,
-                                                          const std::vector<expr> &moduli,
-                                                          const PolyDecls &d,
-                                                          bool modular,
-                                                          const RewriteOptions &options,
-                                                          RewriteStats &stats,
-                                                          std::vector<std::string> &diagnostics,
-                                                          const std::string &label)
+    std::optional<Pattern> extract_variable_assignment_pattern(const expr &poly,
+                                                               const expr &source,
+                                                               const std::vector<expr> &moduli,
+                                                               const PolyDecls &d,
+                                                               bool modular,
+                                                               const RewriteOptions &options,
+                                                               RewriteStats &stats,
+                                                               std::vector<std::string> &diagnostics,
+                                                               const std::string &label)
     {
         if (auto common = extract_common_assignment(poly, source, moduli, d, modular,
                                                     options, stats, diagnostics, label))
@@ -1479,9 +1450,9 @@ namespace
     {
         if (!info.usable)
             return std::nullopt;
-        auto pat = extract_ocaml_style_assignment(info.polynomial, info.residual, moduli, d,
-                                                  info.modular, options, stats, diagnostics,
-                                                  info.label);
+        auto pat = extract_variable_assignment_pattern(info.polynomial, info.residual, moduli, d,
+                                                       info.modular, options, stats, diagnostics,
+                                                       info.label);
         if (pat)
             return pat;
         if (options.use_subexpression_rules)
@@ -2616,15 +2587,15 @@ int run_rewrite_selftests()
                          "(assert (eqP (PSub (PSub (PConst x) (PConst y)) (PConst 1)) (PConst 0)))",
                          "(PConst x)", "(PAdd (PConst y) (PConst 1))", true));
 
-    run(test_rule_target("x - y gives y := x",
+    run(test_rule_target("x - y gives x := y",
                          "(declare-const x Int)(declare-const y Int)"
                          "(assert (eqP (PSub (PConst x) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PConst x)", true));
+                         "(PConst x)", "(PConst y)", true));
 
-    run(test_rule_target("y - x gives x := y",
+    run(test_rule_target("y - x gives y := x",
                          "(declare-const x Int)(declare-const y Int)"
                          "(assert (eqP (PSub (PConst y) (PConst x)) (PConst 0)))",
-                         "(PConst x)", "(PConst y)", true));
+                         "(PConst y)", "(PConst x)", true));
 
     run(test_rule_target("y + 1 - x gives x := y + 1",
                          "(declare-const x Int)(declare-const y Int)"
@@ -2885,16 +2856,16 @@ int run_rewrite_selftests()
             collect_eqP_rec(a, eqps);
         expr residual = first_eqp_diff(asserts, d);
         expr modulus = eqps[0].arg(0).arg(1);
-        expr target = eqps[0].arg(0).arg(0).arg(1);
+        expr target = eqps[0].arg(0).arg(0).arg(0);
         RewriteOptions opts;
         opts.use_singular_normalization = false;
         RewriteResult inactive = rewrite_assignments({residual}, target, {}, opts);
         RewriteResult active = rewrite_assignments({residual}, target, {modulus}, opts);
         bool ok = check(equivalent_for_test(inactive.rewritten_target, target, d),
-                        "inactive modular common pattern rewrote y without active modulus");
+                        "inactive modular common pattern rewrote x without active modulus");
         ok &= check(equivalent_for_test(active.rewritten_target,
-                                        eqps[0].arg(0).arg(0).arg(0), d),
-                    "active modular common pattern did not rewrite y to x");
+                                        eqps[0].arg(0).arg(0).arg(1), d),
+                    "active modular common pattern did not rewrite x to y");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
@@ -2958,9 +2929,9 @@ int run_rewrite_selftests()
         expr z = mk_decl_app(ctx, d.pconst, {ctx.int_const("z")});
         RewriteOptions opts;
         opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments({residual}, z, {m}, opts);
-        bool ok = check(equivalent_for_test(rr.rewritten_target, x, d),
-                        "generator multiple of active modulus was kept in extracted rule");
+        RewriteResult rr = rewrite_assignments({residual}, x, {m}, opts);
+        bool ok = check(equivalent_for_test(rr.rewritten_target, z, d),
+                        "active modulus simplification did not expose the source assignment direction");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
