@@ -106,8 +106,153 @@ static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
 static bool REJECT_DUPLICATE_LHS = false;
 static bool REJECT_CONFLICTING_LHS = false;
 static bool ENABLE_REWRITE_SINGULAR_NF = true;
-static bool ENABLE_AUTO_LEMMAS = true;
+static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
+
+struct AccumulatedTiming
+{
+    std::size_t calls = 0;
+    std::chrono::nanoseconds elapsed{0};
+
+    void reset()
+    {
+        calls = 0;
+        elapsed = std::chrono::nanoseconds{0};
+    }
+
+    template <class Rep, class Period>
+    void add(std::chrono::duration<Rep, Period> d)
+    {
+        ++calls;
+        elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(d);
+    }
+};
+
+static AccumulatedTiming g_groebner_timing;
+static AccumulatedTiming g_final_fixed_value_check_timing;
+static std::optional<clk::time_point> g_final_fixed_value_check_span_start;
+
+class ScopedAccumulatedTiming
+{
+    AccumulatedTiming &timing_;
+    clk::time_point start_;
+
+public:
+    explicit ScopedAccumulatedTiming(AccumulatedTiming &timing)
+        : timing_(timing), start_(clk::now())
+    {
+        if (&timing_ == &g_final_fixed_value_check_timing &&
+            !g_final_fixed_value_check_span_start)
+        {
+            g_final_fixed_value_check_span_start = start_;
+        }
+    }
+
+    ~ScopedAccumulatedTiming()
+    {
+        timing_.add(clk::now() - start_);
+    }
+};
+
+struct CliSummary
+{
+    std::string input_file;
+    std::string options;
+    std::chrono::nanoseconds parse_time{0};
+    std::chrono::nanoseconds rewrite_time{0};
+    std::chrono::nanoseconds solve_time{0};
+    std::chrono::nanoseconds total_time{0};
+    std::size_t groebner_calls = 0;
+    std::chrono::nanoseconds groebner_time{0};
+    std::size_t final_fixed_value_check_calls = 0;
+    std::chrono::nanoseconds final_fixed_value_check_time{0};
+    check_result result = unknown;
+};
+
+static std::string fmt_cli_seconds(std::chrono::nanoseconds d)
+{
+    const double seconds = std::chrono::duration<double>(d).count();
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(4) << seconds << " seconds";
+    return oss.str();
+}
+
+static std::string check_result_name(check_result r)
+{
+    switch (r)
+    {
+    case sat:
+        return "sat";
+    case unsat:
+        return "unsat";
+    case unknown:
+        return "unknown";
+    }
+    return "unknown";
+}
+
+static void print_cli_value_row(std::ostream &os, const std::string &label, const std::string &value)
+{
+    os << std::left << std::setw(49) << label << value << "\n";
+}
+
+static void begin_cli_timed_row(std::ostream &os, const std::string &label)
+{
+    os << std::left << std::setw(49) << label;
+    os.flush();
+}
+
+static void finish_cli_timed_row(std::ostream &os,
+                                 const std::string &status,
+                                 std::chrono::nanoseconds elapsed,
+                                 std::optional<std::size_t> calls = std::nullopt)
+{
+    std::ostringstream state;
+    state << "[" << status << "]";
+    if (calls)
+        state << " " << *calls << " calls";
+
+    os << std::left << std::setw(16) << state.str()
+       << fmt_cli_seconds(elapsed) << "\n";
+    os.flush();
+}
+
+static void print_cli_input_section(std::ostream &os, const std::string &input_file, const std::string &options)
+{
+    os << "# Input\n\n";
+    print_cli_value_row(os, "Input file:", input_file);
+    print_cli_value_row(os, "Options:", options);
+    os << "\n# Procedure main\n\n";
+    os.flush();
+}
+
+static std::string join_options(int argc, char **argv)
+{
+    if (argc <= 2)
+        return "(none)";
+
+    std::ostringstream oss;
+    for (int i = 2; i < argc; ++i)
+    {
+        if (i > 2)
+            oss << ' ';
+        oss << argv[i];
+    }
+    return oss.str();
+}
+
+static void print_usage(std::ostream &os, const char *prog)
+{
+    os << "Usage: " << prog
+       << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
+          " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
+          " [--m-prime] [--disable-auto-lemmas]"
+          " [--no-rewriting] [--no-singular-nf]"
+          " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
+          " [--enable-expression-growth-check]"
+          " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
+          " [--disable-final-fixed-value-check] [--show-model]\n";
+}
 
 static void init_singular()
 {
@@ -264,9 +409,9 @@ static bool is_tracking_symbol_name(const std::string &name)
     return true;
 }
 
-static void print_model_filtered(const z3::model &m)
+static void print_model_filtered(const z3::model &m, std::ostream &os = std::cout)
 {
-    std::cout << "Model:\n";
+    os << "Model:\n";
 
     Z3_context c = (Z3_context)m.ctx();
     Z3_model zm = (Z3_model)m;
@@ -289,10 +434,10 @@ static void print_model_filtered(const z3::model &m)
 
         z3::expr val(m.ctx(), ast);
 
-        std::cout << "(define-fun " << name
-                  << " () " << fd.range()
-                  << "\n  " << val
-                  << ")\n";
+        os << "(define-fun " << name
+           << " () " << fd.range()
+           << "\n  " << val
+           << ")\n";
     }
 }
 
@@ -1001,6 +1146,7 @@ static ideal groebner_std(ideal I, const ring R, const std::string &label = "")
     intvec **w = &w0;
     ideal G = kStd(I, NULL, testHomog, w, NULL, 0, 0, NULL);
     auto t1 = clk::now();
+    g_groebner_timing.add(t1 - t0);
 
     std::ostringstream oss;
     oss << "Groebner basis std";
@@ -2777,6 +2923,7 @@ public:
 
     void fixed(const expr &t, const expr &v) override
     {
+        ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
         log_fixed(t, v);
         cache_fixed_expr(t, v);
 
@@ -2805,7 +2952,10 @@ public:
     {
         // check_eqmodP1_conflicts_when_ready();
         if (ENABLE_FINAL_FIXED_VALUE_CHECK)
+        {
+            ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
             final_fixed_value_check_eqmodP1();
+        }
         std::cout << "===== [final] =====\n";
     }
 
@@ -2831,24 +2981,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    TeeStreamBuf tee_cout(std::cout.rdbuf(), runlog.rdbuf());
-    TeeStreamBuf tee_cerr(std::cerr.rdbuf(), runlog.rdbuf());
-    ScopedStreamBuf restore_cout(std::cout, &tee_cout);
-    ScopedStreamBuf restore_cerr(std::cerr, &tee_cerr);
+    std::ostream terminal_out(std::cout.rdbuf());
+    bool show_model_on_terminal = false;
 
     try
     {
         if (argc < 2)
         {
-            std::cerr << "Usage: " << argv[0]
-                      << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
-                         " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
-                         " [--m-prime] [--disable-auto-lemmas]"
-                         " [--no-rewriting] [--no-singular-nf]"
-                         " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
-                         " [--enable-expression-growth-check]"
-                         " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
-                         " [--disable-final-fixed-value-check]\n";
+            print_usage(std::cerr, argv[0]);
+            runlog << "Usage requested: missing input file\n";
             return 1;
         }
 
@@ -2887,162 +3028,239 @@ int main(int argc, char **argv)
                 ENABLE_AUTO_LEMMAS = false;
             else if (a == "--disable-final-fixed-value-check")
                 ENABLE_FINAL_FIXED_VALUE_CHECK = false;
+            else if (a == "--show-model")
+                show_model_on_terminal = true;
             else
             {
                 std::cerr << "Unknown option: " << a << "\n";
+                print_usage(std::cerr, argv[0]);
+                runlog << "Unknown option: " << a << "\n";
                 return 1;
             }
         }
 
-        LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
-        LOG_INFO(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
+        CliSummary summary;
+        summary.input_file = argv[1];
+        summary.options = join_options(argc, argv);
+        std::string terminal_model;
 
-        context c;
+        g_groebner_timing.reset();
+        g_final_fixed_value_check_timing.reset();
+        g_final_fixed_value_check_span_start.reset();
 
-        std::string raw = read_file_all(argv[1]);
-        std::string smt = inject_poly_eqP_eqmodP_if_missing(raw);
+        const auto total_t0 = clk::now();
+        print_cli_input_section(terminal_out, summary.input_file, summary.options);
 
-        std::vector<expr> asserts = parse_smt2_assertions(c, smt);
-
-        LOG_TRACE(g_log, "parse", "Loaded " + std::to_string(asserts.size()) + " assertions.");
-
-        RewriteOptions rwopt;
-        rwopt.enable_rewriting = ENABLE_REWRITING;
-        rwopt.use_singular_normalization = ENABLE_REWRITE_SINGULAR_NF;
-        rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
-        rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
-        rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
-        rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
-        rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
-
-        RewriteResult rr = run_rewriting_pipeline(c, asserts, rwopt, g_log);
-        asserts = std::move(rr.asserts);
-
-        solver s(c);
-
-        for (size_t i = 0; i < asserts.size(); ++i)
         {
-            std::string nm = "A#" + std::to_string(i);
-            expr tag = c.bool_const(nm.c_str());
+            ScopedStreamBuf redirect_cout(std::cout, runlog.rdbuf());
+            ScopedStreamBuf redirect_cerr(std::cerr, runlog.rdbuf());
 
-            Z3_solver_assert_and_track(
-                (Z3_context)c,
-                (Z3_solver)s,
-                (Z3_ast)asserts[i],
-                (Z3_ast)tag);
+            LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
+            LOG_INFO(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
+
+            context c;
+
+            begin_cli_timed_row(terminal_out, "Parsing SMT2 file:");
+            auto parse_t0 = clk::now();
+            std::string raw = read_file_all(argv[1]);
+            std::string smt = inject_poly_eqP_eqmodP_if_missing(raw);
+            std::vector<expr> asserts = parse_smt2_assertions(c, smt);
+            auto parse_t1 = clk::now();
+            summary.parse_time = std::chrono::duration_cast<std::chrono::nanoseconds>(parse_t1 - parse_t0);
+            finish_cli_timed_row(terminal_out, "OK", summary.parse_time);
+
+            LOG_TRACE(g_log, "parse", "Loaded " + std::to_string(asserts.size()) + " assertions.");
+
+            RewriteOptions rwopt;
+            rwopt.enable_rewriting = ENABLE_REWRITING;
+            rwopt.use_singular_normalization = ENABLE_REWRITE_SINGULAR_NF;
+            rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
+            rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
+            rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
+            rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
+            rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
+
+            begin_cli_timed_row(terminal_out, "Rewriting assignments:");
+            auto rewrite_t0 = clk::now();
+            RewriteResult rr = run_rewriting_pipeline(c, asserts, rwopt, g_log);
+            auto rewrite_t1 = clk::now();
+            summary.rewrite_time = std::chrono::duration_cast<std::chrono::nanoseconds>(rewrite_t1 - rewrite_t0);
+            asserts = std::move(rr.asserts);
+            finish_cli_timed_row(terminal_out, "OK", summary.rewrite_time);
+
+            solver s(c);
+
+            for (size_t i = 0; i < asserts.size(); ++i)
+            {
+                std::string nm = "A#" + std::to_string(i);
+                expr tag = c.bool_const(nm.c_str());
+
+                Z3_solver_assert_and_track(
+                    (Z3_context)c,
+                    (Z3_solver)s,
+                    (Z3_ast)asserts[i],
+                    (Z3_ast)tag);
+            }
+
+            std::vector<expr> eqps;
+            for (auto &f : asserts)
+                collect_eqP_rec(f, eqps);
+            eqps = dedup_and_drop_trivial_eqp(eqps);
+
+            std::vector<expr> lhs, rhs;
+            lhs.reserve(eqps.size());
+            rhs.reserve(eqps.size());
+            for (size_t i = 0; i < eqps.size(); ++i)
+            {
+                LOG_TRACE(g_log, "parse", "Found eqP#" + std::to_string(i) + " constraint: " + eqps[i].to_string());
+                lhs.push_back(eqps[i].arg(0));
+                rhs.push_back(eqps[i].arg(1));
+            }
+
+            std::vector<expr> eqmodsP1;
+            for (auto &f : asserts)
+                collect_eqmodP1_rec(f, eqmodsP1);
+
+            for (size_t i = 0; i < eqmodsP1.size(); ++i)
+            {
+                LOG_TRACE(g_log, "parse",
+                          "Found eqmodP1#" + std::to_string(i) +
+                              " constraint: " + eqmodsP1[i].to_string());
+            }
+
+            std::vector<std::string> indets = collect_all_indets(asserts);
+            IndetEnv env;
+            env.names = indets;
+            for (unsigned i = 0; i < env.names.size(); ++i)
+                env.idx[env.names[i]] = i;
+
+            std::unordered_set<Z3_ast> baseS;
+            for (auto &f : asserts)
+                collect_coeff_bases_rec(f, baseS);
+
+            std::vector<z3::expr> bases;
+            bases.reserve(baseS.size());
+            for (auto a : baseS)
+                bases.emplace_back(c, a);
+
+            std::sort(bases.begin(), bases.end(),
+                      [](const z3::expr &x, const z3::expr &y)
+                      { return x.to_string() < y.to_string(); });
+
+            std::unordered_set<std::string> used;
+
+            CoeffVarMap cmap;
+            cmap.z3_bases = bases;
+            cmap.ring_names.resize(bases.size());
+
+            for (size_t i = 0; i < bases.size(); ++i)
+            {
+                std::string base_name = coeff_base_pretty_name(bases[i]);
+                std::string base = sanitize_ring_var_base(base_name);
+                cmap.ring_names[i] = make_unique_name(base, used);
+            }
+
+            cmap.base_to_index.clear();
+            for (size_t i = 0; i < bases.size(); ++i)
+                cmap.base_to_index[(Z3_ast)bases[i]] = (unsigned)i;
+
+            std::vector<std::string> indet_ring_names(env.names.size());
+            for (size_t i = 0; i < env.names.size(); ++i)
+            {
+                std::string base = sanitize_ring_var_base(env.names[i]);
+                indet_ring_names[i] = make_unique_name(base, used);
+            }
+
+            std::vector<std::string> qvar_names(eqmodsP1.size());
+            for (size_t i = 0; i < eqmodsP1.size(); ++i)
+            {
+                qvar_names[i] = make_unique_name("u_mod_" + std::to_string(i), used);
+            }
+
+            std::vector<std::string> ring_vars;
+            ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() + qvar_names.size());
+            ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
+            ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
+            ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
+
+            LOG_TRACE(g_log, "init",
+                      "Initializing propagator with " +
+                          std::to_string(eqps.size()) + " eqP constraint(s), " +
+                          std::to_string(eqmodsP1.size()) + " eqmodP1 constraint(s).");
+
+            PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1,
+                              env, cmap, indet_ring_names, ring_vars, qvar_names);
+
+            begin_cli_timed_row(terminal_out, "Solving with Z3:");
+            auto solve_t0 = clk::now();
+            check_result r = s.check();
+            auto solve_t1 = clk::now();
+            summary.solve_time = std::chrono::duration_cast<std::chrono::nanoseconds>(solve_t1 - solve_t0);
+            summary.result = r;
+            finish_cli_timed_row(terminal_out, "OK", summary.solve_time);
+
+            std::cout << "Solver result: " << r << "\n";
+            if (r == unknown)
+                std::cout << "Reason unknown: " << s.reason_unknown() << "\n";
+            if (SHOW_MODEL && r == sat)
+            {
+                print_model_filtered(s.get_model());
+                if (show_model_on_terminal)
+                {
+                    std::ostringstream model_out;
+                    print_model_filtered(s.get_model(), model_out);
+                    terminal_model = model_out.str();
+                }
+            }
+
+            std::cout << "[timer] z3.check() = " << util::fmt_duration(solve_t1 - solve_t0) << "\n";
+            std::cout.flush();
+            std::cerr.flush();
+
+            summary.groebner_calls = g_groebner_timing.calls;
+            summary.groebner_time = g_groebner_timing.elapsed;
+            summary.final_fixed_value_check_calls = g_final_fixed_value_check_timing.calls;
+            if (g_final_fixed_value_check_span_start)
+            {
+                summary.final_fixed_value_check_time =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(solve_t1 - *g_final_fixed_value_check_span_start);
+            }
+            else
+            {
+                summary.final_fixed_value_check_time = g_final_fixed_value_check_timing.elapsed;
+            }
+            summary.total_time = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - total_t0);
+            runlog.flush();
         }
 
-        std::vector<expr> eqps;
-        for (auto &f : asserts)
-            collect_eqP_rec(f, eqps);
-        eqps = dedup_and_drop_trivial_eqp(eqps);
-
-        std::vector<expr> lhs, rhs;
-        lhs.reserve(eqps.size());
-        rhs.reserve(eqps.size());
-        for (size_t i = 0; i < eqps.size(); ++i)
-        {
-            LOG_TRACE(g_log, "parse", "Found eqP#" + std::to_string(i) + " constraint: " + eqps[i].to_string());
-            lhs.push_back(eqps[i].arg(0));
-            rhs.push_back(eqps[i].arg(1));
-        }
-
-        std::vector<expr> eqmodsP1;
-        for (auto &f : asserts)
-            collect_eqmodP1_rec(f, eqmodsP1);
-
-        for (size_t i = 0; i < eqmodsP1.size(); ++i)
-        {
-            LOG_TRACE(g_log, "parse",
-                      "Found eqmodP1#" + std::to_string(i) +
-                          " constraint: " + eqmodsP1[i].to_string());
-        }
-
-        std::vector<std::string> indets = collect_all_indets(asserts);
-        IndetEnv env;
-        env.names = indets;
-        for (unsigned i = 0; i < env.names.size(); ++i)
-            env.idx[env.names[i]] = i;
-
-        std::unordered_set<Z3_ast> baseS;
-        for (auto &f : asserts)
-            collect_coeff_bases_rec(f, baseS);
-
-        std::vector<z3::expr> bases;
-        bases.reserve(baseS.size());
-        for (auto a : baseS)
-            bases.emplace_back(c, a);
-
-        std::sort(bases.begin(), bases.end(),
-                  [](const z3::expr &x, const z3::expr &y)
-                  { return x.to_string() < y.to_string(); });
-
-        std::unordered_set<std::string> used;
-
-        CoeffVarMap cmap;
-        cmap.z3_bases = bases;
-        cmap.ring_names.resize(bases.size());
-
-        for (size_t i = 0; i < bases.size(); ++i)
-        {
-            std::string base_name = coeff_base_pretty_name(bases[i]);
-            std::string base = sanitize_ring_var_base(base_name);
-            cmap.ring_names[i] = make_unique_name(base, used);
-        }
-
-        cmap.base_to_index.clear();
-        for (size_t i = 0; i < bases.size(); ++i)
-            cmap.base_to_index[(Z3_ast)bases[i]] = (unsigned)i;
-
-        std::vector<std::string> indet_ring_names(env.names.size());
-        for (size_t i = 0; i < env.names.size(); ++i)
-        {
-            std::string base = sanitize_ring_var_base(env.names[i]);
-            indet_ring_names[i] = make_unique_name(base, used);
-        }
-
-        std::vector<std::string> qvar_names(eqmodsP1.size());
-        for (size_t i = 0; i < eqmodsP1.size(); ++i)
-        {
-            qvar_names[i] = make_unique_name("u_mod_" + std::to_string(i), used);
-        }
-
-        std::vector<std::string> ring_vars;
-        ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() + qvar_names.size());
-        ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
-        ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
-        ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
-
-        LOG_TRACE(g_log, "init",
-                  "Initializing propagator with " +
-                      std::to_string(eqps.size()) + " eqP constraint(s), " +
-                      std::to_string(eqmodsP1.size()) + " eqmodP1 constraint(s).");
-
-        PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1,
-                          env, cmap, indet_ring_names, ring_vars, qvar_names);
-
-        auto t0 = clk::now();
-        check_result r = s.check();
-        auto t1 = clk::now();
-
-        std::cout << "Solver result: " << r << "\n";
-        if (SHOW_MODEL && r == sat)
-            print_model_filtered(s.get_model());
-
-        std::cout << "[timer] z3.check() = " << util::fmt_duration(t1 - t0) << "\n";
-        std::cout.flush();
-        std::cerr.flush();
-        runlog.flush();
-
+        begin_cli_timed_row(terminal_out, "   Computing Groebner basis:");
+        finish_cli_timed_row(terminal_out, "OK", summary.groebner_time, summary.groebner_calls);
+        terminal_out << "\n";
+        begin_cli_timed_row(terminal_out, "   Final fixed-value check:");
+        finish_cli_timed_row(terminal_out, "OK",
+                             summary.final_fixed_value_check_time,
+                             summary.final_fixed_value_check_calls);
+        terminal_out << "\n# Summary\n\n";
+        begin_cli_timed_row(terminal_out, "Verification result:");
+        finish_cli_timed_row(terminal_out, check_result_name(summary.result), summary.total_time);
+        if (show_model_on_terminal && !terminal_model.empty())
+            terminal_out << "\n" << terminal_model;
+        terminal_out.flush();
         return 0;
     }
     catch (const z3::exception &ex)
     {
+        runlog << "Z3 error: " << ex.msg() << "\n";
+        runlog.flush();
+        std::cerr << "\n";
         std::cerr << "Z3 error: " << ex.msg() << "\n";
         return 1;
     }
     catch (const std::exception &ex)
     {
+        runlog << "Error: " << ex.what() << "\n";
+        runlog.flush();
+        std::cerr << "\n";
         std::cerr << "Error: " << ex.what() << "\n";
         return 1;
     }
