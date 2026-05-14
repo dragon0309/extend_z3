@@ -212,7 +212,7 @@ static void finish_cli_timed_row(std::ostream &os,
     if (calls)
         state << " " << *calls << " calls";
 
-    os << std::left << std::setw(16) << state.str()
+    os << std::left << std::setw(28) << state.str()
        << fmt_cli_seconds(elapsed) << "\n";
     os.flush();
 }

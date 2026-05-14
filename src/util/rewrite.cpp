@@ -132,6 +132,30 @@ namespace
         return Z3_is_eq_ast((Z3_context)a.ctx(), (Z3_ast)a, (Z3_ast)b);
     }
 
+    unsigned ast_id(const expr &e)
+    {
+        return Z3_get_ast_id((Z3_context)e.ctx(), (Z3_ast)e);
+    }
+
+    struct AstCacheKey
+    {
+        Z3_context ctx = nullptr;
+        unsigned id = 0;
+
+        bool operator==(const AstCacheKey &other) const
+        {
+            return ctx == other.ctx && id == other.id;
+        }
+    };
+
+    struct AstCacheKeyHash
+    {
+        std::size_t operator()(const AstCacheKey &key) const
+        {
+            return std::hash<void *>{}((void *)key.ctx) ^ (std::hash<unsigned>{}(key.id) << 1);
+        }
+    };
+
     std::string expr_key(const expr &e)
     {
         return e.to_string();
@@ -403,6 +427,14 @@ namespace
         return out;
     }
 
+    std::vector<std::string> collect_sorted_vars(const expr &e)
+    {
+        std::unordered_set<std::string> vars = collect_vars(e);
+        std::vector<std::string> out(vars.begin(), vars.end());
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
     void collect_vars_vec_rec(const expr &e, std::vector<std::string> &out)
     {
         if (is_poly_variable(e))
@@ -416,25 +448,48 @@ namespace
             collect_vars_vec_rec(e.arg(i), out);
     }
 
-    bool contains_expr(const expr &root, const expr &sub)
+    bool expr_matches_key(const expr &root, const expr &sub, const std::string &sub_key, bool sub_is_var)
     {
-        if (same_ast(root, sub) || expr_key(root) == expr_key(sub))
+        if (same_ast(root, sub))
+            return true;
+        if (sub_is_var)
+            return is_poly_variable(root) && variable_key(root) == sub_key;
+        return expr_key(root) == sub_key;
+    }
+
+    bool contains_expr_keyed(const expr &root, const expr &sub, const std::string &sub_key, bool sub_is_var)
+    {
+        if (expr_matches_key(root, sub, sub_key, sub_is_var))
             return true;
         if (!root.is_app())
             return false;
         for (unsigned i = 0; i < root.num_args(); ++i)
-            if (contains_expr(root.arg(i), sub))
+            if (contains_expr_keyed(root.arg(i), sub, sub_key, sub_is_var))
                 return true;
         return false;
     }
 
-    std::size_t occurs_count(const expr &root, const expr &sub)
+    bool contains_expr(const expr &root, const expr &sub)
     {
-        std::size_t n = (same_ast(root, sub) || expr_key(root) == expr_key(sub)) ? 1 : 0;
+        const bool sub_is_var = is_poly_variable(sub);
+        const std::string sub_key = sub_is_var ? variable_key(sub) : expr_key(sub);
+        return contains_expr_keyed(root, sub, sub_key, sub_is_var);
+    }
+
+    std::size_t occurs_count_keyed(const expr &root, const expr &sub, const std::string &sub_key, bool sub_is_var)
+    {
+        std::size_t n = expr_matches_key(root, sub, sub_key, sub_is_var) ? 1 : 0;
         if (root.is_app())
             for (unsigned i = 0; i < root.num_args(); ++i)
-                n += occurs_count(root.arg(i), sub);
+                n += occurs_count_keyed(root.arg(i), sub, sub_key, sub_is_var);
         return n;
+    }
+
+    std::size_t occurs_count(const expr &root, const expr &sub)
+    {
+        const bool sub_is_var = is_poly_variable(sub);
+        const std::string sub_key = sub_is_var ? variable_key(sub) : expr_key(sub);
+        return occurs_count_keyed(root, sub, sub_key, sub_is_var);
     }
 
     bool is_numeric_const(const expr &e, const mpz_class &v)
@@ -443,7 +498,38 @@ namespace
         return extract_poly_int_constant(e, k) && k == v;
     }
 
+    struct PolySimplifyMemoEntry
+    {
+        expr original;
+        expr simplified;
+
+        PolySimplifyMemoEntry(const expr &o, const expr &s) : original(o), simplified(s) {}
+    };
+
+    using SimplifyMemo = std::unordered_map<AstCacheKey, std::vector<PolySimplifyMemoEntry>, AstCacheKeyHash>;
+    thread_local SimplifyMemo *active_simplify_memo = nullptr;
+
+    struct ScopedSimplifyMemo
+    {
+        SimplifyMemo memo;
+        SimplifyMemo *previous = nullptr;
+
+        ScopedSimplifyMemo() : previous(active_simplify_memo)
+        {
+            active_simplify_memo = &memo;
+        }
+
+        ~ScopedSimplifyMemo()
+        {
+            active_simplify_memo = previous;
+        }
+
+        ScopedSimplifyMemo(const ScopedSimplifyMemo &) = delete;
+        ScopedSimplifyMemo &operator=(const ScopedSimplifyMemo &) = delete;
+    };
+
     expr simplify_poly(const expr &e, const PolyDecls &d);
+    expr simplify_poly_impl(const expr &e, const PolyDecls &d);
 
     expr simplify_pneg(const expr &a, const PolyDecls &d)
     {
@@ -460,7 +546,46 @@ namespace
         return mk_psub(d, mk_pconst_mpz(d, ctx, 0), a);
     }
 
+    expr simplify_poly_cached(const expr &e, const PolyDecls &d, SimplifyMemo &memo)
+    {
+        if (!e.is_app())
+            return e;
+
+        AstCacheKey key{(Z3_context)e.ctx(), ast_id(e)};
+        auto it = memo.find(key);
+        if (it != memo.end())
+        {
+            for (const PolySimplifyMemoEntry &entry : it->second)
+                if (same_ast(entry.original, e))
+                    return entry.simplified;
+        }
+
+        expr r = simplify_poly_impl(e, d);
+        memo[key].emplace_back(e, r);
+        return r;
+    }
+
     expr simplify_poly(const expr &e, const PolyDecls &d)
+    {
+        if (active_simplify_memo)
+            return simplify_poly_cached(e, d, *active_simplify_memo);
+
+        SimplifyMemo memo;
+        active_simplify_memo = &memo;
+        try
+        {
+            expr r = simplify_poly_cached(e, d, memo);
+            active_simplify_memo = nullptr;
+            return r;
+        }
+        catch (...)
+        {
+            active_simplify_memo = nullptr;
+            throw;
+        }
+    }
+
+    expr simplify_poly_impl(const expr &e, const PolyDecls &d)
     {
         context &ctx = e.ctx();
         if (!e.is_app())
@@ -690,7 +815,8 @@ namespace
         if (options.suppressed_lhs_keys.count(key))
             return std::nullopt;
         expr rhs = simplify_poly(rhs0, d);
-        if (collect_vars(rhs).count(key) || contains_expr(rhs, lhs))
+        std::vector<std::string> rhs_dependencies = collect_sorted_vars(rhs);
+        if (std::binary_search(rhs_dependencies.begin(), rhs_dependencies.end(), key))
         {
             ++stats.skipped_lhs_occurs_in_rhs;
             diagnostics.push_back(label + ": skipped " + diagnostic_tag + " lhs occurs in rhs");
@@ -704,6 +830,7 @@ namespace
             return std::nullopt;
         }
         RewriteRule r(lhs, rhs, source, RewriteRule::Kind::Variable, modular, label);
+        r.rhs_dependencies = std::move(rhs_dependencies);
         return Pattern(r, key);
     }
 
@@ -981,6 +1108,7 @@ namespace
                     continue;
                 }
                 RewriteRule r(sub, rhs, source, RewriteRule::Kind::SubExpression, modular, label);
+                r.rhs_dependencies = collect_sorted_vars(rhs);
                 return Pattern(r, "Sub:" + sub.to_string());
             }
             catch (const std::exception &)
@@ -1500,15 +1628,21 @@ namespace
 
         std::unordered_map<std::string, std::vector<Candidate>> grouped;
         std::vector<bool> has_candidate(infos.size(), false);
+        const std::vector<expr> empty_others;
         for (std::size_t i = 0; i < infos.size(); ++i)
         {
             std::vector<expr> others;
-            others.reserve(infos.size() > 0 ? infos.size() - 1 : 0);
-            for (std::size_t j = 0; j < infos.size(); ++j)
-                if (i != j)
-                    others.push_back(infos[j].polynomial);
+            const std::vector<expr> *others_ref = &empty_others;
+            if (options.use_subexpression_rules)
+            {
+                others.reserve(infos.size() > 0 ? infos.size() - 1 : 0);
+                for (std::size_t j = 0; j < infos.size(); ++j)
+                    if (i != j)
+                        others.push_back(infos[j].polynomial);
+                others_ref = &others;
+            }
 
-            auto pat = extract_one_assignment(infos[i], others, moduli, d, options, stats, diagnostics);
+            auto pat = extract_one_assignment(infos[i], *others_ref, moduli, d, options, stats, diagnostics);
             if (pat)
             {
                 grouped[pat->lhs_key].emplace_back(*pat, i);
@@ -1697,60 +1831,108 @@ namespace
         return cur;
     }
 
-    expr apply_variable_rules_rec(const expr &e,
-                                  const std::unordered_map<std::string, const RewriteRule *> &rules,
-                                  const PolyDecls &d,
-                                  std::unordered_map<std::string, expr> &expanded,
-                                  std::unordered_set<std::string> &active,
-                                  bool &changed);
-
-    expr expand_variable_rule(const std::string &key,
-                              const std::unordered_map<std::string, const RewriteRule *> &rules,
-                              const PolyDecls &d,
-                              std::unordered_map<std::string, expr> &expanded,
-                              std::unordered_set<std::string> &active)
+    struct RewriteMemoEntry
     {
-        auto cached = expanded.find(key);
-        if (cached != expanded.end())
+        expr original;
+        expr rewritten;
+        bool changed = false;
+
+        RewriteMemoEntry(const expr &o, const expr &r, bool c) : original(o), rewritten(r), changed(c) {}
+    };
+
+    struct RewriteEnv
+    {
+        const std::vector<RewriteRule> &rules;
+        const PolyDecls &d;
+        bool all_variable_rules = true;
+        std::unordered_map<std::string, const RewriteRule *> by_lhs;
+        std::unordered_map<std::string, expr> expanded;
+        std::unordered_map<unsigned, std::vector<RewriteMemoEntry>> memo;
+        std::unordered_set<std::string> active;
+
+        RewriteEnv(const std::vector<RewriteRule> &rules_, const PolyDecls &d_)
+            : rules(rules_), d(d_)
+        {
+            for (const RewriteRule &r : rules)
+            {
+                if (r.kind != RewriteRule::Kind::Variable || !is_poly_variable(r.lhs))
+                {
+                    all_variable_rules = false;
+                    break;
+                }
+            }
+
+            if (all_variable_rules)
+            {
+                by_lhs.reserve(rules.size());
+                expanded.reserve(rules.size());
+                for (const RewriteRule &r : rules)
+                    by_lhs.emplace(variable_key(r.lhs), &r);
+            }
+        }
+    };
+
+    expr apply_variable_env_rec(const expr &e, RewriteEnv &env, bool &changed);
+
+    expr expand_variable_rule_env(const std::string &key, RewriteEnv &env)
+    {
+        auto cached = env.expanded.find(key);
+        if (cached != env.expanded.end())
             return cached->second;
 
-        auto it = rules.find(key);
-        if (it == rules.end())
+        auto it = env.by_lhs.find(key);
+        if (it == env.by_lhs.end())
             throw std::runtime_error("missing variable rewrite rule");
-        if (!active.insert(key).second)
+        if (!env.active.insert(key).second)
             return it->second->rhs;
 
         bool rhs_changed = false;
-        expr rhs = apply_variable_rules_rec(it->second->rhs, rules, d, expanded, active, rhs_changed);
-        active.erase(key);
+        expr rhs = apply_variable_env_rec(it->second->rhs, env, rhs_changed);
+        env.active.erase(key);
         if (rhs_changed && is_poly_ctor(rhs))
-            rhs = simplify_poly(rhs, d);
+            rhs = simplify_poly(rhs, env.d);
         else if (rhs_changed)
             rhs = rhs.simplify();
 
-        auto [pos, _] = expanded.emplace(key, rhs);
+        auto [pos, _] = env.expanded.emplace(key, rhs);
         return pos->second;
     }
 
-    expr apply_variable_rules_rec(const expr &e,
-                                  const std::unordered_map<std::string, const RewriteRule *> &rules,
-                                  const PolyDecls &d,
-                                  std::unordered_map<std::string, expr> &expanded,
-                                  std::unordered_set<std::string> &active,
-                                  bool &changed)
+    expr apply_variable_env_rec(const expr &e, RewriteEnv &env, bool &changed)
     {
+        const unsigned id = ast_id(e);
+        auto cached = env.memo.find(id);
+        if (cached != env.memo.end())
+        {
+            for (const RewriteMemoEntry &entry : cached->second)
+            {
+                if (same_ast(entry.original, e))
+                {
+                    changed = entry.changed;
+                    return entry.rewritten;
+                }
+            }
+        }
+
         if (is_poly_variable(e))
         {
             const std::string key = variable_key(e);
-            auto it = rules.find(key);
-            if (it != rules.end())
+            auto it = env.by_lhs.find(key);
+            if (it != env.by_lhs.end())
             {
                 changed = true;
-                return expand_variable_rule(key, rules, d, expanded, active);
+                expr r = expand_variable_rule_env(key, env);
+                if (env.active.find(key) == env.active.end())
+                    env.memo[id].emplace_back(e, r, true);
+                return r;
             }
         }
         if (!e.is_app())
+        {
+            changed = false;
+            env.memo[id].emplace_back(e, e, false);
             return e;
+        }
 
         std::vector<expr> args;
         args.reserve(e.num_args());
@@ -1758,14 +1940,37 @@ namespace
         for (unsigned i = 0; i < e.num_args(); ++i)
         {
             bool child_changed = false;
-            expr child = apply_variable_rules_rec(e.arg(i), rules, d, expanded, active, child_changed);
+            expr child = apply_variable_env_rec(e.arg(i), env, child_changed);
             any = any || child_changed;
             args.push_back(child);
         }
         if (!any)
+        {
+            changed = false;
+            env.memo[id].emplace_back(e, e, false);
             return e;
+        }
+
         changed = true;
-        return rebuild_app(e, args).simplify();
+        expr r = rebuild_app(e, args).simplify();
+        env.memo[id].emplace_back(e, r, true);
+        return r;
+    }
+
+    expr apply_rules_with_env(const expr &e, RewriteEnv &env)
+    {
+        if (env.rules.empty())
+            return e;
+        if (!env.all_variable_rules)
+            return apply_rules_sequential(e, env.rules, env.d);
+
+        bool changed = false;
+        expr cur = apply_variable_env_rec(e, env, changed);
+        if (changed && is_poly_ctor(cur))
+            return simplify_poly(cur, env.d);
+        if (changed)
+            return cur.simplify();
+        return cur;
     }
 
     expr apply_rules(const expr &e, const std::vector<RewriteRule> &rules, const PolyDecls &d)
@@ -1773,50 +1978,48 @@ namespace
         if (rules.empty())
             return e;
 
-        bool all_variable_rules = true;
-        for (const RewriteRule &r : rules)
-        {
-            if (r.kind != RewriteRule::Kind::Variable || !is_poly_variable(r.lhs))
-            {
-                all_variable_rules = false;
-                break;
-            }
-        }
-        if (!all_variable_rules)
-            return apply_rules_sequential(e, rules, d);
-
-        std::unordered_map<std::string, const RewriteRule *> by_lhs;
-        by_lhs.reserve(rules.size());
-        for (const RewriteRule &r : rules)
-            by_lhs.emplace(variable_key(r.lhs), &r);
-
-        std::unordered_map<std::string, expr> expanded;
-        std::unordered_set<std::string> active;
-        bool changed = false;
-        expr cur = apply_variable_rules_rec(e, by_lhs, d, expanded, active, changed);
-        if (changed && is_poly_ctor(cur))
-            return simplify_poly(cur, d);
-        if (changed)
-            return cur.simplify();
-        return cur;
+        RewriteEnv env(rules, d);
+        return apply_rules_with_env(e, env);
     }
 
     std::vector<std::size_t> topo_sort_rules(const std::vector<RewriteRule> &rules)
     {
         const std::size_t n = rules.size();
         std::unordered_map<std::string, std::size_t> index;
-        for (std::size_t i = 0; i < n; ++i)
-            index[variable_key(rules[i].lhs)] = i;
-
-        std::vector<std::vector<std::size_t>> deps(n);
+        bool use_dependency_keys = true;
         for (std::size_t i = 0; i < n; ++i)
         {
-            for (std::size_t j = 0; j < n; ++j)
+            if (rules[i].kind != RewriteRule::Kind::Variable || !is_poly_variable(rules[i].lhs))
+                use_dependency_keys = false;
+            index[variable_key(rules[i].lhs)] = i;
+        }
+
+        std::vector<std::vector<std::size_t>> deps(n);
+        if (use_dependency_keys)
+        {
+            for (std::size_t i = 0; i < n; ++i)
             {
-                if (i != j && contains_expr(rules[i].rhs, rules[j].lhs))
-                    deps[i].push_back(j);
+                for (const std::string &dep_key : rules[i].rhs_dependencies)
+                {
+                    auto it = index.find(dep_key);
+                    if (it != index.end() && it->second != i)
+                        deps[i].push_back(it->second);
+                }
+                std::sort(deps[i].begin(), deps[i].end());
+                deps[i].erase(std::unique(deps[i].begin(), deps[i].end()), deps[i].end());
             }
-            std::sort(deps[i].begin(), deps[i].end());
+        }
+        else
+        {
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                for (std::size_t j = 0; j < n; ++j)
+                {
+                    if (i != j && contains_expr(rules[i].rhs, rules[j].lhs))
+                        deps[i].push_back(j);
+                }
+                std::sort(deps[i].begin(), deps[i].end());
+            }
         }
 
         std::vector<int> state(n, 0);
@@ -1857,6 +2060,7 @@ namespace
             if (contains_expr(rhs, src.lhs))
                 throw CircularDependency();
             RewriteRule r(src.lhs, rhs, src.source_generator, src.kind, src.is_modular, src.source_label);
+            r.rhs_dependencies = collect_sorted_vars(rhs);
             env.push_back(r);
         }
         return env;
@@ -1904,16 +2108,17 @@ namespace
 
             std::vector<std::size_t> sorted = topo_sort_rules(ex.rules);
             std::vector<RewriteRule> env = compose_rules(ex.rules, sorted, d);
+            RewriteEnv rewrite_env(env, d);
             ++res.dag_rounds;
             res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
 
             std::vector<expr> rewritten_residuals;
             rewritten_residuals.reserve(ex.residuals.size());
             for (const expr &r : ex.residuals)
-                rewritten_residuals.push_back(normalize_poly_under_moduli(apply_rules(r, env, d),
+                rewritten_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(r, rewrite_env),
                                                                           moduli, d, options, res.stats));
             current = normalize_residuals(rewritten_residuals, moduli, d, options, res.stats);
-            current_target = normalize_poly_under_moduli(apply_rules(current_target, env, d),
+            current_target = normalize_poly_under_moduli(apply_rules_with_env(current_target, rewrite_env),
                                                          moduli, d, options, res.stats);
         }
 
@@ -2013,17 +2218,18 @@ namespace
         res.rules_used = env;
 
         std::vector<expr> final_residuals;
+        RewriteEnv final_env(env, d);
         for (const expr &r : residuals)
-            final_residuals.push_back(normalize_poly_under_moduli(apply_rules(r, env, d),
+            final_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(r, final_env),
                                                                   moduli, d, options, res.stats));
         while (!stack.empty())
         {
-            final_residuals.push_back(normalize_poly_under_moduli(apply_rules(stack.front(), env, d),
+            final_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(stack.front(), final_env),
                                                                   moduli, d, options, res.stats));
             stack.pop_front();
         }
         res.residual_generators = normalize_residuals(final_residuals, moduli, d, options, res.stats);
-        res.rewritten_target = normalize_poly_under_moduli(apply_rules(target, env, d),
+        res.rewritten_target = normalize_poly_under_moduli(apply_rules_with_env(target, final_env),
                                                            moduli, d, options, res.stats);
         return res;
     }
@@ -2129,13 +2335,12 @@ namespace
     }
 
     expr rewrite_assertion(const expr &assertion,
-                           const std::vector<RewriteRule> &rules,
-                           const PolyDecls &d,
+                           RewriteEnv &env,
                            const RewriteOptions &options,
                            RewriteStats &stats)
     {
-        expr r = apply_rules(assertion, rules, d);
-        return simplify_assertion_rec(r, d, options, stats).simplify();
+        expr r = apply_rules_with_env(assertion, env);
+        return simplify_assertion_rec(r, env.d, options, stats).simplify();
     }
 
     void collect_rule_atoms_rec(const expr &e, std::unordered_set<std::string> &out)
@@ -2207,6 +2412,7 @@ RewriteResult rewrite_assignments(const std::vector<z3::expr> &ideal_generators,
     PolyDecls d = collect_decls(roots);
     if (!d.pconst)
         throw std::runtime_error("rewrite_assignments: PConst constructor not found");
+    ScopedSimplifyMemo simplify_scope;
 
     try
     {
@@ -2243,6 +2449,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
     PolyDecls d = collect_decls(roots);
     if (!d.pconst)
         return out;
+    ScopedSimplifyMemo simplify_scope;
 
     auto post_moduli = [&](const AnnotatedPostcondition &p)
     {
@@ -2345,6 +2552,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                     util::fmt_duration(rewrite_t1 - rewrite_t0));
         return out;
     }
+    ScopedSimplifyMemo simplify_scope;
     expr poly_zero = mk_pconst_mpz(d, ctx, 0);
 
     RewriteOptions options = option;
@@ -2401,9 +2609,10 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
 
     std::vector<expr> rewritten_asserts;
     rewritten_asserts.reserve(input_asserts.size());
+    RewriteEnv assertion_env(core.rules_used, d);
     for (const expr &a : input_asserts)
     {
-        expr rw = rewrite_assertion(a, core.rules_used, d, options, out.stats);
+        expr rw = rewrite_assertion(a, assertion_env, options, out.stats);
         if (!is_true_expr(rw))
             rewritten_asserts.push_back(rw);
     }
