@@ -5,6 +5,7 @@
 
 #include <gmpxx.h>
 #include <cstddef>
+#include <iosfwd>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,7 @@ struct RewriteOptions
     bool reject_conflicting_lhs = false;
     std::size_t max_rounds = 100;
     std::size_t max_expression_growth = 4096;
+    std::ostream *rewrite_log = nullptr;
 
     // Preserve variables that occur in eqmodP1 atoms by preventing them from
     // becoming rewrite-rule left-hand sides.

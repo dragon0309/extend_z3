@@ -251,7 +251,8 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
           " [--enable-expression-growth-check]"
           " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
-          " [--disable-final-fixed-value-check] [--show-model]\n";
+          " [--disable-final-fixed-value-check] [--show-model]"
+          " [--rewrite-log]\n";
 }
 
 static void init_singular()
@@ -2983,6 +2984,7 @@ int main(int argc, char **argv)
 
     std::ostream terminal_out(std::cout.rdbuf());
     bool show_model_on_terminal = false;
+    bool rewrite_log_requested = false;
 
     try
     {
@@ -3030,6 +3032,8 @@ int main(int argc, char **argv)
                 ENABLE_FINAL_FIXED_VALUE_CHECK = false;
             else if (a == "--show-model")
                 show_model_on_terminal = true;
+            else if (a == "--rewrite-log")
+                rewrite_log_requested = true;
             else
             {
                 std::cerr << "Unknown option: " << a << "\n";
@@ -3079,6 +3083,15 @@ int main(int argc, char **argv)
             rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
             rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
             rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
+
+            std::ofstream rewrite_log;
+            if (rewrite_log_requested)
+            {
+                rewrite_log.open("rewrite.log", std::ios::out | std::ios::trunc);
+                if (!rewrite_log.is_open())
+                    throw std::runtime_error("cannot open rewrite.log for writing");
+                rwopt.rewrite_log = &rewrite_log;
+            }
 
             begin_cli_timed_row(terminal_out, "Rewriting assignments:");
             auto rewrite_t0 = clk::now();

@@ -111,9 +111,9 @@ std::string pretty_rewrite_atom_name(const std::string &s)
     if (!u.empty())
         return u;
     if (s.rfind("PConst:", 0) == 0)
-        return s.substr(std::strlen("PConst:"));
+        return pretty_rewrite_atom_name(s.substr(std::strlen("PConst:")));
     if (s.rfind("PVar:", 0) == 0)
-        return s.substr(std::strlen("PVar:"));
+        return pretty_rewrite_atom_name(s.substr(std::strlen("PVar:")));
     return s;
 }
 
@@ -433,6 +433,22 @@ namespace
         std::vector<std::string> out(vars.begin(), vars.end());
         std::sort(out.begin(), out.end());
         return out;
+    }
+
+    std::string format_raw_set(std::vector<std::string> items)
+    {
+        std::sort(items.begin(), items.end());
+        items.erase(std::unique(items.begin(), items.end()), items.end());
+        std::ostringstream oss;
+        oss << "{";
+        for (std::size_t i = 0; i < items.size(); ++i)
+        {
+            if (i)
+                oss << ", ";
+            oss << items[i];
+        }
+        oss << "}";
+        return oss.str();
     }
 
     void collect_vars_vec_rec(const expr &e, std::vector<std::string> &out)
@@ -1527,9 +1543,10 @@ namespace
         bool modular = false;
         bool usable = true;
         std::string label;
+        std::size_t input_index = 0;
 
-        GeneratorInfo(const expr &r, const expr &p, bool m, bool u, std::string l)
-            : residual(r), polynomial(p), modular(m), usable(u), label(std::move(l))
+        GeneratorInfo(const expr &r, const expr &p, bool m, bool u, std::string l, std::size_t idx = 0)
+            : residual(r), polynomial(p), modular(m), usable(u), label(std::move(l)), input_index(idx)
         {
         }
     };
@@ -1592,8 +1609,22 @@ namespace
 
     struct Extraction
     {
+        struct Residual
+        {
+            expr polynomial;
+            std::string reason;
+            std::size_t input_index = 0;
+
+            Residual(const expr &p, std::string r, std::size_t idx)
+                : polynomial(p), reason(std::move(r)), input_index(idx)
+            {
+            }
+        };
+
         std::vector<RewriteRule> rules;
-        std::vector<expr> residuals;
+        std::vector<Residual> residuals;
+        std::vector<expr> input_generators;
+        std::size_t input_count = 0;
     };
 
     Extraction extract_assignments_under_moduli(const std::vector<expr> &generators,
@@ -1605,6 +1636,9 @@ namespace
                                                 const std::string &trace_scope)
     {
         const std::string scope_prefix = trace_scope.empty() ? "" : trace_scope + "/";
+        Extraction out;
+        out.input_count = generators.size();
+        out.input_generators = generators;
 
         std::vector<GeneratorInfo> infos;
         infos.reserve(generators.size());
@@ -1614,7 +1648,10 @@ namespace
             auto info = generator_to_polynomial(generators[i], moduli, d, options, stats, diagnostics,
                                                 glabel);
             if (info)
+            {
+                info->input_index = i;
                 infos.push_back(*info);
+            }
             else
                 diagnostics.push_back(glabel + ": unsupported generator");
         }
@@ -1650,11 +1687,12 @@ namespace
             }
         }
 
-        Extraction out;
         std::vector<bool> consumed(infos.size(), false);
+        std::vector<std::string> residual_reasons(infos.size());
         for (auto &kv : grouped)
         {
             auto &cands = kv.second;
+            const std::string lhs_name = cands.empty() ? kv.first : cands[0].pattern.rule.lhs.to_string();
             const bool has_duplicate_lhs = cands.size() > 1;
             if (has_duplicate_lhs && options.reject_duplicate_lhs)
                 stats.duplicate_lhs += cands.size() - 1;
@@ -1675,22 +1713,30 @@ namespace
             if (conflict)
             {
                 ++stats.conflicting_lhs;
-                diagnostics.push_back("duplicate lhs conflict: " + pretty_rewrite_atom_name(kv.first));
+                diagnostics.push_back("duplicate lhs conflict: " + lhs_name);
                 for (const Candidate &c : cands)
+                {
                     consumed[c.index] = false;
+                    residual_reasons[c.index] = "conflicting LHS " + lhs_name + " has incompatible RHS";
+                }
                 continue;
             }
             if (has_duplicate_lhs && options.reject_duplicate_lhs)
             {
-                diagnostics.push_back("duplicate lhs: " + pretty_rewrite_atom_name(kv.first));
+                diagnostics.push_back("duplicate lhs: " + lhs_name);
                 for (const Candidate &c : cands)
+                {
                     consumed[c.index] = false;
+                    residual_reasons[c.index] = "duplicate LHS " + lhs_name + " already assigned in this round";
+                }
                 continue;
             }
 
             out.rules.push_back(cands[0].pattern.rule);
             ++stats.rules_extracted;
             consumed[cands[0].index] = true;
+            for (std::size_t i = 1; i < cands.size(); ++i)
+                residual_reasons[cands[i].index] = "duplicate LHS " + lhs_name + " already assigned in this round";
         }
 
         std::sort(out.rules.begin(), out.rules.end(),
@@ -1702,7 +1748,7 @@ namespace
         for (std::size_t i = 0; i < infos.size(); ++i)
         {
             if (!has_candidate[i] || !consumed[i])
-                out.residuals.push_back(infos[i].polynomial);
+                out.residuals.emplace_back(infos[i].polynomial, residual_reasons[i], infos[i].input_index);
         }
         return out;
     }
@@ -2085,6 +2131,176 @@ namespace
         return out;
     }
 
+    std::vector<expr> keep_normalized_residuals(const std::vector<expr> &residuals,
+                                                const std::vector<expr> &moduli,
+                                                const PolyDecls &d,
+                                                const RewriteOptions &options,
+                                                RewriteStats &stats)
+    {
+        std::vector<expr> out;
+        std::unordered_set<std::string> seen;
+        for (const expr &r : residuals)
+        {
+            if (is_poly_ctor(r) && poly_equiv_zero(r, moduli, d, options, stats))
+                continue;
+            if (seen.insert(r.to_string()).second)
+                out.push_back(r);
+        }
+        return out;
+    }
+
+    void write_rule_list(std::ostream &os, const std::vector<RewriteRule> &rules, const PolyDecls &d)
+    {
+        (void)d;
+        if (rules.empty())
+        {
+            os << "(none)\n";
+            return;
+        }
+        for (const RewriteRule &r : rules)
+            os << r.lhs.to_string() << " := " << r.rhs.to_string() << "\n";
+    }
+
+    std::vector<std::string> rule_lhs_strings(const std::vector<RewriteRule> &rules)
+    {
+        std::vector<std::string> items;
+        items.reserve(rules.size());
+        for (const RewriteRule &r : rules)
+            items.push_back(r.lhs.to_string());
+        std::sort(items.begin(), items.end());
+        return items;
+    }
+
+    void write_rule_analysis(std::ostream &os,
+                             const std::vector<RewriteRule> &rules,
+                             const std::vector<std::size_t> *topo,
+                             const std::vector<RewriteRule> *composed,
+                             const PolyDecls &d)
+    {
+        (void)d;
+        const std::vector<std::string> lhs_keys = rule_lhs_strings(rules);
+        std::unordered_map<std::string, std::string> lhs_by_key;
+        for (const RewriteRule &r : rules)
+            lhs_by_key.emplace(variable_key(r.lhs), r.lhs.to_string());
+
+        os << "assignment LHS set: " << format_raw_set(lhs_keys) << "\n\n";
+
+        os << "assignment dependencies:\n";
+        if (rules.empty())
+            os << "(none)\n";
+        else
+        {
+            for (const RewriteRule &r : rules)
+            {
+                std::vector<std::string> deps;
+                for (const std::string &v : collect_sorted_vars(r.rhs))
+                {
+                    auto it = lhs_by_key.find(v);
+                    if (it != lhs_by_key.end())
+                        deps.push_back(it->second);
+                }
+                os << r.lhs.to_string() << " -> " << format_raw_set(deps) << "\n";
+            }
+        }
+        os << "\n";
+
+        os << "topological order:\n";
+        if (!topo)
+            os << "rejected: circular dependency\n";
+        else if (topo->empty())
+            os << "(none)\n";
+        else
+            for (std::size_t idx : *topo)
+                os << rules[idx].lhs.to_string() << "\n";
+        os << "\n";
+
+        os << "composed env:\n";
+        if (!composed)
+            os << "(not composed)\n";
+        else
+            write_rule_list(os, *composed, d);
+        os << "\n";
+    }
+
+    void write_residual_list(std::ostream &os,
+                             const std::vector<Extraction::Residual> &residuals,
+                             const PolyDecls &d)
+    {
+        (void)d;
+        if (residuals.empty())
+        {
+            os << "(none)\n";
+            return;
+        }
+        for (std::size_t i = 0; i < residuals.size(); ++i)
+        {
+            os << "[" << i << "] " << residuals[i].polynomial.to_string();
+            if (!residuals[i].reason.empty())
+                os << "    reason: " << residuals[i].reason;
+            os << "\n";
+        }
+    }
+
+    void write_round_prefix(std::ostream &os,
+                            std::size_t round,
+                            const Extraction &ex,
+                            const PolyDecls &d)
+    {
+        os << "[DAG round " << round << "]\n";
+        os << "input generators: " << ex.input_count << "\n\n";
+        for (std::size_t i = 0; i < ex.input_generators.size(); ++i)
+            os << "[" << i << "] " << ex.input_generators[i].to_string() << "\n";
+        os << "\n";
+        os << "assignments extracted: " << ex.rules.size() << "\n\n";
+        os << "assignments:\n";
+        write_rule_list(os, ex.rules, d);
+        os << "\n";
+        os << "residuals kept in this round: " << ex.residuals.size() << "\n\n";
+        os << "residuals:\n";
+        write_residual_list(os, ex.residuals, d);
+        os << "\n";
+    }
+
+    void write_residual_rewrite_log(std::ostream &os,
+                                    const std::vector<Extraction::Residual> &originals,
+                                    const std::vector<expr> &rewritten,
+                                    const std::vector<std::string> &drop_reasons,
+                                    const PolyDecls &d)
+    {
+        (void)d;
+        os << "residual rewrite:\n";
+        if (originals.empty())
+        {
+            os << "(none)\n\n";
+            return;
+        }
+        for (std::size_t i = 0; i < originals.size(); ++i)
+        {
+            os << "[" << i << "] " << originals[i].polynomial.to_string() << "\n";
+            if (i < rewritten.size() && expr_key(originals[i].polynomial) == expr_key(rewritten[i]))
+                os << "==> unchanged";
+            else if (i < rewritten.size())
+                os << "==> " << rewritten[i].to_string();
+            if (i < drop_reasons.size() && !drop_reasons[i].empty())
+                os << "    reason: " << drop_reasons[i];
+            os << "\n\n";
+        }
+    }
+
+    void write_final_residuals(std::ostream &os, const std::vector<expr> &residuals, const PolyDecls &d)
+    {
+        (void)d;
+        os << "final residuals:\n";
+        if (residuals.empty())
+        {
+            os << "(none)\n\n";
+            return;
+        }
+        for (std::size_t i = 0; i < residuals.size(); ++i)
+            os << "[" << i << "] " << residuals[i].to_string() << "\n";
+        os << "\n";
+    }
+
     RewriteResult try_dag_rewrite(const std::vector<expr> &ideal,
                                   const expr &target,
                                   const std::vector<expr> &moduli,
@@ -2102,22 +2318,86 @@ namespace
                                                              "dag-r" + std::to_string(round));
             if (ex.rules.empty())
             {
-                current = normalize_residuals(current, moduli, d, options, res.stats);
+                std::vector<expr> normalized;
+                normalized.reserve(ex.residuals.size());
+                std::vector<std::string> drop_reasons;
+                drop_reasons.reserve(ex.residuals.size());
+                for (const auto &r : ex.residuals)
+                {
+                    expr n = normalize_poly_under_moduli(r.polynomial, moduli, d, options, res.stats);
+                    bool dropped_zero = is_poly_ctor(n) && poly_equiv_zero(n, moduli, d, options, res.stats);
+                    normalized.push_back(n);
+                    drop_reasons.push_back(dropped_zero ? "dropped because zero" : "");
+                }
+                current = keep_normalized_residuals(normalized, moduli, d, options, res.stats);
+                if (options.rewrite_log)
+                {
+                    const std::vector<std::size_t> empty_topo;
+                    const std::vector<RewriteRule> empty_env;
+                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                    write_rule_analysis(*options.rewrite_log, ex.rules, &empty_topo, &empty_env, d);
+                    write_residual_rewrite_log(*options.rewrite_log, ex.residuals, normalized, drop_reasons, d);
+                    write_final_residuals(*options.rewrite_log, current, d);
+                }
                 break;
             }
 
-            std::vector<std::size_t> sorted = topo_sort_rules(ex.rules);
-            std::vector<RewriteRule> env = compose_rules(ex.rules, sorted, d);
+            std::vector<std::size_t> sorted;
+            try
+            {
+                sorted = topo_sort_rules(ex.rules);
+            }
+            catch (const CircularDependency &)
+            {
+                if (options.rewrite_log)
+                {
+                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                    write_rule_analysis(*options.rewrite_log, ex.rules, nullptr, nullptr, d);
+                    *options.rewrite_log << "residual rewrite:\n";
+                    *options.rewrite_log << "(not run)    reason: circular dependency\n\n";
+                }
+                throw;
+            }
+
+            std::vector<RewriteRule> env;
+            try
+            {
+                env = compose_rules(ex.rules, sorted, d);
+            }
+            catch (const CircularDependency &)
+            {
+                if (options.rewrite_log)
+                {
+                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                    write_rule_analysis(*options.rewrite_log, ex.rules, &sorted, nullptr, d);
+                    *options.rewrite_log << "residual rewrite:\n";
+                    *options.rewrite_log << "(not run)    reason: circular dependency\n\n";
+                }
+                throw;
+            }
             RewriteEnv rewrite_env(env, d);
             ++res.dag_rounds;
             res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
 
             std::vector<expr> rewritten_residuals;
             rewritten_residuals.reserve(ex.residuals.size());
-            for (const expr &r : ex.residuals)
-                rewritten_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(r, rewrite_env),
-                                                                          moduli, d, options, res.stats));
-            current = normalize_residuals(rewritten_residuals, moduli, d, options, res.stats);
+            std::vector<std::string> drop_reasons;
+            drop_reasons.reserve(ex.residuals.size());
+            for (const auto &r : ex.residuals)
+            {
+                expr rw = normalize_poly_under_moduli(apply_rules_with_env(r.polynomial, rewrite_env),
+                                                      moduli, d, options, res.stats);
+                bool dropped_zero = is_poly_ctor(rw) && poly_equiv_zero(rw, moduli, d, options, res.stats);
+                rewritten_residuals.push_back(rw);
+                drop_reasons.push_back(dropped_zero ? "dropped because zero" : "");
+            }
+            current = keep_normalized_residuals(rewritten_residuals, moduli, d, options, res.stats);
+            if (options.rewrite_log)
+            {
+                write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                write_rule_analysis(*options.rewrite_log, ex.rules, &sorted, &env, d);
+                write_residual_rewrite_log(*options.rewrite_log, ex.residuals, rewritten_residuals, drop_reasons, d);
+            }
             current_target = normalize_poly_under_moduli(apply_rules_with_env(current_target, rewrite_env),
                                                          moduli, d, options, res.stats);
         }
