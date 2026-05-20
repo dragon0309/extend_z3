@@ -492,20 +492,27 @@ namespace
         return contains_expr_keyed(root, sub, sub_key, sub_is_var);
     }
 
-    std::size_t occurs_count_keyed(const expr &root, const expr &sub, const std::string &sub_key, bool sub_is_var)
+    bool occurs_once_keyed(const expr &root,
+                           const expr &sub,
+                           const std::string &sub_key,
+                           bool sub_is_var,
+                           std::size_t &count)
     {
-        std::size_t n = expr_matches_key(root, sub, sub_key, sub_is_var) ? 1 : 0;
+        if (expr_matches_key(root, sub, sub_key, sub_is_var) && ++count > 1)
+            return false;
         if (root.is_app())
             for (unsigned i = 0; i < root.num_args(); ++i)
-                n += occurs_count_keyed(root.arg(i), sub, sub_key, sub_is_var);
-        return n;
+                if (!occurs_once_keyed(root.arg(i), sub, sub_key, sub_is_var, count))
+                    return false;
+        return true;
     }
 
-    std::size_t occurs_count(const expr &root, const expr &sub)
+    bool occurs_once(const expr &root, const expr &sub)
     {
         const bool sub_is_var = is_poly_variable(sub);
         const std::string sub_key = sub_is_var ? variable_key(sub) : expr_key(sub);
-        return occurs_count_keyed(root, sub, sub_key, sub_is_var);
+        std::size_t count = 0;
+        return occurs_once_keyed(root, sub, sub_key, sub_is_var, count) && count == 1;
     }
 
     bool is_numeric_const(const expr &e, const mpz_class &v)
@@ -916,7 +923,7 @@ namespace
 
         for (const expr &lhs : candidates)
         {
-            if (occurs_count(poly, lhs) != 1)
+            if (!occurs_once(poly, lhs))
                 continue;
             try
             {
@@ -1090,7 +1097,7 @@ namespace
                 continue;
             if (contains_multiplicative_or_power(sub))
                 continue;
-            if (occurs_count(poly, sub) != 1)
+            if (!occurs_once(poly, sub))
                 continue;
             if (!vars_disjoint_except_eq(sub, poly))
                 continue;
