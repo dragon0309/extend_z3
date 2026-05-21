@@ -525,26 +525,167 @@ namespace
     {
         expr original;
         expr simplified;
+        bool changed = false;
 
-        PolySimplifyMemoEntry(const expr &o, const expr &s) : original(o), simplified(s) {}
+        PolySimplifyMemoEntry(const expr &o, const expr &s, bool c) : original(o), simplified(s), changed(c) {}
     };
 
     using SimplifyMemo = std::unordered_map<AstCacheKey, std::vector<PolySimplifyMemoEntry>, AstCacheKeyHash>;
     thread_local SimplifyMemo *active_simplify_memo = nullptr;
+    thread_local bool active_disable_rewrite_cache = false;
+    thread_local bool active_verify_rewrite_lookups = false;
+    thread_local std::ostream *active_rewrite_lookup_log = nullptr;
+
+    struct RewriteLookupStats
+    {
+        std::size_t simplify_hits_verified = 0;
+        std::size_t expanded_hits_verified = 0;
+        std::size_t rewrite_memo_hits_verified = 0;
+        std::size_t failures = 0;
+    };
+
+    thread_local RewriteLookupStats *active_rewrite_lookup_stats = nullptr;
+
+    bool cache_expr_matches(const expr &cached, const expr &recomputed)
+    {
+        if (same_ast(cached, recomputed))
+            return true;
+        try
+        {
+            return (cached == recomputed).simplify().is_true();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void record_lookup_verification(const char *what,
+                                    const expr &original,
+                                    const expr &cached,
+                                    const expr &recomputed,
+                                    bool *changed = nullptr,
+                                    bool *recomputed_changed = nullptr)
+    {
+        const bool ok = cache_expr_matches(cached, recomputed) &&
+                        (!changed || !recomputed_changed || *changed == *recomputed_changed);
+
+        if (active_rewrite_lookup_stats)
+        {
+            if (std::strcmp(what, "simplify_poly memo") == 0)
+                ++active_rewrite_lookup_stats->simplify_hits_verified;
+            else if (std::strcmp(what, "expanded rewrite rule") == 0)
+                ++active_rewrite_lookup_stats->expanded_hits_verified;
+            else if (std::strcmp(what, "rewrite memo") == 0)
+                ++active_rewrite_lookup_stats->rewrite_memo_hits_verified;
+            if (!ok)
+                ++active_rewrite_lookup_stats->failures;
+        }
+
+        if (active_rewrite_lookup_log)
+        {
+            *active_rewrite_lookup_log << "[lookup] " << what << " "
+                                       << (ok ? "OK" : "FAIL") << "\n";
+            if (changed && recomputed_changed)
+                *active_rewrite_lookup_log << "  changed=" << (*changed ? "true" : "false")
+                                           << " recomputed_changed=" << (*recomputed_changed ? "true" : "false")
+                                           << "\n";
+            *active_rewrite_lookup_log << "  original=" << original << "\n"
+                                       << "  cached=" << cached << "\n"
+                                       << "  recomputed=" << recomputed << "\n\n";
+        }
+
+        if (ok)
+            return;
+
+        std::ostringstream oss;
+        oss << "rewrite lookup verification failed for " << what
+            << "\n  original=" << original
+            << "\n  cached=" << cached
+            << "\n  recomputed=" << recomputed;
+        if (changed && recomputed_changed)
+            oss << "\n  cached_changed=" << (*changed ? "true" : "false")
+                << "\n  recomputed_changed=" << (*recomputed_changed ? "true" : "false");
+        throw std::runtime_error(oss.str());
+    }
+
+    struct ScopedLookupOverride
+    {
+        SimplifyMemo *previous_memo = nullptr;
+        bool previous_disable = false;
+        bool previous_verify = false;
+
+        ScopedLookupOverride(SimplifyMemo *memo, bool disable_cache, bool verify_lookups)
+            : previous_memo(active_simplify_memo),
+              previous_disable(active_disable_rewrite_cache),
+              previous_verify(active_verify_rewrite_lookups)
+        {
+            active_simplify_memo = memo;
+            active_disable_rewrite_cache = disable_cache;
+            active_verify_rewrite_lookups = verify_lookups;
+        }
+
+        ~ScopedLookupOverride()
+        {
+            active_simplify_memo = previous_memo;
+            active_disable_rewrite_cache = previous_disable;
+            active_verify_rewrite_lookups = previous_verify;
+        }
+
+        ScopedLookupOverride(const ScopedLookupOverride &) = delete;
+        ScopedLookupOverride &operator=(const ScopedLookupOverride &) = delete;
+    };
 
     struct ScopedSimplifyMemo
     {
         SimplifyMemo memo;
+        RewriteLookupStats stats;
         SimplifyMemo *previous = nullptr;
+        bool previous_disable = false;
+        bool previous_verify = false;
+        std::ostream *previous_lookup_log = nullptr;
+        RewriteLookupStats *previous_lookup_stats = nullptr;
 
-        ScopedSimplifyMemo() : previous(active_simplify_memo)
+        explicit ScopedSimplifyMemo(const RewriteOptions &options = RewriteOptions{})
+            : previous(active_simplify_memo),
+              previous_disable(active_disable_rewrite_cache),
+              previous_verify(active_verify_rewrite_lookups),
+              previous_lookup_log(active_rewrite_lookup_log),
+              previous_lookup_stats(active_rewrite_lookup_stats)
         {
             active_simplify_memo = &memo;
+            active_disable_rewrite_cache = options.disable_rewrite_cache;
+            active_verify_rewrite_lookups = options.verify_rewrite_lookups;
+            active_rewrite_lookup_log = options.rewrite_lookup_log;
+            active_rewrite_lookup_stats = options.rewrite_lookup_log ? &stats : nullptr;
+            if (active_rewrite_lookup_log)
+            {
+                *active_rewrite_lookup_log << "[rewrite lookup verification]\n"
+                                           << "  disable_cache="
+                                           << (options.disable_rewrite_cache ? "true" : "false") << "\n"
+                                           << "  verify_lookups="
+                                           << (options.verify_rewrite_lookups ? "true" : "false") << "\n\n";
+            }
         }
 
         ~ScopedSimplifyMemo()
         {
+            if (active_rewrite_lookup_log && active_rewrite_lookup_stats == &stats)
+            {
+                *active_rewrite_lookup_log << "[summary]\n"
+                                           << "  simplify_poly memo verified hits: "
+                                           << stats.simplify_hits_verified << "\n"
+                                           << "  expanded rewrite rule verified hits: "
+                                           << stats.expanded_hits_verified << "\n"
+                                           << "  rewrite memo verified hits: "
+                                           << stats.rewrite_memo_hits_verified << "\n"
+                                           << "  failures: " << stats.failures << "\n";
+            }
             active_simplify_memo = previous;
+            active_disable_rewrite_cache = previous_disable;
+            active_verify_rewrite_lookups = previous_verify;
+            active_rewrite_lookup_log = previous_lookup_log;
+            active_rewrite_lookup_stats = previous_lookup_stats;
         }
 
         ScopedSimplifyMemo(const ScopedSimplifyMemo &) = delete;
@@ -553,6 +694,12 @@ namespace
 
     expr simplify_poly(const expr &e, const PolyDecls &d);
     expr simplify_poly_impl(const expr &e, const PolyDecls &d);
+
+    expr simplify_poly_uncached_for_verification(const expr &e, const PolyDecls &d)
+    {
+        ScopedLookupOverride guard(nullptr, true, false);
+        return simplify_poly_impl(e, d);
+    }
 
     expr simplify_pneg(const expr &a, const PolyDecls &d)
     {
@@ -573,6 +720,8 @@ namespace
     {
         if (!e.is_app())
             return e;
+        if (active_disable_rewrite_cache)
+            return simplify_poly_impl(e, d);
 
         AstCacheKey key{(Z3_context)e.ctx(), ast_id(e)};
         auto it = memo.find(key);
@@ -580,16 +729,28 @@ namespace
         {
             for (const PolySimplifyMemoEntry &entry : it->second)
                 if (same_ast(entry.original, e))
+                {
+                    if (active_verify_rewrite_lookups)
+                    {
+                        expr recomputed = simplify_poly_uncached_for_verification(e, d);
+                        bool cached_changed = entry.changed;
+                        bool recomputed_changed = !same_ast(e, recomputed);
+                        record_lookup_verification("simplify_poly memo", e, entry.simplified, recomputed,
+                                                   &cached_changed, &recomputed_changed);
+                    }
                     return entry.simplified;
+                }
         }
 
         expr r = simplify_poly_impl(e, d);
-        memo[key].emplace_back(e, r);
+        memo[key].emplace_back(e, r, !same_ast(e, r));
         return r;
     }
 
     expr simplify_poly(const expr &e, const PolyDecls &d)
     {
+        if (active_disable_rewrite_cache)
+            return simplify_poly_impl(e, d);
         if (active_simplify_memo)
             return simplify_poly_cached(e, d, *active_simplify_memo);
 
@@ -1898,13 +2059,17 @@ namespace
         const std::vector<RewriteRule> &rules;
         const PolyDecls &d;
         bool all_variable_rules = true;
+        bool disable_cache = false;
+        bool verify_lookups = false;
         std::unordered_map<std::string, const RewriteRule *> by_lhs;
         std::unordered_map<std::string, expr> expanded;
         std::unordered_map<unsigned, std::vector<RewriteMemoEntry>> memo;
         std::unordered_set<std::string> active;
 
-        RewriteEnv(const std::vector<RewriteRule> &rules_, const PolyDecls &d_)
-            : rules(rules_), d(d_)
+        RewriteEnv(const std::vector<RewriteRule> &rules_, const PolyDecls &d_,
+                   const RewriteOptions &options_ = RewriteOptions{})
+            : rules(rules_), d(d_), disable_cache(options_.disable_rewrite_cache),
+              verify_lookups(options_.verify_rewrite_lookups)
         {
             for (const RewriteRule &r : rules)
             {
@@ -1929,9 +2094,23 @@ namespace
 
     expr expand_variable_rule_env(const std::string &key, RewriteEnv &env)
     {
-        auto cached = env.expanded.find(key);
-        if (cached != env.expanded.end())
-            return cached->second;
+        if (!env.disable_cache)
+        {
+            auto cached = env.expanded.find(key);
+            if (cached != env.expanded.end())
+            {
+                if (env.verify_lookups)
+                {
+                    RewriteOptions verify_options;
+                    verify_options.disable_rewrite_cache = true;
+                    RewriteEnv check_env(env.rules, env.d, verify_options);
+                    ScopedLookupOverride guard(nullptr, true, false);
+                    expr recomputed = expand_variable_rule_env(key, check_env);
+                    record_lookup_verification("expanded rewrite rule", cached->second, cached->second, recomputed);
+                }
+                return cached->second;
+            }
+        }
 
         auto it = env.by_lhs.find(key);
         if (it == env.by_lhs.end())
@@ -1947,6 +2126,8 @@ namespace
         else if (rhs_changed)
             rhs = rhs.simplify();
 
+        if (env.disable_cache)
+            return rhs;
         auto [pos, _] = env.expanded.emplace(key, rhs);
         return pos->second;
     }
@@ -1954,15 +2135,30 @@ namespace
     expr apply_variable_env_rec(const expr &e, RewriteEnv &env, bool &changed)
     {
         const unsigned id = ast_id(e);
-        auto cached = env.memo.find(id);
-        if (cached != env.memo.end())
+        if (!env.disable_cache)
         {
-            for (const RewriteMemoEntry &entry : cached->second)
+            auto cached = env.memo.find(id);
+            if (cached != env.memo.end())
             {
-                if (same_ast(entry.original, e))
+                for (const RewriteMemoEntry &entry : cached->second)
                 {
-                    changed = entry.changed;
-                    return entry.rewritten;
+                    if (same_ast(entry.original, e))
+                    {
+                        if (env.verify_lookups)
+                        {
+                            RewriteOptions verify_options;
+                            verify_options.disable_rewrite_cache = true;
+                            RewriteEnv check_env(env.rules, env.d, verify_options);
+                            bool recomputed_changed = false;
+                            ScopedLookupOverride guard(nullptr, true, false);
+                            expr recomputed = apply_variable_env_rec(e, check_env, recomputed_changed);
+                            bool cached_changed = entry.changed;
+                            record_lookup_verification("rewrite memo", e, entry.rewritten, recomputed,
+                                                       &cached_changed, &recomputed_changed);
+                        }
+                        changed = entry.changed;
+                        return entry.rewritten;
+                    }
                 }
             }
         }
@@ -1975,7 +2171,7 @@ namespace
             {
                 changed = true;
                 expr r = expand_variable_rule_env(key, env);
-                if (env.active.find(key) == env.active.end())
+                if (!env.disable_cache && env.active.find(key) == env.active.end())
                     env.memo[id].emplace_back(e, r, true);
                 return r;
             }
@@ -1983,7 +2179,8 @@ namespace
         if (!e.is_app())
         {
             changed = false;
-            env.memo[id].emplace_back(e, e, false);
+            if (!env.disable_cache)
+                env.memo[id].emplace_back(e, e, false);
             return e;
         }
 
@@ -2000,13 +2197,15 @@ namespace
         if (!any)
         {
             changed = false;
-            env.memo[id].emplace_back(e, e, false);
+            if (!env.disable_cache)
+                env.memo[id].emplace_back(e, e, false);
             return e;
         }
 
         changed = true;
         expr r = rebuild_app(e, args).simplify();
-        env.memo[id].emplace_back(e, r, true);
+        if (!env.disable_cache)
+            env.memo[id].emplace_back(e, r, true);
         return r;
     }
 
@@ -2026,12 +2225,13 @@ namespace
         return cur;
     }
 
-    expr apply_rules(const expr &e, const std::vector<RewriteRule> &rules, const PolyDecls &d)
+    expr apply_rules(const expr &e, const std::vector<RewriteRule> &rules, const PolyDecls &d,
+                     const RewriteOptions &options = RewriteOptions{})
     {
         if (rules.empty())
             return e;
 
-        RewriteEnv env(rules, d);
+        RewriteEnv env(rules, d, options);
         return apply_rules_with_env(e, env);
     }
 
@@ -2102,14 +2302,15 @@ namespace
 
     std::vector<RewriteRule> compose_rules(const std::vector<RewriteRule> &rules,
                                            const std::vector<std::size_t> &sorted,
-                                           const PolyDecls &d)
+                                           const PolyDecls &d,
+                                           const RewriteOptions &options)
     {
         std::vector<RewriteRule> env;
         env.reserve(rules.size());
         for (std::size_t idx : sorted)
         {
             const RewriteRule &src = rules[idx];
-            expr rhs = simplify_poly(apply_rules(src.rhs, env, d), d);
+            expr rhs = simplify_poly(apply_rules(src.rhs, env, d, options), d);
             if (contains_expr(rhs, src.lhs))
                 throw CircularDependency();
             RewriteRule r(src.lhs, rhs, src.source_generator, src.kind, src.is_modular, src.source_label);
@@ -2369,7 +2570,7 @@ namespace
             std::vector<RewriteRule> env;
             try
             {
-                env = compose_rules(ex.rules, sorted, d);
+                env = compose_rules(ex.rules, sorted, d, options);
             }
             catch (const CircularDependency &)
             {
@@ -2382,7 +2583,7 @@ namespace
                 }
                 throw;
             }
-            RewriteEnv rewrite_env(env, d);
+            RewriteEnv rewrite_env(env, d, options);
             ++res.dag_rounds;
             res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
 
@@ -2435,7 +2636,7 @@ namespace
         {
             expr poly = stack.front();
             stack.pop_front();
-            poly = normalize_poly_under_moduli(apply_rules(poly, env, d), moduli, d, options, res.stats);
+            poly = normalize_poly_under_moduli(apply_rules(poly, env, d, options), moduli, d, options, res.stats);
 
             auto info = generator_to_polynomial(poly, moduli, d, options, res.stats, res.diagnostics,
                                                 "wl-i" + std::to_string(iterations));
@@ -2505,7 +2706,7 @@ namespace
         res.rules_used = env;
 
         std::vector<expr> final_residuals;
-        RewriteEnv final_env(env, d);
+        RewriteEnv final_env(env, d, options);
         for (const expr &r : residuals)
             final_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(r, final_env),
                                                                   moduli, d, options, res.stats));
@@ -2699,7 +2900,7 @@ RewriteResult rewrite_assignments(const std::vector<z3::expr> &ideal_generators,
     PolyDecls d = collect_decls(roots);
     if (!d.pconst)
         throw std::runtime_error("rewrite_assignments: PConst constructor not found");
-    ScopedSimplifyMemo simplify_scope;
+    ScopedSimplifyMemo simplify_scope(options);
 
     try
     {
@@ -2736,7 +2937,7 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
     PolyDecls d = collect_decls(roots);
     if (!d.pconst)
         return out;
-    ScopedSimplifyMemo simplify_scope;
+    ScopedSimplifyMemo simplify_scope(options);
 
     auto post_moduli = [&](const AnnotatedPostcondition &p)
     {
@@ -2779,16 +2980,16 @@ RewriteTwoPhaseResult rewrite_assignments_two_phase(
         std::vector<RewriteRule> single{pat->rule};
         out.rules_used.push_back(pat->rule);
         for (auto &p : finished)
-            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d),
+            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d, options),
                                                        moduli, d, options, out.stats);
         for (auto &p : todo)
-            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d),
+            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d, options),
                                                        moduli, d, options, out.stats);
         for (auto &p : out.postconditions)
         {
-            p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d), d);
+            p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d, options), d);
             for (auto &m : p.moduli)
-                m = simplify_poly(apply_rules(m, single, d), d);
+                m = simplify_poly(apply_rules(m, single, d, options), d);
             p.polynomial = normalize_poly_under_moduli(p.polynomial, post_moduli(p), d, options, out.stats);
         }
     }
@@ -2839,9 +3040,6 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                     util::fmt_duration(rewrite_t1 - rewrite_t0));
         return out;
     }
-    ScopedSimplifyMemo simplify_scope;
-    expr poly_zero = mk_pconst_mpz(d, ctx, 0);
-
     RewriteOptions options = option;
     if (option.preserve_eqmodp1_vars)
     {
@@ -2854,6 +3052,8 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         }
         options.suppressed_lhs_keys = std::move(suppressed);
     }
+    ScopedSimplifyMemo simplify_scope(options);
+    expr poly_zero = mk_pconst_mpz(d, ctx, 0);
 
     // Assertion-level rewriting extracts assignments only from eqP atoms that
     // are unconditionally asserted: either the assertion itself, or below only
@@ -2896,7 +3096,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
 
     std::vector<expr> rewritten_asserts;
     rewritten_asserts.reserve(input_asserts.size());
-    RewriteEnv assertion_env(core.rules_used, d);
+    RewriteEnv assertion_env(core.rules_used, d, options);
     for (const expr &a : input_asserts)
     {
         expr rw = rewrite_assertion(a, assertion_env, options, out.stats);
@@ -3466,6 +3666,43 @@ int run_rewrite_selftests()
         bool ok = check(rr.postconditions.size() == 1 &&
                             equivalent_for_test(rr.postconditions[0].polynomial, x, d),
                         "two-phase postcondition kept multiple of its modulus");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] rewrite lookup debug modes preserve results\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const y Int)"
+                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
+                                        "(assert (eqP (PConst y) (PConst 0)))");
+        PolyDecls d = collect_decls(asserts);
+        std::vector<expr> eqps;
+        for (const expr &a : asserts)
+            collect_eqP_rec(a, eqps);
+        std::vector<expr> ideal;
+        for (const expr &e : eqps)
+            ideal.push_back(mk_psub(d, e.arg(0), e.arg(1)));
+        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
+        expr target = mk_padd(d, x, x);
+        expr expected = mk_pconst_mpz(d, ctx, 2);
+
+        RewriteOptions verify;
+        verify.use_singular_normalization = false;
+        verify.verify_rewrite_lookups = true;
+        RewriteResult verified = rewrite_assignments(ideal, target, {}, verify);
+
+        RewriteOptions no_cache = verify;
+        no_cache.verify_rewrite_lookups = false;
+        no_cache.disable_rewrite_cache = true;
+        RewriteResult uncached = rewrite_assignments(ideal, target, {}, no_cache);
+
+        bool ok = check(equivalent_for_test(verified.rewritten_target, expected, d),
+                        "verified lookup mode changed rewrite result");
+        ok &= check(equivalent_for_test(uncached.rewritten_target, expected, d),
+                    "disabled cache mode changed rewrite result");
         if (ok)
             std::cout << "  OK\n";
         run(ok);

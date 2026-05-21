@@ -100,12 +100,16 @@ static bool ENABLE_REWRITING = true;
 //     dropping duplicate or conflicting rewrite candidates.
 //   * ENABLE_REWRITE_SINGULAR_NF (default true): allow Singular-backed zero
 //     checks during rewrite normalization.
+//   * DISABLE_REWRITE_CACHE / VERIFY_REWRITE_LOOKUPS (default false): debug
+//     cache/memo correctness by disabling or rechecking rewrite memo hits.
 static bool PRESERVE_EQMODP1_VARS = false;
 static bool ENABLE_SUBEXPRESSION_RULES = false;
 static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
 static bool REJECT_DUPLICATE_LHS = false;
 static bool REJECT_CONFLICTING_LHS = false;
 static bool ENABLE_REWRITE_SINGULAR_NF = true;
+static bool DISABLE_REWRITE_CACHE = false;
+static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
 
@@ -251,6 +255,7 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
           " [--enable-expression-growth-check]"
           " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
+          " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--show-model]"
           " [--rewrite-log]\n";
 }
@@ -3026,6 +3031,10 @@ int main(int argc, char **argv)
                 REJECT_DUPLICATE_LHS = true;
             else if (a == "--reject-conflicting-lhs")
                 REJECT_CONFLICTING_LHS = true;
+            else if (a == "--disable-rewrite-cache")
+                DISABLE_REWRITE_CACHE = true;
+            else if (a == "--verify-rewrite-lookups")
+                VERIFY_REWRITE_LOOKUPS = true;
             else if (a == "--disable-auto-lemmas")
                 ENABLE_AUTO_LEMMAS = false;
             else if (a == "--disable-final-fixed-value-check")
@@ -3083,6 +3092,8 @@ int main(int argc, char **argv)
             rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
             rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
             rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
+            rwopt.disable_rewrite_cache = DISABLE_REWRITE_CACHE;
+            rwopt.verify_rewrite_lookups = VERIFY_REWRITE_LOOKUPS;
 
             std::ofstream rewrite_log;
             if (rewrite_log_requested)
@@ -3091,6 +3102,14 @@ int main(int argc, char **argv)
                 if (!rewrite_log.is_open())
                     throw std::runtime_error("cannot open rewrite.log for writing");
                 rwopt.rewrite_log = &rewrite_log;
+            }
+            std::ofstream rewrite_lookup_log;
+            if (VERIFY_REWRITE_LOOKUPS)
+            {
+                rewrite_lookup_log.open("rewritelookups.log", std::ios::out | std::ios::trunc);
+                if (!rewrite_lookup_log.is_open())
+                    throw std::runtime_error("cannot open rewritelookups.log for writing");
+                rwopt.rewrite_lookup_log = &rewrite_lookup_log;
             }
 
             begin_cli_timed_row(terminal_out, "Rewriting assignments:");

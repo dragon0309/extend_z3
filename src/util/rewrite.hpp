@@ -25,9 +25,12 @@ struct RewriteOptions
     bool enable_expression_growth_check = false;
     bool reject_duplicate_lhs = false;
     bool reject_conflicting_lhs = false;
+    bool disable_rewrite_cache = false;
+    bool verify_rewrite_lookups = false;
     std::size_t max_rounds = 100;
     std::size_t max_expression_growth = 4096;
     std::ostream *rewrite_log = nullptr;
+    std::ostream *rewrite_lookup_log = nullptr;
 
     // Preserve variables that occur in eqmodP1 atoms by preventing them from
     // becoming rewrite-rule left-hand sides.
