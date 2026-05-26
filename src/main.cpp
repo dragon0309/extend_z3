@@ -829,7 +829,7 @@ struct RingEnv
 
     void build(coeffs cf,
                const std::vector<std::string> &base_vars,
-               rRingOrder_t /*order_ignored*/ = ringorder_dp)
+               rRingOrder_t /*order_ignored*/ = ringorder_lp)
     {
         init_singular();
 
@@ -872,7 +872,7 @@ struct RingEnv
         block1_heap = (int *)omAlloc0(ord_size * sizeof(int));
         wvhdl_heap = nullptr;
 
-        ord_heap[0] = ringorder_dp;
+        ord_heap[0] = ringorder_lp;
         ord_heap[1] = ringorder_C;
         ord_heap[2] = (rRingOrder_t)0;
 
@@ -3397,7 +3397,7 @@ public:
 
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
-        m_RE.build(cfZ, m_ring_vars, ringorder_dp);
+        m_RE.build(cfZ, m_ring_vars, ringorder_lp);
 
         for (size_t i = 0; i < eqps.size(); ++i)
         {
@@ -3491,7 +3491,7 @@ public:
 
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
-        m_RE.build(cfZ, m_ring_vars, ringorder_dp);
+        m_RE.build(cfZ, m_ring_vars, ringorder_lp);
     }
 
     ~PolyPropagator() override
