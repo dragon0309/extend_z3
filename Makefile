@@ -7,7 +7,7 @@ OBJS := $(SRCS:%.cpp=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
 CPPFLAGS += -Isrc
-CXXFLAGS += -std=c++20 -Wall -MMD -MP
+CXXFLAGS += -std=c++20 -Wall -MMD -MP -O2 -DNDEBUG
 
 # Z3 (your local build)
 Z3_ROOT    = $(CURDIR)/z3

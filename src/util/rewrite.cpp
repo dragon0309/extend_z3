@@ -83,8 +83,6 @@ std::string rule_rhs_pretty(const PolyRewriteRule &rr)
         return "0";
     case PolyRewriteRule::Kind::ToConst:
         return rr.const_value.get_str();
-    case PolyRewriteRule::Kind::Alias:
-        return rr.target;
     case PolyRewriteRule::Kind::ExprRhs:
         return rr.rhs_int ? rr.rhs_int->to_string() : std::string("<poly-expr>");
     }
@@ -1775,6 +1773,9 @@ namespace
         return std::nullopt;
     }
 
+    bool is_eqP_atom(const expr &e);
+    bool is_true_expr(const expr &e);
+
     struct Extraction
     {
         struct Residual
@@ -1791,9 +1792,221 @@ namespace
 
         std::vector<RewriteRule> rules;
         std::vector<Residual> residuals;
-        std::vector<expr> input_generators;
+        std::vector<std::size_t> consumed_input_indices;
+        std::vector<expr> input_formulas;
         std::size_t input_count = 0;
     };
+
+    struct RewriteItem
+    {
+        expr formula;
+        std::optional<expr> poly_view;
+        bool rule_candidate = false;
+        std::size_t source_index = 0;
+
+        RewriteItem(const expr &f, std::optional<expr> p, bool candidate, std::size_t idx)
+            : formula(f), poly_view(std::move(p)), rule_candidate(candidate), source_index(idx)
+        {
+        }
+    };
+
+    struct AssertionRewriteResult
+    {
+        std::vector<expr> residual_assertions;
+        std::vector<RewriteRule> rules_used;
+        bool used_worklist_fallback = false;
+        std::size_t dag_rounds = 0;
+        RewriteStats stats;
+        std::vector<std::string> diagnostics;
+    };
+
+    struct AssertionRewriteTiming
+    {
+        std::chrono::nanoseconds make_items{0};
+        std::chrono::nanoseconds extract{0};
+        std::chrono::nanoseconds topo_sort{0};
+        std::chrono::nanoseconds compose{0};
+        std::chrono::nanoseconds build_env{0};
+        std::chrono::nanoseconds residual_rewrite{0};
+        std::chrono::nanoseconds final_collect{0};
+        std::size_t rounds = 0;
+        std::size_t items_seen = 0;
+        std::size_t residual_rewrite_calls = 0;
+    };
+
+    void append_rewrite_items_rec(const expr &assertion,
+                                  std::vector<RewriteItem> &items,
+                                  const PolyDecls &d,
+                                  std::size_t source_index)
+    {
+        if (is_true_expr(assertion))
+            return;
+        if (assertion.is_app() && assertion.decl().name().str() == "and")
+        {
+            for (unsigned i = 0; i < assertion.num_args(); ++i)
+                append_rewrite_items_rec(assertion.arg(i), items, d, source_index);
+            return;
+        }
+
+        if (is_eqP_atom(assertion))
+        {
+            expr poly = simplify_poly(mk_psub(d, assertion.arg(0), assertion.arg(1)), d);
+            items.emplace_back(assertion, poly, true, source_index);
+            return;
+        }
+
+        items.emplace_back(assertion, std::nullopt, false, source_index);
+    }
+
+    std::vector<RewriteItem> make_rewrite_items(const std::vector<expr> &assertions,
+                                                const PolyDecls &d)
+    {
+        std::vector<RewriteItem> items;
+        for (std::size_t i = 0; i < assertions.size(); ++i)
+            append_rewrite_items_rec(assertions[i], items, d, i);
+        return items;
+    }
+
+    std::vector<expr> formulas_from_items(const std::vector<RewriteItem> &items)
+    {
+        std::vector<expr> out;
+        out.reserve(items.size());
+        std::unordered_set<std::string> seen;
+        seen.reserve(items.size());
+        for (const RewriteItem &item : items)
+        {
+            if (is_true_expr(item.formula))
+                continue;
+            if (seen.insert(item.formula.to_string()).second)
+                out.push_back(item.formula);
+        }
+        return out;
+    }
+
+    Extraction extract_assertion_item_assignments(const std::vector<RewriteItem> &items,
+                                                  const std::vector<expr> &moduli,
+                                                  const PolyDecls &d,
+                                                  const RewriteOptions &options,
+                                                  RewriteStats &stats,
+                                                  std::vector<std::string> &diagnostics,
+                                                  const std::string &trace_scope)
+    {
+        const std::string scope_prefix = trace_scope.empty() ? "" : trace_scope + "/";
+        Extraction out;
+        out.input_count = items.size();
+        if (options.rewrite_log)
+            out.input_formulas.reserve(items.size());
+
+        std::vector<GeneratorInfo> infos;
+        infos.reserve(items.size());
+        for (std::size_t i = 0; i < items.size(); ++i)
+        {
+            if (options.rewrite_log)
+                out.input_formulas.push_back(items[i].formula);
+            if (!items[i].rule_candidate || !items[i].poly_view)
+                continue;
+
+            const std::string glabel = scope_prefix + "item#" + std::to_string(i);
+            expr p = moduli.empty() ? *items[i].poly_view
+                                    : normalize_poly_under_moduli(*items[i].poly_view, moduli, d, options, stats);
+            GeneratorInfo info(items[i].formula, p, false, true, glabel, i);
+            infos.push_back(info);
+        }
+
+        struct Candidate
+        {
+            Pattern pattern;
+            std::size_t index;
+            Candidate(const Pattern &p, std::size_t i) : pattern(p), index(i) {}
+        };
+
+        std::unordered_map<std::string, std::vector<Candidate>> grouped;
+        grouped.reserve(infos.size());
+        std::vector<bool> has_candidate(infos.size(), false);
+        const std::vector<expr> empty_others;
+        for (std::size_t i = 0; i < infos.size(); ++i)
+        {
+            std::vector<expr> others;
+            const std::vector<expr> *others_ref = &empty_others;
+            if (options.use_subexpression_rules)
+            {
+                others.reserve(infos.size() > 0 ? infos.size() - 1 : 0);
+                for (std::size_t j = 0; j < infos.size(); ++j)
+                    if (i != j)
+                        others.push_back(infos[j].polynomial);
+                others_ref = &others;
+            }
+
+            auto pat = extract_one_assignment(infos[i], *others_ref, moduli, d, options, stats, diagnostics);
+            if (pat)
+            {
+                grouped[pat->lhs_key].emplace_back(*pat, i);
+                has_candidate[i] = true;
+            }
+        }
+
+        std::vector<bool> consumed(infos.size(), false);
+        std::vector<std::string> residual_reasons(infos.size());
+        out.rules.reserve(grouped.size());
+        out.consumed_input_indices.reserve(grouped.size());
+        for (auto &kv : grouped)
+        {
+            auto &cands = kv.second;
+            const std::string lhs_name = cands.empty() ? kv.first : cands[0].pattern.rule.lhs.to_string();
+            const bool has_duplicate_lhs = cands.size() > 1;
+            if (has_duplicate_lhs && options.reject_duplicate_lhs)
+                stats.duplicate_lhs += cands.size() - 1;
+
+            bool conflict = false;
+            if (has_duplicate_lhs && options.reject_conflicting_lhs)
+            {
+                for (std::size_t i = 1; i < cands.size(); ++i)
+                {
+                    if (!equivalent_poly(cands[0].pattern.rule.rhs, cands[i].pattern.rule.rhs,
+                                         moduli, d, options, stats))
+                    {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+            if (conflict)
+            {
+                ++stats.conflicting_lhs;
+                diagnostics.push_back("duplicate lhs conflict: " + lhs_name);
+                for (const Candidate &c : cands)
+                    residual_reasons[c.index] = "conflicting LHS " + lhs_name + " has incompatible RHS";
+                continue;
+            }
+            if (has_duplicate_lhs && options.reject_duplicate_lhs)
+            {
+                diagnostics.push_back("duplicate lhs: " + lhs_name);
+                for (const Candidate &c : cands)
+                    residual_reasons[c.index] = "duplicate LHS " + lhs_name + " already assigned in this round";
+                continue;
+            }
+
+            out.rules.push_back(cands[0].pattern.rule);
+            out.consumed_input_indices.push_back(infos[cands[0].index].input_index);
+            ++stats.rules_extracted;
+            consumed[cands[0].index] = true;
+            for (std::size_t i = 1; i < cands.size(); ++i)
+                residual_reasons[cands[i].index] = "duplicate LHS " + lhs_name + " already assigned in this round";
+        }
+
+        std::sort(out.rules.begin(), out.rules.end(),
+                  [](const RewriteRule &a, const RewriteRule &b)
+                  {
+                      return variable_key(a.lhs) < variable_key(b.lhs);
+                  });
+
+        for (std::size_t i = 0; i < infos.size(); ++i)
+        {
+            if (!has_candidate[i] || !consumed[i])
+                out.residuals.emplace_back(infos[i].polynomial, residual_reasons[i], infos[i].input_index);
+        }
+        return out;
+    }
 
     Extraction extract_assignments_under_moduli(const std::vector<expr> &generators,
                                                 const std::vector<expr> &moduli,
@@ -1806,7 +2019,7 @@ namespace
         const std::string scope_prefix = trace_scope.empty() ? "" : trace_scope + "/";
         Extraction out;
         out.input_count = generators.size();
-        out.input_generators = generators;
+        out.input_formulas = generators;
 
         std::vector<GeneratorInfo> infos;
         infos.reserve(generators.size());
@@ -1901,6 +2114,7 @@ namespace
             }
 
             out.rules.push_back(cands[0].pattern.rule);
+            out.consumed_input_indices.push_back(infos[cands[0].index].input_index);
             ++stats.rules_extracted;
             consumed[cands[0].index] = true;
             for (std::size_t i = 1; i < cands.size(); ++i)
@@ -2239,12 +2453,16 @@ namespace
     {
         const std::size_t n = rules.size();
         std::unordered_map<std::string, std::size_t> index;
+        index.reserve(n);
+        std::vector<std::string> lhs_keys;
+        lhs_keys.reserve(n);
         bool use_dependency_keys = true;
         for (std::size_t i = 0; i < n; ++i)
         {
             if (rules[i].kind != RewriteRule::Kind::Variable || !is_poly_variable(rules[i].lhs))
                 use_dependency_keys = false;
-            index[variable_key(rules[i].lhs)] = i;
+            lhs_keys.push_back(variable_key(rules[i].lhs));
+            index[lhs_keys.back()] = i;
         }
 
         std::vector<std::vector<std::size_t>> deps(n);
@@ -2277,6 +2495,7 @@ namespace
 
         std::vector<int> state(n, 0);
         std::vector<std::size_t> sorted;
+        sorted.reserve(n);
         std::function<void(std::size_t)> dfs = [&](std::size_t i)
         {
             if (state[i] == 1)
@@ -2294,7 +2513,7 @@ namespace
         for (std::size_t i = 0; i < n; ++i)
             order[i] = i;
         std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b)
-                  { return variable_key(rules[a].lhs) < variable_key(rules[b].lhs); });
+                  { return lhs_keys[a] < lhs_keys[b]; });
         for (std::size_t i : order)
             dfs(i);
         return sorted;
@@ -2307,15 +2526,29 @@ namespace
     {
         std::vector<RewriteRule> env;
         env.reserve(rules.size());
+        RewriteEnv rewrite_env(env, d, options);
         for (std::size_t idx : sorted)
         {
             const RewriteRule &src = rules[idx];
-            expr rhs = simplify_poly(apply_rules(src.rhs, env, d, options), d);
+            expr rhs = simplify_poly(apply_rules_with_env(src.rhs, rewrite_env), d);
             if (contains_expr(rhs, src.lhs))
                 throw CircularDependency();
             RewriteRule r(src.lhs, rhs, src.source_generator, src.kind, src.is_modular, src.source_label);
             r.rhs_dependencies = collect_sorted_vars(rhs);
             env.push_back(r);
+            rewrite_env.memo.clear();
+            if (rewrite_env.all_variable_rules && r.kind == RewriteRule::Kind::Variable && is_poly_variable(r.lhs))
+            {
+                std::string key = variable_key(env.back().lhs);
+                rewrite_env.by_lhs.emplace(key, &env.back());
+                rewrite_env.expanded.erase(key);
+            }
+            else
+            {
+                rewrite_env.all_variable_rules = false;
+                rewrite_env.by_lhs.clear();
+                rewrite_env.expanded.clear();
+            }
         }
         return env;
     }
@@ -2455,9 +2688,9 @@ namespace
                             const PolyDecls &d)
     {
         os << "[DAG round " << round << "]\n";
-        os << "input generators: " << ex.input_count << "\n\n";
-        for (std::size_t i = 0; i < ex.input_generators.size(); ++i)
-            os << "[" << i << "] " << ex.input_generators[i].to_string() << "\n";
+        os << "input formulas: " << ex.input_count << "\n\n";
+        for (std::size_t i = 0; i < ex.input_formulas.size(); ++i)
+            os << "[" << i << "] " << ex.input_formulas[i].to_string() << "\n";
         os << "\n";
         os << "assignments extracted: " << ex.rules.size() << "\n\n";
         os << "assignments:\n";
@@ -2831,6 +3064,206 @@ namespace
         return simplify_assertion_rec(r, env.d, options, stats).simplify();
     }
 
+    void add_stats(RewriteStats &dst, const RewriteStats &src)
+    {
+        dst.rules_extracted += src.rules_extracted;
+        dst.duplicate_lhs += src.duplicate_lhs;
+        dst.conflicting_lhs += src.conflicting_lhs;
+        dst.skipped_nonlinear += src.skipped_nonlinear;
+        dst.skipped_unsafe_coefficient += src.skipped_unsafe_coefficient;
+        dst.skipped_lhs_occurs_in_rhs += src.skipped_lhs_occurs_in_rhs;
+        dst.skipped_modulus_not_subsumed += src.skipped_modulus_not_subsumed;
+        dst.skipped_expression_growth += src.skipped_expression_growth;
+        dst.singular_nf_checks += src.singular_nf_checks;
+        dst.singular_zero_reductions += src.singular_zero_reductions;
+        dst.singular_failures += src.singular_failures;
+    }
+
+    AssertionRewriteResult try_dag_rewrite_assertions(const std::vector<expr> &input_asserts,
+                                                      const PolyDecls &d,
+                                                      const RewriteOptions &options,
+                                                      AssertionRewriteTiming *timing = nullptr)
+    {
+        AssertionRewriteResult res;
+        auto make_t0 = std::chrono::steady_clock::now();
+        std::vector<RewriteItem> current = make_rewrite_items(input_asserts, d);
+        if (timing)
+            timing->make_items += std::chrono::steady_clock::now() - make_t0;
+        const std::vector<expr> moduli;
+
+        for (std::size_t round = 0; round < options.max_rounds; ++round)
+        {
+            if (timing)
+            {
+                ++timing->rounds;
+                timing->items_seen += current.size();
+            }
+            auto extract_t0 = std::chrono::steady_clock::now();
+            Extraction ex = extract_assertion_item_assignments(current, moduli, d, options,
+                                                               res.stats, res.diagnostics,
+                                                               "assert-r" + std::to_string(round));
+            if (timing)
+                timing->extract += std::chrono::steady_clock::now() - extract_t0;
+            if (ex.rules.empty())
+            {
+                std::vector<expr> simplified;
+                simplified.reserve(current.size());
+                std::vector<Extraction::Residual> originals;
+                originals.reserve(current.size());
+                std::vector<std::string> drop_reasons;
+                drop_reasons.reserve(current.size());
+                RewriteEnv empty_env(ex.rules, d, options);
+                auto rewrite_t0 = std::chrono::steady_clock::now();
+                for (std::size_t i = 0; i < current.size(); ++i)
+                {
+                    originals.emplace_back(current[i].formula, "", i);
+                    expr rw = rewrite_assertion(current[i].formula, empty_env, options, res.stats);
+                    simplified.push_back(rw);
+                    drop_reasons.push_back(is_true_expr(rw) ? "dropped because true" : "");
+                }
+                if (timing)
+                {
+                    timing->residual_rewrite += std::chrono::steady_clock::now() - rewrite_t0;
+                    timing->residual_rewrite_calls += current.size();
+                }
+                make_t0 = std::chrono::steady_clock::now();
+                current = make_rewrite_items(simplified, d);
+                if (timing)
+                    timing->make_items += std::chrono::steady_clock::now() - make_t0;
+                if (options.rewrite_log)
+                {
+                    const std::vector<std::size_t> empty_topo;
+                    const std::vector<RewriteRule> empty_rules;
+                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                    write_rule_analysis(*options.rewrite_log, ex.rules, &empty_topo, &empty_rules, d);
+                    write_residual_rewrite_log(*options.rewrite_log, originals, simplified, drop_reasons, d);
+                    write_final_residuals(*options.rewrite_log, formulas_from_items(current), d);
+                }
+                break;
+            }
+
+            std::vector<std::size_t> sorted;
+            try
+            {
+                auto topo_t0 = std::chrono::steady_clock::now();
+                sorted = topo_sort_rules(ex.rules);
+                if (timing)
+                    timing->topo_sort += std::chrono::steady_clock::now() - topo_t0;
+            }
+            catch (const CircularDependency &)
+            {
+                std::vector<expr> candidate_formulas;
+                candidate_formulas.reserve(current.size());
+                for (const RewriteItem &item : current)
+                    if (item.rule_candidate)
+                        candidate_formulas.push_back(item.formula);
+
+                expr zero = mk_pconst_mpz(d, current[0].formula.ctx(), 0);
+                RewriteResult fallback = functional_worklist_rewrite(candidate_formulas, zero, moduli, d, options);
+                res.used_worklist_fallback = true;
+                res.rules_used.insert(res.rules_used.end(), fallback.rules_used.begin(), fallback.rules_used.end());
+                add_stats(res.stats, fallback.stats);
+                res.diagnostics.insert(res.diagnostics.end(), fallback.diagnostics.begin(), fallback.diagnostics.end());
+
+                RewriteEnv fallback_env(fallback.rules_used, d, options);
+                std::vector<expr> rewritten;
+                rewritten.reserve(current.size());
+                for (const RewriteItem &item : current)
+                {
+                    expr rw = rewrite_assertion(item.formula, fallback_env, options, res.stats);
+                    if (!is_true_expr(rw))
+                        rewritten.push_back(rw);
+                }
+                current = make_rewrite_items(rewritten, d);
+                break;
+            }
+
+            std::vector<RewriteRule> env;
+            try
+            {
+                auto compose_t0 = std::chrono::steady_clock::now();
+                env = compose_rules(ex.rules, sorted, d, options);
+                if (timing)
+                    timing->compose += std::chrono::steady_clock::now() - compose_t0;
+            }
+            catch (const CircularDependency &)
+            {
+                std::vector<expr> candidate_formulas;
+                candidate_formulas.reserve(current.size());
+                for (const RewriteItem &item : current)
+                    if (item.rule_candidate)
+                        candidate_formulas.push_back(item.formula);
+
+                expr zero = mk_pconst_mpz(d, current[0].formula.ctx(), 0);
+                RewriteResult fallback = functional_worklist_rewrite(candidate_formulas, zero, moduli, d, options);
+                res.used_worklist_fallback = true;
+                res.rules_used.insert(res.rules_used.end(), fallback.rules_used.begin(), fallback.rules_used.end());
+                add_stats(res.stats, fallback.stats);
+                res.diagnostics.insert(res.diagnostics.end(), fallback.diagnostics.begin(), fallback.diagnostics.end());
+
+                RewriteEnv fallback_env(fallback.rules_used, d, options);
+                std::vector<expr> rewritten;
+                rewritten.reserve(current.size());
+                for (const RewriteItem &item : current)
+                {
+                    expr rw = rewrite_assertion(item.formula, fallback_env, options, res.stats);
+                    if (!is_true_expr(rw))
+                        rewritten.push_back(rw);
+                }
+                current = make_rewrite_items(rewritten, d);
+                break;
+            }
+
+            auto env_t0 = std::chrono::steady_clock::now();
+            RewriteEnv rewrite_env(env, d, options);
+            if (timing)
+                timing->build_env += std::chrono::steady_clock::now() - env_t0;
+            ++res.dag_rounds;
+            res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
+
+            std::unordered_set<std::size_t> consumed(ex.consumed_input_indices.begin(),
+                                                     ex.consumed_input_indices.end());
+            std::vector<expr> rewritten;
+            rewritten.reserve(current.size());
+            std::vector<expr> log_rewritten;
+            std::vector<Extraction::Residual> log_originals;
+            std::vector<std::string> drop_reasons;
+            auto rewrite_t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < current.size(); ++i)
+            {
+                if (consumed.count(i))
+                    continue;
+                if (timing)
+                    ++timing->residual_rewrite_calls;
+                log_originals.emplace_back(current[i].formula, "", i);
+                expr rw = rewrite_assertion(current[i].formula, rewrite_env, options, res.stats);
+                log_rewritten.push_back(rw);
+                drop_reasons.push_back(is_true_expr(rw) ? "dropped because true" : "");
+                if (!is_true_expr(rw))
+                    rewritten.push_back(rw);
+            }
+            if (timing)
+                timing->residual_rewrite += std::chrono::steady_clock::now() - rewrite_t0;
+
+            if (options.rewrite_log)
+            {
+                write_round_prefix(*options.rewrite_log, round + 1, ex, d);
+                write_rule_analysis(*options.rewrite_log, ex.rules, &sorted, &env, d);
+                write_residual_rewrite_log(*options.rewrite_log, log_originals, log_rewritten, drop_reasons, d);
+            }
+            make_t0 = std::chrono::steady_clock::now();
+            current = make_rewrite_items(rewritten, d);
+            if (timing)
+                timing->make_items += std::chrono::steady_clock::now() - make_t0;
+        }
+
+        auto collect_t0 = std::chrono::steady_clock::now();
+        res.residual_assertions = formulas_from_items(current);
+        if (timing)
+            timing->final_collect += std::chrono::steady_clock::now() - collect_t0;
+        return res;
+    }
+
     void collect_rule_atoms_rec(const expr &e, std::unordered_set<std::string> &out)
     {
         if (is_poly_variable(e))
@@ -3003,10 +3436,17 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                      util::Logger &log)
 {
     const auto rewrite_t0 = std::chrono::steady_clock::now();
+    std::chrono::nanoseconds pre_scan_time{0};
+    std::chrono::nanoseconds collect_decls_time{0};
+    std::chrono::nanoseconds assertion_rewrite_time{0};
+    std::chrono::nanoseconds legacy_rule_time{0};
+    std::chrono::nanoseconds post_scan_time{0};
+    std::chrono::nanoseconds substitution_log_time{0};
     expr zero = ctx.int_val(0);
     RewriteResult out(zero);
     out.asserts = input_asserts;
 
+    auto phase_t0 = std::chrono::steady_clock::now();
     std::vector<expr> eqps_before;
     std::vector<expr> asserted_eqps_before;
     std::vector<expr> eqmods_before;
@@ -3016,12 +3456,14 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         collect_eqmodP1_rec(a, eqmods_before);
     }
     collect_asserted_eqP(input_asserts, asserted_eqps_before);
-    out.generators_before = (int)(eqps_before.size() + eqmods_before.size());
+    out.rewrite_atoms_before = (int)(eqps_before.size() + eqmods_before.size());
     out.unique_vars_before = count_rewrite_vars(input_asserts);
+    pre_scan_time = std::chrono::steady_clock::now() - phase_t0;
 
     if (!option.enable_rewriting)
     {
-        out.generators_after = out.generators_before;
+        out.residual_assertions = input_asserts;
+        out.rewrite_atoms_after = out.rewrite_atoms_before;
         out.unique_vars_after = out.unique_vars_before;
         const auto rewrite_t1 = std::chrono::steady_clock::now();
         LOG_INFO(log, "rewrite", "[rewrite] mode: disabled"
@@ -3031,9 +3473,14 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     }
 
     std::vector<expr> roots = input_asserts;
+    phase_t0 = std::chrono::steady_clock::now();
     PolyDecls d = collect_decls(roots);
+    collect_decls_time = std::chrono::steady_clock::now() - phase_t0;
     if (!d.pconst)
     {
+        out.residual_assertions = input_asserts;
+        out.rewrite_atoms_after = out.rewrite_atoms_before;
+        out.unique_vars_after = out.unique_vars_before;
         const auto rewrite_t1 = std::chrono::steady_clock::now();
         LOG_WARN(log, "rewrite", "[rewrite] no PConst constructor found; skipping rewriting"
                                   " time=" +
@@ -3055,56 +3502,31 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     ScopedSimplifyMemo simplify_scope(options);
     expr poly_zero = mk_pconst_mpz(d, ctx, 0);
 
-    // Assertion-level rewriting extracts assignments only from eqP atoms that
-    // are unconditionally asserted: either the assertion itself, or below only
-    // top-level conjunctions. Other nested eqP atoms are not known true until
-    // the solver fixes them to true; the propagator handles those later.
-    // eqmodP1 is rewritten by the resulting environment but is not used as an
-    // equality assignment because that would be unsound as an SMT assertion.
-    std::vector<expr> ideal;
-    ideal.reserve(asserted_eqps_before.size());
-    for (const expr &eqp : asserted_eqps_before)
-        ideal.push_back(mk_psub(d, eqp.arg(0), eqp.arg(1)));
+    AssertionRewriteTiming assertion_timing;
+    phase_t0 = std::chrono::steady_clock::now();
+    AssertionRewriteResult unified = try_dag_rewrite_assertions(input_asserts, d, options, &assertion_timing);
+    assertion_rewrite_time = std::chrono::steady_clock::now() - phase_t0;
 
-    RewriteResult core(poly_zero);
-    try
-    {
-        core = try_dag_rewrite(ideal, poly_zero, {}, d, options);
-    }
-    catch (const CircularDependency &)
-    {
-        core = functional_worklist_rewrite(ideal, poly_zero, {}, d, options);
-    }
+    out.residual_assertions = unified.residual_assertions;
+    out.asserts = unified.residual_assertions;
+    out.rewritten_target = poly_zero;
+    out.rules_used = unified.rules_used;
+    out.used_worklist_fallback = unified.used_worklist_fallback;
+    out.dag_rounds = unified.dag_rounds;
+    out.stats = unified.stats;
+    out.diagnostics = unified.diagnostics;
+    if (unified.used_worklist_fallback)
+        out.diagnostics.push_back("worklist fallback used");
 
-    out.residual_generators = core.residual_generators;
-    out.rewritten_target = core.rewritten_target;
-    out.rules_used = core.rules_used;
-    out.used_worklist_fallback = core.used_worklist_fallback;
-    out.dag_rounds = core.dag_rounds;
-    out.stats = core.stats;
-    out.diagnostics = core.diagnostics;
-    out.rewrite_skipped_log = core.diagnostics;
-    if (core.used_worklist_fallback)
-        out.rewrite_dropped_cycles.push_back("worklist fallback used");
-
-    for (const RewriteRule &r : core.rules_used)
+    phase_t0 = std::chrono::steady_clock::now();
+    for (const RewriteRule &r : unified.rules_used)
     {
         const std::string key = variable_key(r.lhs);
         out.rewrite_rules[key] = to_legacy_rule(r, d);
     }
-    out.expr_rule_count = out.rewrite_rules.size();
+    legacy_rule_time = std::chrono::steady_clock::now() - phase_t0;
 
-    std::vector<expr> rewritten_asserts;
-    rewritten_asserts.reserve(input_asserts.size());
-    RewriteEnv assertion_env(core.rules_used, d, options);
-    for (const expr &a : input_asserts)
-    {
-        expr rw = rewrite_assertion(a, assertion_env, options, out.stats);
-        if (!is_true_expr(rw))
-            rewritten_asserts.push_back(rw);
-    }
-    out.asserts = std::move(rewritten_asserts);
-
+    phase_t0 = std::chrono::steady_clock::now();
     std::vector<expr> eqps_after;
     std::vector<expr> eqmods_after;
     for (const expr &a : out.asserts)
@@ -3112,15 +3534,16 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         collect_eqP_rec(a, eqps_after);
         collect_eqmodP1_rec(a, eqmods_after);
     }
-    out.generators_after = (int)(eqps_after.size() + eqmods_after.size());
+    out.rewrite_atoms_after = (int)(eqps_after.size() + eqmods_after.size());
     out.unique_vars_after = count_rewrite_vars(out.asserts);
+    post_scan_time = std::chrono::steady_clock::now() - phase_t0;
 
     const auto rewrite_t1 = std::chrono::steady_clock::now();
     std::ostringstream summary;
-    summary << "[rewrite] input_generators=" << out.generators_before
+    summary << "[rewrite] input_rewrite_atoms=" << out.rewrite_atoms_before
             << " asserted_eqP=" << asserted_eqps_before.size()
             << " assignments=" << out.rules_used.size()
-            << " residual_generators=" << out.residual_generators.size()
+            << " residual_assertions=" << out.residual_assertions.size()
             << " dag_rounds=" << out.dag_rounds
             << " worklist=" << (out.used_worklist_fallback ? "yes" : "no")
             << " singular_nf=" << out.stats.singular_nf_checks
@@ -3129,8 +3552,28 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
             << " time=" << util::fmt_duration(rewrite_t1 - rewrite_t0);
     LOG_INFO(log, "rewrite", summary.str());
 
+    std::ostringstream timing_summary;
+    timing_summary << "[rewrite timing] pre_scan=" << util::fmt_duration(pre_scan_time)
+                   << " collect_decls=" << util::fmt_duration(collect_decls_time)
+                   << " assertion_total=" << util::fmt_duration(assertion_rewrite_time)
+                   << " legacy_rules=" << util::fmt_duration(legacy_rule_time)
+                   << " post_scan=" << util::fmt_duration(post_scan_time)
+                   << " rounds=" << assertion_timing.rounds
+                   << " items_seen=" << assertion_timing.items_seen
+                   << " residual_rewrite_calls=" << assertion_timing.residual_rewrite_calls
+                   << "\n  assertion_detail:"
+                   << " make_items=" << util::fmt_duration(assertion_timing.make_items)
+                   << " extract=" << util::fmt_duration(assertion_timing.extract)
+                   << " topo=" << util::fmt_duration(assertion_timing.topo_sort)
+                   << " compose=" << util::fmt_duration(assertion_timing.compose)
+                   << " build_env=" << util::fmt_duration(assertion_timing.build_env)
+                   << " residual_rewrite=" << util::fmt_duration(assertion_timing.residual_rewrite)
+                   << " final_collect=" << util::fmt_duration(assertion_timing.final_collect);
+    LOG_INFO(log, "rewrite", timing_summary.str());
+
     if (!out.rewrite_rules.empty())
     {
+        phase_t0 = std::chrono::steady_clock::now();
         std::vector<std::string> lines;
         for (const auto &kv : out.rewrite_rules)
             lines.push_back("    " + pretty_rewrite_atom_name(kv.first) + " -> " + rule_rhs_pretty(kv.second) +
@@ -3140,13 +3583,16 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         oss << "[rewrite] substitutions (" << lines.size() << "):\n";
         for (const auto &line : lines)
             oss << line << "\n";
-        if (!out.rewrite_skipped_log.empty())
+        if (!out.diagnostics.empty())
         {
-            oss << "  skipped (" << out.rewrite_skipped_log.size() << "):\n";
-            for (const std::string &sk : out.rewrite_skipped_log)
+            oss << "  diagnostics (" << out.diagnostics.size() << "):\n";
+            for (const std::string &sk : out.diagnostics)
                 oss << "    " << sk << "\n";
         }
+        substitution_log_time = std::chrono::steady_clock::now() - phase_t0;
         LOG_INFO(log, "rewrite", oss.str());
+        LOG_INFO(log, "rewrite", "[rewrite timing] substitution_log_build=" +
+                                      util::fmt_duration(substitution_log_time));
     }
 
     return out;
@@ -3482,6 +3928,58 @@ int run_rewrite_selftests()
         RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
         bool ok = check(rr.rules_used.size() == 2, "top-level conjunct eqP was not used for rewriting");
         ok &= check(rr.asserts.empty(), "top-level conjunct eqP assertion was not rewritten away");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] nested eqP residual rewrites without extracting a rule\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)"
+                                        "(assert (eqP (PConst x) (PConst 1)))"
+                                        "(assert (not (eqP (PConst x) (PConst 2))))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        PolyDecls d = collect_decls(asserts);
+        std::vector<expr> eqps;
+        for (const expr &a : rr.asserts)
+            collect_eqP_rec(a, eqps);
+        bool ok = check(rr.rules_used.size() == 1, "nested eqP was used as a rule source");
+        ok &= check(rr.asserts.size() == 1, "nested eqP residual was dropped unexpectedly");
+        ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
+                    "residual_assertions no longer mirrors final assertions");
+        if (ok)
+            ok &= check(eqps.size() == 1 && equivalent_for_test(eqps[0].arg(0), mk_pconst_mpz(d, ctx, 1), d),
+                        "nested eqP residual was not rewritten by top-level rule");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] non-poly assertion remains in residual assertions\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const a Int)(declare-const b Int)"
+                                        "(assert (and (eqP (PConst x) (PConst 1)) (= a b)))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool has_int_equality = false;
+        for (const expr &a : rr.residual_assertions)
+            has_int_equality = has_int_equality || (a.is_app() && a.decl().name().str() == "=");
+        bool ok = check(rr.rules_used.size() == 1, "top-level eqP did not produce a rule");
+        ok &= check(rr.asserts.size() == 1, "non-poly assertion was not the only residual assertion");
+        ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
+                    "residual_assertions no longer carries final SMT assertions");
+        ok &= check(has_int_equality, "non-poly equality was not preserved in residual_assertions");
         if (ok)
             std::cout << "  OK\n";
         run(ok);

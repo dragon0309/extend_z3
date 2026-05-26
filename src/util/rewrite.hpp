@@ -68,7 +68,6 @@ struct PolyRewriteRule
 {
     enum class Kind
     {
-        Alias,
         ToZero,
         ToConst,
         ExprRhs
@@ -77,8 +76,7 @@ struct PolyRewriteRule
     bool to_zero = false;
     bool to_const = false;
     mpz_class const_value = 0;
-    std::string target;
-    Kind kind = Kind::Alias;
+    Kind kind = Kind::ExprRhs;
 
     std::optional<z3::expr> rhs_int;
     std::unordered_set<std::string> rhs_atoms;
@@ -115,15 +113,12 @@ struct RewriteResult
 
     // Assertion-level wrapper output used by main.cpp.
     std::vector<z3::expr> asserts;
-    int generators_before = 0;
+    std::vector<z3::expr> residual_assertions;
+    int rewrite_atoms_before = 0;
     int unique_vars_before = 0;
-    int generators_after = 0;
+    int rewrite_atoms_after = 0;
     int unique_vars_after = 0;
     std::unordered_map<std::string, PolyRewriteRule> rewrite_rules;
-    std::size_t legacy_rule_count = 0;
-    std::size_t expr_rule_count = 0;
-    std::vector<std::string> rewrite_skipped_log;
-    std::vector<std::string> rewrite_dropped_cycles;
 
     explicit RewriteResult(const z3::expr &target);
 };
