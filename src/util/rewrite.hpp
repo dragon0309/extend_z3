@@ -106,7 +106,7 @@ struct RewriteResult
     std::vector<z3::expr> residual_generators;
     z3::expr rewritten_target;
     std::vector<RewriteRule> rules_used;
-    bool used_worklist_fallback = false;
+    bool used_worklist_rewrite = false;
     std::size_t dag_rounds = 0;
     RewriteStats stats;
     std::vector<std::string> diagnostics;

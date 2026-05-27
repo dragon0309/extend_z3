@@ -1814,10 +1814,18 @@ namespace
     {
         std::vector<expr> residual_assertions;
         std::vector<RewriteRule> rules_used;
-        bool used_worklist_fallback = false;
+        bool used_worklist_rewrite = false;
         std::size_t dag_rounds = 0;
         RewriteStats stats;
         std::vector<std::string> diagnostics;
+    };
+
+    struct AssertionWorkItem
+    {
+        expr formula;
+        std::unordered_set<std::string> vars;
+        std::optional<expr> poly_view;
+        bool rule_candidate = false;
     };
 
     struct AssertionRewriteTiming
@@ -2848,6 +2856,48 @@ namespace
         return res;
     }
 
+    AssertionWorkItem rewrite_item_to_work_item(const RewriteItem &item)
+    {
+        return AssertionWorkItem{item.formula, collect_vars(item.formula), item.poly_view, item.rule_candidate};
+    }
+
+    void update_env_dependents_on_new_rule(std::vector<RewriteRule> &env,
+                                           const RewriteRule &new_rule,
+                                           const PolyDecls &d)
+    {
+        if (!is_poly_variable(new_rule.lhs))
+            return;
+        const std::string new_lhs = variable_key(new_rule.lhs);
+        for (RewriteRule &old : env)
+        {
+            if (!std::binary_search(old.rhs_dependencies.begin(), old.rhs_dependencies.end(), new_lhs))
+                continue;
+            bool changed = false;
+            old.rhs = simplify_poly(substitute_one_rec(old.rhs, new_rule, d, changed), d);
+            if (changed)
+                old.rhs_dependencies = collect_sorted_vars(old.rhs);
+        }
+    }
+
+    std::vector<expr> residual_polys_from_work_items(const std::vector<AssertionWorkItem> &residuals,
+                                                     const std::vector<expr> &moduli,
+                                                     const PolyDecls &d,
+                                                     const RewriteOptions &options,
+                                                     RewriteStats &stats)
+    {
+        std::vector<expr> others;
+        others.reserve(residuals.size());
+        for (const AssertionWorkItem &r : residuals)
+        {
+            if (!r.poly_view)
+                continue;
+            expr p = moduli.empty() ? *r.poly_view
+                                    : normalize_poly_under_moduli(*r.poly_view, moduli, d, options, stats);
+            others.push_back(p);
+        }
+        return others;
+    }
+
     RewriteResult functional_worklist_rewrite(const std::vector<expr> &ideal,
                                               const expr &target,
                                               const std::vector<expr> &moduli,
@@ -2855,7 +2905,7 @@ namespace
                                               const RewriteOptions &options)
     {
         RewriteResult res(target);
-        res.used_worklist_fallback = true;
+        res.used_worklist_rewrite = true;
 
         std::deque<expr> stack;
         for (const expr &g : ideal)
@@ -2916,11 +2966,7 @@ namespace
             }
 
             RewriteRule new_rule = pat->rule;
-            for (RewriteRule &old : env)
-            {
-                bool changed = false;
-                old.rhs = simplify_poly(substitute_one_rec(old.rhs, new_rule, d, changed), d);
-            }
+            update_env_dependents_on_new_rule(env, new_rule, d);
             env_index[pat->lhs_key] = env.size();
             env.push_back(new_rule);
             res.rules_used.push_back(new_rule);
@@ -3064,19 +3110,140 @@ namespace
         return simplify_assertion_rec(r, env.d, options, stats).simplify();
     }
 
-    void add_stats(RewriteStats &dst, const RewriteStats &src)
+    std::vector<RewriteItem> assertion_worklist_rewrite(std::vector<RewriteItem> current,
+                                                        const std::vector<expr> &moduli,
+                                                        const PolyDecls &d,
+                                                        const RewriteOptions &options,
+                                                        AssertionRewriteResult &res,
+                                                        AssertionRewriteTiming *timing = nullptr)
     {
-        dst.rules_extracted += src.rules_extracted;
-        dst.duplicate_lhs += src.duplicate_lhs;
-        dst.conflicting_lhs += src.conflicting_lhs;
-        dst.skipped_nonlinear += src.skipped_nonlinear;
-        dst.skipped_unsafe_coefficient += src.skipped_unsafe_coefficient;
-        dst.skipped_lhs_occurs_in_rhs += src.skipped_lhs_occurs_in_rhs;
-        dst.skipped_modulus_not_subsumed += src.skipped_modulus_not_subsumed;
-        dst.skipped_expression_growth += src.skipped_expression_growth;
-        dst.singular_nf_checks += src.singular_nf_checks;
-        dst.singular_zero_reductions += src.singular_zero_reductions;
-        dst.singular_failures += src.singular_failures;
+        std::deque<AssertionWorkItem> stack;
+        for (const RewriteItem &item : current)
+            stack.push_back(rewrite_item_to_work_item(item));
+
+        std::vector<AssertionWorkItem> residuals;
+        std::vector<RewriteRule> env;
+        std::unordered_map<std::string, std::size_t> env_index;
+
+        const std::size_t iteration_limit =
+            options.max_rounds * std::max<std::size_t>(1, current.size() + 1);
+        std::size_t iterations = 0;
+
+        while (!stack.empty() && iterations++ < iteration_limit)
+        {
+            AssertionWorkItem item = std::move(stack.front());
+            stack.pop_front();
+
+            RewriteEnv rewrite_env(env, d, options);
+            auto rewrite_t0 = std::chrono::steady_clock::now();
+            expr rw = rewrite_assertion(item.formula, rewrite_env, options, res.stats);
+            if (timing)
+            {
+                timing->residual_rewrite += std::chrono::steady_clock::now() - rewrite_t0;
+                ++timing->residual_rewrite_calls;
+            }
+            if (is_true_expr(rw))
+                continue;
+
+            item.formula = rw;
+            item.vars = collect_vars(rw);
+            if (item.rule_candidate && is_eqP_atom(rw))
+            {
+                expr p = simplify_poly(mk_psub(d, rw.arg(0), rw.arg(1)), d);
+                if (!moduli.empty())
+                    p = normalize_poly_under_moduli(p, moduli, d, options, res.stats);
+                item.poly_view = p;
+            }
+            else
+                item.poly_view = std::nullopt;
+
+            if (item.rule_candidate && item.poly_view)
+            {
+                const std::vector<expr> others =
+                    residual_polys_from_work_items(residuals, moduli, d, options, res.stats);
+                GeneratorInfo info(item.formula, *item.poly_view, false, true,
+                                   "assert-wl-" + std::to_string(iterations), 0);
+                auto pat = extract_one_assignment(info, others, moduli, d, options, res.stats,
+                                                res.diagnostics);
+                if (pat && !contains_expr(pat->rule.rhs, pat->rule.lhs))
+                {
+                    auto existing = env_index.find(pat->lhs_key);
+                    if (existing != env_index.end())
+                    {
+                        bool conflict = false;
+                        if (options.reject_conflicting_lhs)
+                        {
+                            conflict = !equivalent_poly(env[existing->second].rhs, pat->rule.rhs,
+                                                        moduli, d, options, res.stats);
+                        }
+                        if (conflict)
+                        {
+                            ++res.stats.conflicting_lhs;
+                            res.diagnostics.push_back("duplicate lhs conflict: " +
+                                                      pretty_rewrite_atom_name(pat->lhs_key));
+                        }
+                        else if (options.reject_duplicate_lhs)
+                        {
+                            ++res.stats.duplicate_lhs;
+                            res.diagnostics.push_back("duplicate lhs: " +
+                                                      pretty_rewrite_atom_name(pat->lhs_key));
+                        }
+                        else
+                        {
+                            residuals.push_back(std::move(item));
+                        }
+                    }
+                    else
+                    {
+                        RewriteRule new_rule = pat->rule;
+                        update_env_dependents_on_new_rule(env, new_rule, d);
+                        env_index[pat->lhs_key] = env.size();
+                        env.push_back(new_rule);
+                        ++res.stats.rules_extracted;
+
+                        const std::string new_lhs_key = variable_key(new_rule.lhs);
+                        std::vector<AssertionWorkItem> keep;
+                        keep.reserve(residuals.size());
+                        for (AssertionWorkItem &r : residuals)
+                        {
+                            if (r.vars.count(new_lhs_key))
+                                stack.push_back(std::move(r));
+                            else
+                                keep.push_back(std::move(r));
+                        }
+                        residuals.swap(keep);
+                    }
+                }
+                else
+                    residuals.push_back(std::move(item));
+            }
+            else
+                residuals.push_back(std::move(item));
+        }
+
+        while (!stack.empty())
+        {
+            AssertionWorkItem item = std::move(stack.front());
+            stack.pop_front();
+            RewriteEnv rewrite_env(env, d, options);
+            expr rw = rewrite_assertion(item.formula, rewrite_env, options, res.stats);
+            if (!is_true_expr(rw))
+                residuals.push_back(AssertionWorkItem{rw, collect_vars(rw), std::nullopt, false});
+        }
+
+        std::vector<expr> formulas;
+        formulas.reserve(residuals.size());
+        for (const AssertionWorkItem &r : residuals)
+            formulas.push_back(r.formula);
+
+        res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
+        res.used_worklist_rewrite = true;
+
+        auto make_t0 = std::chrono::steady_clock::now();
+        std::vector<RewriteItem> out = make_rewrite_items(formulas, d);
+        if (timing)
+            timing->make_items += std::chrono::steady_clock::now() - make_t0;
+        return out;
     }
 
     AssertionRewriteResult try_dag_rewrite_assertions(const std::vector<expr> &input_asserts,
@@ -3152,29 +3319,7 @@ namespace
             }
             catch (const CircularDependency &)
             {
-                std::vector<expr> candidate_formulas;
-                candidate_formulas.reserve(current.size());
-                for (const RewriteItem &item : current)
-                    if (item.rule_candidate)
-                        candidate_formulas.push_back(item.formula);
-
-                expr zero = mk_pconst_mpz(d, current[0].formula.ctx(), 0);
-                RewriteResult fallback = functional_worklist_rewrite(candidate_formulas, zero, moduli, d, options);
-                res.used_worklist_fallback = true;
-                res.rules_used.insert(res.rules_used.end(), fallback.rules_used.begin(), fallback.rules_used.end());
-                add_stats(res.stats, fallback.stats);
-                res.diagnostics.insert(res.diagnostics.end(), fallback.diagnostics.begin(), fallback.diagnostics.end());
-
-                RewriteEnv fallback_env(fallback.rules_used, d, options);
-                std::vector<expr> rewritten;
-                rewritten.reserve(current.size());
-                for (const RewriteItem &item : current)
-                {
-                    expr rw = rewrite_assertion(item.formula, fallback_env, options, res.stats);
-                    if (!is_true_expr(rw))
-                        rewritten.push_back(rw);
-                }
-                current = make_rewrite_items(rewritten, d);
+                current = assertion_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
                 break;
             }
 
@@ -3188,29 +3333,7 @@ namespace
             }
             catch (const CircularDependency &)
             {
-                std::vector<expr> candidate_formulas;
-                candidate_formulas.reserve(current.size());
-                for (const RewriteItem &item : current)
-                    if (item.rule_candidate)
-                        candidate_formulas.push_back(item.formula);
-
-                expr zero = mk_pconst_mpz(d, current[0].formula.ctx(), 0);
-                RewriteResult fallback = functional_worklist_rewrite(candidate_formulas, zero, moduli, d, options);
-                res.used_worklist_fallback = true;
-                res.rules_used.insert(res.rules_used.end(), fallback.rules_used.begin(), fallback.rules_used.end());
-                add_stats(res.stats, fallback.stats);
-                res.diagnostics.insert(res.diagnostics.end(), fallback.diagnostics.begin(), fallback.diagnostics.end());
-
-                RewriteEnv fallback_env(fallback.rules_used, d, options);
-                std::vector<expr> rewritten;
-                rewritten.reserve(current.size());
-                for (const RewriteItem &item : current)
-                {
-                    expr rw = rewrite_assertion(item.formula, fallback_env, options, res.stats);
-                    if (!is_true_expr(rw))
-                        rewritten.push_back(rw);
-                }
-                current = make_rewrite_items(rewritten, d);
+                current = assertion_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
                 break;
             }
 
@@ -3511,12 +3634,12 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     out.asserts = unified.residual_assertions;
     out.rewritten_target = poly_zero;
     out.rules_used = unified.rules_used;
-    out.used_worklist_fallback = unified.used_worklist_fallback;
+    out.used_worklist_rewrite = unified.used_worklist_rewrite;
     out.dag_rounds = unified.dag_rounds;
     out.stats = unified.stats;
     out.diagnostics = unified.diagnostics;
-    if (unified.used_worklist_fallback)
-        out.diagnostics.push_back("worklist fallback used");
+    if (unified.used_worklist_rewrite)
+        out.diagnostics.push_back("assertion worklist rewrite used");
 
     phase_t0 = std::chrono::steady_clock::now();
     for (const RewriteRule &r : unified.rules_used)
@@ -3545,7 +3668,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
             << " assignments=" << out.rules_used.size()
             << " residual_assertions=" << out.residual_assertions.size()
             << " dag_rounds=" << out.dag_rounds
-            << " worklist=" << (out.used_worklist_fallback ? "yes" : "no")
+            << " worklist=" << (out.used_worklist_rewrite ? "yes" : "no")
             << " singular_nf=" << out.stats.singular_nf_checks
             << " singular_zero=" << out.stats.singular_zero_reductions
             << " singular_failures=" << out.stats.singular_failures
@@ -3834,7 +3957,7 @@ int run_rewrite_selftests()
     }
 
     {
-        std::cout << "[selftest] cycle triggers worklist fallback and keeps residual\n";
+        std::cout << "[selftest] cycle triggers worklist rewrite and keeps residual\n";
         context ctx;
         auto asserts = parse_assertions(ctx,
                                         "(declare-const x Int)(declare-const y Int)"
@@ -3848,8 +3971,56 @@ int run_rewrite_selftests()
         RewriteOptions opts;
         opts.use_singular_normalization = false;
         RewriteResult rr = rewrite_assignments(ideal, eqps[0].arg(0), {}, opts);
-        bool ok = check(rr.used_worklist_fallback, "worklist fallback not used");
+        bool ok = check(rr.used_worklist_rewrite, "worklist rewrite not used");
         ok &= check(!rr.residual_generators.empty(), "cycle residual was dropped");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] cyclic assertions use assertion worklist rewrite\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const y Int)"
+                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
+                                        "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool ok = check(rr.used_worklist_rewrite, "assertion worklist rewrite not used");
+        ok &= check(!rr.rules_used.empty(), "cyclic assertion rewrite produced no rules");
+        ok &= check(rr.rules_used.size() < asserts.size(),
+                    "cyclic assertion rewrite did not consume any eqP as rules");
+        if (ok)
+            std::cout << "  OK\n";
+        run(ok);
+    }
+
+    {
+        std::cout << "[selftest] cyclic assertion worklist keeps non-poly residual\n";
+        context ctx;
+        auto asserts = parse_assertions(ctx,
+                                        "(declare-const x Int)(declare-const y Int)"
+                                        "(declare-const a Int)(declare-const b Int)"
+                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
+                                        "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))"
+                                        "(assert (= a b))");
+        RewriteOptions opts;
+        opts.use_singular_normalization = false;
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool has_int_equality = false;
+        for (const expr &a : rr.residual_assertions)
+            has_int_equality = has_int_equality || (a.is_app() && a.decl().name().str() == "=");
+        bool ok = check(rr.used_worklist_rewrite, "assertion worklist rewrite not used");
+        ok &= check(!rr.asserts.empty(), "all assertions were dropped after cyclic worklist");
+        ok &= check(has_int_equality, "non-poly equality missing after cyclic worklist");
+        ok &= check(rr.asserts.size() < asserts.size(),
+                    "cyclic worklist did not eliminate any assertions");
         if (ok)
             std::cout << "  OK\n";
         run(ok);
