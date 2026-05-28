@@ -2685,8 +2685,20 @@ namespace
             stack.pop_front();
 
             RewriteEnv rewrite_env(env, d, options);
+            std::unordered_set<std::string> rule_lhs_keys;
+            if (rewrite_env.all_variable_rules)
+            {
+                rule_lhs_keys.reserve(rewrite_env.by_lhs.size());
+                for (const auto &kv : rewrite_env.by_lhs)
+                    rule_lhs_keys.insert(kv.first);
+            }
+            const bool skip_rewrite =
+                rewrite_env.all_variable_rules &&
+                !intersects_lhs_keys(item.vars, rule_lhs_keys);
             auto rewrite_t0 = std::chrono::steady_clock::now();
-            expr rw = rewrite_assertion(item.formula, rewrite_env, options, res.stats);
+            expr rw = skip_rewrite
+                          ? simplify_assertion_rec(item.formula, d, options, res.stats).simplify()
+                          : rewrite_assertion(item.formula, rewrite_env, options, res.stats);
             if (timing)
             {
                 timing->residual_rewrite += std::chrono::steady_clock::now() - rewrite_t0;
@@ -2755,7 +2767,19 @@ namespace
             AssertionWorkItem item = std::move(stack.front());
             stack.pop_front();
             RewriteEnv rewrite_env(env, d, options);
-            expr rw = rewrite_assertion(item.formula, rewrite_env, options, res.stats);
+            std::unordered_set<std::string> rule_lhs_keys;
+            if (rewrite_env.all_variable_rules)
+            {
+                rule_lhs_keys.reserve(rewrite_env.by_lhs.size());
+                for (const auto &kv : rewrite_env.by_lhs)
+                    rule_lhs_keys.insert(kv.first);
+            }
+            const bool skip_rewrite =
+                rewrite_env.all_variable_rules &&
+                !intersects_lhs_keys(item.vars, rule_lhs_keys);
+            expr rw = skip_rewrite
+                          ? simplify_assertion_rec(item.formula, d, options, res.stats).simplify()
+                          : rewrite_assertion(item.formula, rewrite_env, options, res.stats);
             if (!is_true_expr(rw))
                 residuals.push_back(AssertionWorkItem{rw, collect_vars(rw), std::nullopt, false});
         }
