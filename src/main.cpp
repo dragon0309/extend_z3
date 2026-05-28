@@ -112,6 +112,8 @@ static bool DISABLE_REWRITE_CACHE = false;
 static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
+static bool LOG_CONFLICT_ANTS = false;
+static bool USE_GROEBNER_RING_VAR_ORDER = true;
 
 struct AccumulatedTiming
 {
@@ -257,7 +259,7 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--show-model]"
-          " [--rewrite-log]\n";
+          " [--rewrite-log] [--groebner-ring-order]\n";
 }
 
 static void init_singular()
@@ -533,6 +535,61 @@ static std::string make_unique_name(const std::string &base, std::unordered_set<
     }
 }
 
+static bool starts_with(const std::string &s, const char *prefix)
+{
+    const std::size_t n = std::strlen(prefix);
+    return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+static bool is_groebner_aux_var(const std::string &name)
+{
+    return starts_with(name, "tmp") || starts_with(name, "mulH");
+}
+
+static std::vector<std::string> build_groebner_ring_var_order(
+    const std::vector<std::string> &coeff_ring_names,
+    const std::vector<std::string> &indet_ring_names,
+    const std::vector<std::string> &qvar_names,
+    const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names)
+{
+    std::vector<std::string> aux;
+    std::vector<std::string> coeffs;
+    aux.reserve(coeff_ring_names.size());
+    coeffs.reserve(coeff_ring_names.size());
+
+    for (const auto &name : coeff_ring_names)
+    {
+        if (is_groebner_aux_var(name))
+            aux.push_back(name);
+        else
+            coeffs.push_back(name);
+    }
+
+    auto descending = [](std::vector<std::string> &xs)
+    {
+        std::sort(xs.begin(), xs.end(), std::greater<std::string>());
+    };
+    descending(aux);
+    descending(coeffs);
+
+    std::vector<std::string> ring_vars;
+    ring_vars.reserve(coeff_ring_names.size() + indet_ring_names.size() +
+                      qvar_names.size() + 2 * eqmodp2_qvar_names.size());
+
+    for (auto it = eqmodp2_qvar_names.rbegin(); it != eqmodp2_qvar_names.rend(); ++it)
+    {
+        ring_vars.push_back(it->first);
+        ring_vars.push_back(it->second);
+    }
+    for (auto it = qvar_names.rbegin(); it != qvar_names.rend(); ++it)
+        ring_vars.push_back(*it);
+
+    ring_vars.insert(ring_vars.end(), aux.begin(), aux.end());
+    ring_vars.insert(ring_vars.end(), coeffs.begin(), coeffs.end());
+    ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
+    return ring_vars;
+}
+
 static std::vector<expr> dedup_and_drop_trivial_eqp(const std::vector<expr> &eqps)
 {
     std::vector<expr> out;
@@ -681,6 +738,10 @@ struct CoeffVarMap
     std::vector<z3::expr> z3_bases;
     std::vector<std::string> ring_names;
     std::unordered_map<Z3_ast, unsigned> base_to_index;
+
+    // Singular variable indices (1..N); filled after RingEnv::build.
+    std::vector<int> coeff_ring_index;
+    std::vector<int> indet_ring_index;
 };
 
 // ---------------- Singular: number helpers ----------------
@@ -897,6 +958,19 @@ struct RingEnv
         throw std::runtime_error("RingEnv: unknown ring variable: " + ring_name);
     }
 };
+
+static void cmap_bind_ring_indices(CoeffVarMap &cmap,
+                                   RingEnv &RE,
+                                   const std::vector<std::string> &indet_ring_names)
+{
+    cmap.coeff_ring_index.resize(cmap.ring_names.size());
+    for (size_t i = 0; i < cmap.ring_names.size(); ++i)
+        cmap.coeff_ring_index[i] = RE.ensure_var_idx(cmap.ring_names[i]);
+
+    cmap.indet_ring_index.resize(indet_ring_names.size());
+    for (size_t j = 0; j < indet_ring_names.size(); ++j)
+        cmap.indet_ring_index[j] = RE.ensure_var_idx(indet_ring_names[j]);
+}
 
 // ---------------- Z3 Int expr -> Singular poly ----------------
 static poly expr_to_poly_anyring(const expr &e, RingEnv &RE, const CoeffVarMap &cmap)
@@ -1276,10 +1350,16 @@ struct IndetKeyHash
 };
 
 static std::unordered_map<IndetKey, poly, IndetKeyHash>
-split_by_indets(poly D, int Nc, int Mi, RingEnv &RE)
+split_by_indets(poly D, const CoeffVarMap &cmap, int Mi, RingEnv &RE)
 {
     ring R = RE.R;
     rChangeCurrRing(R);
+
+    const int Nc = (int)cmap.coeff_ring_index.size();
+    if (Nc != (int)cmap.ring_names.size())
+        throw std::runtime_error("split_by_indets: coeff_ring_index not bound");
+    if (Mi != (int)cmap.indet_ring_index.size())
+        throw std::runtime_error("split_by_indets: indet_ring_index size mismatch");
 
     std::unordered_map<IndetKey, poly, IndetKeyHash> out;
 
@@ -1289,7 +1369,7 @@ split_by_indets(poly D, int Nc, int Mi, RingEnv &RE)
         key.e.assign((size_t)Mi, 0);
         for (int j = 0; j < Mi; ++j)
         {
-            int idx = Nc + 1 + j;
+            int idx = cmap.indet_ring_index[(size_t)j];
             key.e[(size_t)j] = p_GetExp(t, idx, R);
         }
 
@@ -1299,7 +1379,7 @@ split_by_indets(poly D, int Nc, int Mi, RingEnv &RE)
         poly ct = p_NSet(ac, R);
         for (int i = 0; i < Nc; ++i)
         {
-            int idx = 1 + i;
+            int idx = cmap.coeff_ring_index[(size_t)i];
             int e = p_GetExp(t, idx, R);
             if (e != 0)
                 p_SetExp(ct, idx, e, R);
@@ -1335,11 +1415,12 @@ static z3::expr z3_pow(z3::expr base, int exp)
     return res;
 }
 
-static z3::expr coeff_poly_to_z3_expr(z3::context &c, poly P, const ring R, const CoeffVarMap &cmap, int Nc)
+static z3::expr coeff_poly_to_z3_expr(z3::context &c, poly P, const ring R, const CoeffVarMap &cmap)
 {
     if (P == nullptr)
         return c.int_val(0);
 
+    const int Nc = (int)cmap.coeff_ring_index.size();
     z3::expr acc = c.int_val(0);
 
     for (poly t = P; t != nullptr; t = pNext(t))
@@ -1350,7 +1431,7 @@ static z3::expr coeff_poly_to_z3_expr(z3::context &c, poly P, const ring R, cons
 
         for (int i = 0; i < Nc; ++i)
         {
-            int idx = 1 + i;
+            int idx = cmap.coeff_ring_index[(size_t)i];
             int e = p_GetExp(t, idx, R);
             if (e == 0)
                 continue;
@@ -1412,7 +1493,7 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
 
     out.D_full = p_Copy(D, R);
 
-    auto groups = split_by_indets(D, Nc, Mi, RE);
+    auto groups = split_by_indets(D, cmap, Mi, RE);
     if (D)
         p_Delete(&D, R);
 
@@ -1422,7 +1503,7 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
     {
         poly coeffP = kv.second;
 
-        expr coeffE = coeff_poly_to_z3_expr(zctx, coeffP, R, cmap, Nc);
+        expr coeffE = coeff_poly_to_z3_expr(zctx, coeffP, R, cmap);
         out.coeff_ints.push_back(coeffE);
 
         expr eq0 = (coeffE == zctx.int_val(0)).simplify();
@@ -1662,6 +1743,30 @@ class PolyPropagator : public user_propagator_base
 
     std::unordered_map<Z3_ast, std::string> m_label;
 
+    struct BoolTrailEntry
+    {
+        Z3_ast key = nullptr;
+        bool had_old = false;
+        Z3_lbool old_value = Z3_L_UNDEF;
+    };
+
+    struct FixedAstTrailEntry
+    {
+        Z3_ast key = nullptr;
+        bool had_old = false;
+        Z3_ast old_value = nullptr;
+    };
+
+    struct TrailMark
+    {
+        size_t bool_size = 0;
+        size_t fixed_ast_size = 0;
+    };
+
+    std::vector<BoolTrailEntry> m_bool_trail;
+    std::vector<FixedAstTrailEntry> m_fixed_ast_trail;
+    std::vector<TrailMark> m_trail_marks;
+
     std::string label_of(const expr &e) const
     {
         auto it = m_label.find((Z3_ast)e);
@@ -1672,13 +1777,20 @@ class PolyPropagator : public user_propagator_base
 
     void log_fixed(const expr &t, const expr &v)
     {
-        if (!PRINT_FIXED_ALL)
-            return;
         if (t.is_numeral())
             return;
         if (t.is_bool() && (t.is_true() || t.is_false()))
             return;
-
+        if (is_bv_to_int_app(t))
+            return;
+        if (!PRINT_FIXED_ALL)
+        {
+            if (!t.is_app())
+                return;
+            const std::string decl_name = t.decl().name().str();
+            if (decl_name.size() < 6 || decl_name.compare(0, 6, "eqmodP") != 0)
+                return;
+        }
         LOG_TRACE(g_log, "fixed", label_of(t) + " = " + v.to_string());
     }
 
@@ -1688,6 +1800,36 @@ class PolyPropagator : public user_propagator_base
             return;
 
         LOG_TRACE(g_log, "propagate", label_of(from) + " ==> " + infer.to_string());
+    }
+
+    static std::string lbool_to_string(Z3_lbool v)
+    {
+        switch (v)
+        {
+        case Z3_L_FALSE:
+            return "false";
+        case Z3_L_TRUE:
+            return "true";
+        default:
+            return "undef";
+        }
+    }
+
+    void log_conflict_ants(const std::vector<expr> &ants_vec) const
+    {
+        std::ostringstream oss;
+        oss << "antecedents(" << ants_vec.size() << ")";
+        for (size_t i = 0; i < ants_vec.size(); ++i)
+        {
+            const expr &a = ants_vec[i];
+            oss << "\n  [" << i << "] " << label_of(a);
+            auto bit = m_bool_cache.find((Z3_ast)a);
+            if (bit != m_bool_cache.end())
+                oss << " = " << lbool_to_string(bit->second);
+            else
+                oss << " = <not-fixed-bool>";
+        }
+        LOG_INFO(g_log, "conflict", oss.str());
     }
 
     Z3_lbool lbool_of(const expr &a) const
@@ -1722,14 +1864,55 @@ class PolyPropagator : public user_propagator_base
         {
             if (it->second == val)
                 return;
+            m_fixed_ast_trail.push_back({key, true, it->second});
+            Z3_inc_ref((Z3_context)ctx(), it->second);
             Z3_dec_ref((Z3_context)ctx(), it->second);
             it->second = val;
             Z3_inc_ref((Z3_context)ctx(), val);
             return;
         }
 
+        m_fixed_ast_trail.push_back({key, false, nullptr});
         m_fixed_ast_cache.emplace(key, val);
         Z3_inc_ref((Z3_context)ctx(), val);
+    }
+
+    void cache_bool_value(const expr &t, Z3_lbool bv)
+    {
+        Z3_ast key = (Z3_ast)t;
+        auto it = m_bool_cache.find(key);
+        if (it != m_bool_cache.end())
+        {
+            if (it->second == bv)
+                return;
+            m_bool_trail.push_back({key, true, it->second});
+            it->second = bv;
+            return;
+        }
+
+        m_bool_trail.push_back({key, false, Z3_L_UNDEF});
+        m_bool_cache.emplace(key, bv);
+    }
+
+    void restore_fixed_ast_entry(const FixedAstTrailEntry &entry)
+    {
+        auto it = m_fixed_ast_cache.find(entry.key);
+        if (it != m_fixed_ast_cache.end() && it->second != nullptr)
+            Z3_dec_ref((Z3_context)ctx(), it->second);
+
+        if (entry.had_old)
+        {
+            m_fixed_ast_cache[entry.key] = entry.old_value;
+            if (entry.old_value != nullptr)
+            {
+                Z3_inc_ref((Z3_context)ctx(), entry.old_value);
+                Z3_dec_ref((Z3_context)ctx(), entry.old_value);
+            }
+        }
+        else if (it != m_fixed_ast_cache.end())
+        {
+            m_fixed_ast_cache.erase(it);
+        }
     }
 
     static bool parse_z3_numeral_to_mpz(const expr &e, mpz_class &out)
@@ -2164,6 +2347,8 @@ class PolyPropagator : public user_propagator_base
 
     void conflict_with(const std::vector<expr> &ants_vec)
     {
+        if (LOG_CONFLICT_ANTS)
+            log_conflict_ants(ants_vec);
         expr_vector ants(ctx());
         for (auto &a : ants_vec)
             ants.push_back(a);
@@ -3266,9 +3451,9 @@ class PolyPropagator : public user_propagator_base
 
         std::vector<expr> true_ants;
         std::vector<poly> base_gens;
-        collect_true_eqp_generators(base_gens, true_ants);
         collect_true_eqmod_true_generators(base_gens, true_ants);
         collect_true_eqmodp2_true_generators(base_gens, true_ants);
+        collect_true_eqp_generators(base_gens, true_ants);
 
         bool hit = false;
         expr hit_atom = ctx().bool_val(false);
@@ -3280,12 +3465,12 @@ class PolyPropagator : public user_propagator_base
 
             std::vector<poly> gens;
             gens.reserve(base_gens.size() + 2);
-            for (auto p : base_gens)
-                gens.push_back(p_Copy(p, R));
             if (cp.M1_poly)
                 gens.push_back(p_Copy(cp.M1_poly, R));
             if (cp.M2_poly)
                 gens.push_back(p_Copy(cp.M2_poly, R));
+            for (auto p : base_gens)
+                gens.push_back(p_Copy(p, R));
 
             bool in = false;
             std::string nf_s;
@@ -3398,6 +3583,7 @@ public:
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
         m_RE.build(cfZ, m_ring_vars, ringorder_lp);
+        cmap_bind_ring_indices(m_cmap, m_RE, m_indet_ring_names);
 
         for (size_t i = 0; i < eqps.size(); ++i)
         {
@@ -3492,10 +3678,18 @@ public:
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
         m_RE.build(cfZ, m_ring_vars, ringorder_lp);
+        cmap_bind_ring_indices(m_cmap, m_RE, m_indet_ring_names);
     }
 
     ~PolyPropagator() override
     {
+        for (auto &entry : m_fixed_ast_trail)
+            if (entry.had_old && entry.old_value != nullptr)
+                Z3_dec_ref((Z3_context)ctx(), entry.old_value);
+        m_fixed_ast_trail.clear();
+        m_bool_trail.clear();
+        m_trail_marks.clear();
+
         for (auto &kv : m_fixed_ast_cache)
             if (kv.second != nullptr)
                 Z3_dec_ref((Z3_context)ctx(), kv.second);
@@ -3550,8 +3744,36 @@ public:
         }
     }
 
-    void push() override {}
-    void pop(unsigned) override {}
+    void push() override
+    {
+        m_trail_marks.push_back({m_bool_trail.size(), m_fixed_ast_trail.size()});
+    }
+
+    void pop(unsigned n) override
+    {
+        while (n-- > 0 && !m_trail_marks.empty())
+        {
+            TrailMark mark = m_trail_marks.back();
+            m_trail_marks.pop_back();
+
+            while (m_bool_trail.size() > mark.bool_size)
+            {
+                BoolTrailEntry entry = m_bool_trail.back();
+                m_bool_trail.pop_back();
+                if (entry.had_old)
+                    m_bool_cache[entry.key] = entry.old_value;
+                else
+                    m_bool_cache.erase(entry.key);
+            }
+
+            while (m_fixed_ast_trail.size() > mark.fixed_ast_size)
+            {
+                FixedAstTrailEntry entry = m_fixed_ast_trail.back();
+                m_fixed_ast_trail.pop_back();
+                restore_fixed_ast_entry(entry);
+            }
+        }
+    }
     void eq(const expr &, const expr &) override {}
 
     void created(const expr &t) override
@@ -3662,7 +3884,7 @@ public:
         if (t.is_bool())
         {
             Z3_lbool bv = Z3_get_bool_value(ctx(), (Z3_ast)v);
-            m_bool_cache[(Z3_ast)t] = bv;
+            cache_bool_value(t, bv);
 
             if (t.is_app() && t.decl().name().str() == "eqP" && t.num_args() == 2)
             {
@@ -3774,6 +3996,12 @@ int main(int argc, char **argv)
                 show_model_on_terminal = true;
             else if (a == "--rewrite-log")
                 rewrite_log_requested = true;
+            else if (a == "--log-conflict-ants")
+                LOG_CONFLICT_ANTS = true;
+            else if (a == "--disable-groebner-ring-order")
+                USE_GROEBNER_RING_VAR_ORDER = false;
+            else if (a == "--disable-fix-log")
+                PRINT_FIXED_ALL = false;
             else
             {
                 std::cerr << "Unknown option: " << a << "\n";
@@ -3959,14 +4187,23 @@ int main(int argc, char **argv)
             }
 
             std::vector<std::string> ring_vars;
-            ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() + qvar_names.size() + 2 * eqmodp2_qvar_names.size());
-            ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
-            ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
-            ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
-            for (const auto &qnames : eqmodp2_qvar_names)
+            if (USE_GROEBNER_RING_VAR_ORDER)
             {
-                ring_vars.push_back(qnames.first);
-                ring_vars.push_back(qnames.second);
+                ring_vars = build_groebner_ring_var_order(cmap.ring_names, indet_ring_names,
+                                                          qvar_names, eqmodp2_qvar_names);
+            }
+            else
+            {
+                ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() +
+                                  qvar_names.size() + 2 * eqmodp2_qvar_names.size());
+                ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
+                ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
+                ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
+                for (const auto &qnames : eqmodp2_qvar_names)
+                {
+                    ring_vars.push_back(qnames.first);
+                    ring_vars.push_back(qnames.second);
+                }
             }
 
             LOG_TRACE(g_log, "init",
@@ -4031,7 +4268,8 @@ int main(int argc, char **argv)
         begin_cli_timed_row(terminal_out, "Verification result:");
         finish_cli_timed_row(terminal_out, check_result_name(summary.result), summary.total_time);
         if (show_model_on_terminal && !terminal_model.empty())
-            terminal_out << "\n" << terminal_model;
+            terminal_out << "\n"
+                         << terminal_model;
         terminal_out.flush();
         return 0;
     }
