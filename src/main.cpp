@@ -4249,7 +4249,7 @@ int main(int argc, char **argv)
         begin_cli_timed_row(terminal_out, "   Computing Groebner basis:");
         finish_cli_timed_row(terminal_out, "OK", summary.groebner_time, summary.groebner_calls);
         terminal_out << "\n";
-        begin_cli_timed_row(terminal_out, "   Final fixed-value check:");
+        begin_cli_timed_row(terminal_out, "   Fixed-value check:");
         finish_cli_timed_row(terminal_out, "OK",
                              summary.final_fixed_value_check_time,
                              summary.final_fixed_value_check_calls);

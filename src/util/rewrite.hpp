@@ -119,48 +119,6 @@ struct RewriteResult
     explicit RewriteResult(const z3::expr &target);
 };
 
-struct AnnotatedPolynomial
-{
-    z3::expr polynomial;
-    std::string annotation;
-
-    AnnotatedPolynomial(const z3::expr &poly, std::string annot = {});
-};
-
-struct AnnotatedPostcondition
-{
-    z3::expr postcondition;
-    z3::expr polynomial;
-    std::vector<z3::expr> moduli;
-    std::string annotation;
-
-    AnnotatedPostcondition(const z3::expr &post,
-                           const z3::expr &poly,
-                           std::vector<z3::expr> ms = {},
-                           std::string annot = {});
-};
-
-struct RewriteTwoPhaseResult
-{
-    std::vector<AnnotatedPolynomial> ideal_polynomials;
-    std::vector<AnnotatedPostcondition> postconditions;
-    std::vector<RewriteRule> rules_used;
-    RewriteStats stats;
-    std::vector<std::string> diagnostics;
-};
-
-RewriteResult rewrite_assignments(
-    const std::vector<z3::expr> &ideal_generators,
-    const z3::expr &target,
-    const std::vector<z3::expr> &moduli = {},
-    RewriteOptions options = {});
-
-RewriteTwoPhaseResult rewrite_assignments_two_phase(
-    const std::vector<AnnotatedPolynomial> &ideal_polynomials,
-    const std::vector<AnnotatedPostcondition> &postconditions,
-    const std::vector<z3::expr> &moduli = {},
-    RewriteOptions options = {});
-
 RewriteResult run_rewriting_pipeline(
     z3::context &ctx,
     const std::vector<z3::expr> &input_asserts,

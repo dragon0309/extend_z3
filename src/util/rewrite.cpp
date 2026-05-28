@@ -62,19 +62,6 @@ RewriteRule::RewriteRule(const z3::expr &lhs_,
 
 RewriteResult::RewriteResult(const z3::expr &target) : rewritten_target(target) {}
 
-AnnotatedPolynomial::AnnotatedPolynomial(const z3::expr &poly, std::string annot)
-    : polynomial(poly), annotation(std::move(annot))
-{
-}
-
-AnnotatedPostcondition::AnnotatedPostcondition(const z3::expr &post,
-                                               const z3::expr &poly,
-                                               std::vector<z3::expr> ms,
-                                               std::string annot)
-    : postcondition(post), polynomial(poly), moduli(std::move(ms)), annotation(std::move(annot))
-{
-}
-
 std::string rule_rhs_pretty(const PolyRewriteRule &rr)
 {
     switch (rr.kind)
@@ -1717,40 +1704,6 @@ namespace
         }
     };
 
-    std::optional<GeneratorInfo> generator_to_polynomial(const expr &g,
-                                                         const std::vector<expr> &moduli,
-                                                         const PolyDecls &d,
-                                                         const RewriteOptions &options,
-                                                         RewriteStats &stats,
-                                                         std::vector<std::string> &diagnostics,
-                                                         const std::string &label)
-    {
-        if (g.is_app() && g.decl().name().str() == "eqP" && g.num_args() == 2)
-        {
-            expr p = simplify_poly(mk_psub(d, g.arg(0), g.arg(1)), d);
-            p = normalize_poly_under_moduli(p, moduli, d, options, stats);
-            return GeneratorInfo(p, p, false, true, label);
-        }
-        if (g.is_app() && g.decl().name().str() == "eqmodP1" && g.num_args() == 3)
-        {
-            if (!subsumed_by_moduli(g.arg(2), moduli, d, options, stats))
-            {
-                ++stats.skipped_modulus_not_subsumed;
-                diagnostics.push_back(label + ": skipped modulus not subsumed");
-                return GeneratorInfo(g, g, true, false, label);
-            }
-            expr p = simplify_poly(mk_psub(d, g.arg(0), g.arg(1)), d);
-            p = normalize_poly_under_moduli(p, moduli, d, options, stats);
-            return GeneratorInfo(p, p, true, true, label);
-        }
-        if (is_poly_ctor(g))
-        {
-            expr p = normalize_poly_under_moduli(g, moduli, d, options, stats);
-            return GeneratorInfo(g, p, false, true, label);
-        }
-        return std::nullopt;
-    }
-
     std::optional<Pattern> extract_one_assignment(const GeneratorInfo &info,
                                                   const std::vector<expr> &others,
                                                   const std::vector<expr> &moduli,
@@ -1957,95 +1910,6 @@ namespace
         std::vector<std::string> residual_reasons(infos.size());
         out.rules.reserve(grouped.size());
         out.consumed_input_indices.reserve(grouped.size());
-        for (auto &kv : grouped)
-        {
-            auto &cands = kv.second;
-            const std::string lhs_name = cands.empty() ? kv.first : cands[0].pattern.rule.lhs.to_string();
-
-            out.rules.push_back(cands[0].pattern.rule);
-            out.consumed_input_indices.push_back(infos[cands[0].index].input_index);
-            ++stats.rules_extracted;
-            consumed[cands[0].index] = true;
-            for (std::size_t i = 1; i < cands.size(); ++i)
-                residual_reasons[cands[i].index] = "duplicate LHS " + lhs_name + " already assigned in this round";
-        }
-
-        std::sort(out.rules.begin(), out.rules.end(),
-                  [](const RewriteRule &a, const RewriteRule &b)
-                  {
-                      return variable_key(a.lhs) < variable_key(b.lhs);
-                  });
-
-        for (std::size_t i = 0; i < infos.size(); ++i)
-        {
-            if (!has_candidate[i] || !consumed[i])
-                out.residuals.emplace_back(infos[i].polynomial, residual_reasons[i], infos[i].input_index);
-        }
-        return out;
-    }
-
-    Extraction extract_assignments_under_moduli(const std::vector<expr> &generators,
-                                                const std::vector<expr> &moduli,
-                                                const PolyDecls &d,
-                                                const RewriteOptions &options,
-                                                RewriteStats &stats,
-                                                std::vector<std::string> &diagnostics,
-                                                const std::string &trace_scope)
-    {
-        const std::string scope_prefix = trace_scope.empty() ? "" : trace_scope + "/";
-        Extraction out;
-        out.input_count = generators.size();
-        out.input_formulas = generators;
-
-        std::vector<GeneratorInfo> infos;
-        infos.reserve(generators.size());
-        for (std::size_t i = 0; i < generators.size(); ++i)
-        {
-            const std::string glabel = scope_prefix + "gen#" + std::to_string(i);
-            auto info = generator_to_polynomial(generators[i], moduli, d, options, stats, diagnostics,
-                                                glabel);
-            if (info)
-            {
-                info->input_index = i;
-                infos.push_back(*info);
-            }
-            else
-                diagnostics.push_back(glabel + ": unsupported generator");
-        }
-
-        struct Candidate
-        {
-            Pattern pattern;
-            std::size_t index;
-            Candidate(const Pattern &p, std::size_t i) : pattern(p), index(i) {}
-        };
-
-        std::unordered_map<std::string, std::vector<Candidate>> grouped;
-        std::vector<bool> has_candidate(infos.size(), false);
-        const std::vector<expr> empty_others;
-        for (std::size_t i = 0; i < infos.size(); ++i)
-        {
-            std::vector<expr> others;
-            const std::vector<expr> *others_ref = &empty_others;
-            if (options.use_subexpression_rules)
-            {
-                others.reserve(infos.size() > 0 ? infos.size() - 1 : 0);
-                for (std::size_t j = 0; j < infos.size(); ++j)
-                    if (i != j)
-                        others.push_back(infos[j].polynomial);
-                others_ref = &others;
-            }
-
-            auto pat = extract_one_assignment(infos[i], *others_ref, moduli, d, options, stats, diagnostics);
-            if (pat)
-            {
-                grouped[pat->lhs_key].emplace_back(*pat, i);
-                has_candidate[i] = true;
-            }
-        }
-
-        std::vector<bool> consumed(infos.size(), false);
-        std::vector<std::string> residual_reasons(infos.size());
         for (auto &kv : grouped)
         {
             auto &cands = kv.second;
@@ -2377,16 +2241,6 @@ namespace
         return cur;
     }
 
-    expr apply_rules(const expr &e, const std::vector<RewriteRule> &rules, const PolyDecls &d,
-                     const RewriteOptions &options = RewriteOptions{})
-    {
-        if (rules.empty())
-            return e;
-
-        RewriteEnv env(rules, d, options);
-        return apply_rules_with_env(e, env);
-    }
-
     std::vector<std::size_t> topo_sort_rules(const std::vector<RewriteRule> &rules)
     {
         const std::size_t n = rules.size();
@@ -2489,43 +2343,6 @@ namespace
             }
         }
         return env;
-    }
-
-    std::vector<expr> normalize_residuals(const std::vector<expr> &residuals,
-                                          const std::vector<expr> &moduli,
-                                          const PolyDecls &d,
-                                          const RewriteOptions &options,
-                                          RewriteStats &stats)
-    {
-        std::vector<expr> out;
-        std::unordered_set<std::string> seen;
-        for (const expr &r0 : residuals)
-        {
-            expr r = normalize_poly_under_moduli(r0, moduli, d, options, stats);
-            if (is_poly_ctor(r) && poly_equiv_zero(r, moduli, d, options, stats))
-                continue;
-            if (seen.insert(r.to_string()).second)
-                out.push_back(r);
-        }
-        return out;
-    }
-
-    std::vector<expr> keep_normalized_residuals(const std::vector<expr> &residuals,
-                                                const std::vector<expr> &moduli,
-                                                const PolyDecls &d,
-                                                const RewriteOptions &options,
-                                                RewriteStats &stats)
-    {
-        std::vector<expr> out;
-        std::unordered_set<std::string> seen;
-        for (const expr &r : residuals)
-        {
-            if (is_poly_ctor(r) && poly_equiv_zero(r, moduli, d, options, stats))
-                continue;
-            if (seen.insert(r.to_string()).second)
-                out.push_back(r);
-        }
-        return out;
     }
 
     void write_rule_list(std::ostream &os, const std::vector<RewriteRule> &rules, const PolyDecls &d)
@@ -2680,112 +2497,6 @@ namespace
         os << "\n";
     }
 
-    RewriteResult try_dag_rewrite(const std::vector<expr> &ideal,
-                                  const expr &target,
-                                  const std::vector<expr> &moduli,
-                                  const PolyDecls &d,
-                                  const RewriteOptions &options)
-    {
-        RewriteResult res(target);
-        std::vector<expr> current = ideal;
-        expr current_target = target;
-
-        for (std::size_t round = 0; round < options.max_rounds; ++round)
-        {
-            Extraction ex = extract_assignments_under_moduli(current, moduli, d, options,
-                                                             res.stats, res.diagnostics,
-                                                             "dag-r" + std::to_string(round));
-            if (ex.rules.empty())
-            {
-                std::vector<expr> normalized;
-                normalized.reserve(ex.residuals.size());
-                std::vector<std::string> drop_reasons;
-                drop_reasons.reserve(ex.residuals.size());
-                for (const auto &r : ex.residuals)
-                {
-                    expr n = normalize_poly_under_moduli(r.polynomial, moduli, d, options, res.stats);
-                    bool dropped_zero = is_poly_ctor(n) && poly_equiv_zero(n, moduli, d, options, res.stats);
-                    normalized.push_back(n);
-                    drop_reasons.push_back(dropped_zero ? "dropped because zero" : "");
-                }
-                current = keep_normalized_residuals(normalized, moduli, d, options, res.stats);
-                if (options.rewrite_log)
-                {
-                    const std::vector<std::size_t> empty_topo;
-                    const std::vector<RewriteRule> empty_env;
-                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
-                    write_rule_analysis(*options.rewrite_log, ex.rules, &empty_topo, &empty_env, d);
-                    write_residual_rewrite_log(*options.rewrite_log, ex.residuals, normalized, drop_reasons, d);
-                    write_final_residuals(*options.rewrite_log, current, d);
-                }
-                break;
-            }
-
-            std::vector<std::size_t> sorted;
-            try
-            {
-                sorted = topo_sort_rules(ex.rules);
-            }
-            catch (const CircularDependency &)
-            {
-                if (options.rewrite_log)
-                {
-                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
-                    write_rule_analysis(*options.rewrite_log, ex.rules, nullptr, nullptr, d);
-                    *options.rewrite_log << "residual rewrite:\n";
-                    *options.rewrite_log << "(not run)    reason: circular dependency\n\n";
-                }
-                throw;
-            }
-
-            std::vector<RewriteRule> env;
-            try
-            {
-                env = compose_rules(ex.rules, sorted, d, options);
-            }
-            catch (const CircularDependency &)
-            {
-                if (options.rewrite_log)
-                {
-                    write_round_prefix(*options.rewrite_log, round + 1, ex, d);
-                    write_rule_analysis(*options.rewrite_log, ex.rules, &sorted, nullptr, d);
-                    *options.rewrite_log << "residual rewrite:\n";
-                    *options.rewrite_log << "(not run)    reason: circular dependency\n\n";
-                }
-                throw;
-            }
-            RewriteEnv rewrite_env(env, d, options);
-            ++res.dag_rounds;
-            res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
-
-            std::vector<expr> rewritten_residuals;
-            rewritten_residuals.reserve(ex.residuals.size());
-            std::vector<std::string> drop_reasons;
-            drop_reasons.reserve(ex.residuals.size());
-            for (const auto &r : ex.residuals)
-            {
-                expr rw = normalize_poly_under_moduli(apply_rules_with_env(r.polynomial, rewrite_env),
-                                                      moduli, d, options, res.stats);
-                bool dropped_zero = is_poly_ctor(rw) && poly_equiv_zero(rw, moduli, d, options, res.stats);
-                rewritten_residuals.push_back(rw);
-                drop_reasons.push_back(dropped_zero ? "dropped because zero" : "");
-            }
-            current = keep_normalized_residuals(rewritten_residuals, moduli, d, options, res.stats);
-            if (options.rewrite_log)
-            {
-                write_round_prefix(*options.rewrite_log, round + 1, ex, d);
-                write_rule_analysis(*options.rewrite_log, ex.rules, &sorted, &env, d);
-                write_residual_rewrite_log(*options.rewrite_log, ex.residuals, rewritten_residuals, drop_reasons, d);
-            }
-            current_target = normalize_poly_under_moduli(apply_rules_with_env(current_target, rewrite_env),
-                                                         moduli, d, options, res.stats);
-        }
-
-        res.residual_generators = std::move(current);
-        res.rewritten_target = normalize_poly_under_moduli(current_target, moduli, d, options, res.stats);
-        return res;
-    }
-
     AssertionWorkItem rewrite_item_to_work_item(const RewriteItem &item)
     {
         return AssertionWorkItem{item.formula, collect_vars(item.formula), item.poly_view, item.rule_candidate};
@@ -2826,89 +2537,6 @@ namespace
             others.push_back(p);
         }
         return others;
-    }
-
-    RewriteResult functional_worklist_rewrite(const std::vector<expr> &ideal,
-                                              const expr &target,
-                                              const std::vector<expr> &moduli,
-                                              const PolyDecls &d,
-                                              const RewriteOptions &options)
-    {
-        RewriteResult res(target);
-        res.used_worklist_rewrite = true;
-
-        std::deque<expr> stack;
-        for (const expr &g : ideal)
-            stack.push_back(g);
-        std::vector<expr> residuals;
-        std::vector<RewriteRule> env;
-        std::unordered_map<std::string, std::size_t> env_index;
-
-        std::size_t iterations = 0;
-        while (!stack.empty() && iterations++ < options.max_rounds * std::max<std::size_t>(1, ideal.size() + 1))
-        {
-            expr poly = stack.front();
-            stack.pop_front();
-            poly = normalize_poly_under_moduli(apply_rules(poly, env, d, options), moduli, d, options, res.stats);
-
-            auto info = generator_to_polynomial(poly, moduli, d, options, res.stats, res.diagnostics,
-                                                "wl-i" + std::to_string(iterations));
-            if (!info)
-            {
-                residuals.push_back(poly);
-                continue;
-            }
-            std::vector<expr> others;
-            for (const expr &r : residuals)
-                others.push_back(r);
-            auto pat = extract_one_assignment(*info, others, moduli, d, options, res.stats, res.diagnostics);
-            if (!pat || contains_expr(pat->rule.rhs, pat->rule.lhs))
-            {
-                residuals.push_back(info->polynomial);
-                continue;
-            }
-
-            auto existing = env_index.find(pat->lhs_key);
-            if (existing != env_index.end())
-            {
-                residuals.push_back(info->polynomial);
-                continue;
-            }
-
-            RewriteRule new_rule = pat->rule;
-            update_env_dependents_on_new_rule(env, new_rule, d);
-            env_index[pat->lhs_key] = env.size();
-            env.push_back(new_rule);
-            res.rules_used.push_back(new_rule);
-
-            std::vector<expr> keep;
-            for (const expr &r : residuals)
-            {
-                if (contains_expr(r, new_rule.lhs))
-                    stack.push_back(r);
-                else
-                    keep.push_back(r);
-            }
-            residuals.swap(keep);
-        }
-
-        res.rules_used = env;
-
-        std::vector<expr> final_residuals;
-        RewriteEnv final_env(env, d, options);
-        for (const expr &r : residuals)
-            final_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(r, final_env),
-                                                                  moduli, d, options, res.stats));
-        while (!stack.empty())
-        {
-            final_residuals.push_back(normalize_poly_under_moduli(apply_rules_with_env(stack.front(), final_env),
-                                                                  moduli, d, options, res.stats));
-            stack.pop_front();
-        }
-        res.residual_generators = normalize_residuals(final_residuals, moduli, d, options, res.stats);
-        res.rewritten_target = normalize_poly_under_moduli(apply_rules_with_env(target, final_env),
-                                                           moduli, d, options, res.stats);
-        return res;
     }
 
     void collect_eqP_rec(const expr &e, std::vector<expr> &atoms)
@@ -3020,7 +2648,7 @@ namespace
         return simplify_assertion_rec(r, env.d, options, stats).simplify();
     }
 
-    std::vector<RewriteItem> assertion_worklist_rewrite(std::vector<RewriteItem> current,
+    std::vector<RewriteItem> functional_worklist_rewrite(std::vector<RewriteItem> current,
                                                         const std::vector<expr> &moduli,
                                                         const PolyDecls &d,
                                                         const RewriteOptions &options,
@@ -3135,7 +2763,7 @@ namespace
         return out;
     }
 
-    AssertionRewriteResult try_dag_rewrite_assertions(const std::vector<expr> &input_asserts,
+    AssertionRewriteResult try_dag_rewrite(const std::vector<expr> &input_asserts,
                                                       const PolyDecls &d,
                                                       const RewriteOptions &options,
                                                       AssertionRewriteTiming *timing = nullptr)
@@ -3208,7 +2836,7 @@ namespace
             }
             catch (const CircularDependency &)
             {
-                current = assertion_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
+                current = functional_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
                 break;
             }
 
@@ -3222,7 +2850,7 @@ namespace
             }
             catch (const CircularDependency &)
             {
-                current = assertion_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
+                current = functional_worklist_rewrite(std::move(current), moduli, d, options, res, timing);
                 break;
             }
 
@@ -3327,121 +2955,6 @@ namespace
 
 } // namespace
 
-RewriteResult rewrite_assignments(const std::vector<z3::expr> &ideal_generators,
-                                  const z3::expr &target,
-                                  const std::vector<z3::expr> &moduli,
-                                  RewriteOptions options)
-{
-    RewriteResult disabled(target);
-    if (!options.enable_rewriting)
-    {
-        disabled.residual_generators = ideal_generators;
-        return disabled;
-    }
-
-    std::vector<expr> roots = ideal_generators;
-    roots.push_back(target);
-    roots.insert(roots.end(), moduli.begin(), moduli.end());
-    PolyDecls d = collect_decls(roots);
-    if (!d.pconst)
-        throw std::runtime_error("rewrite_assignments: PConst constructor not found");
-    ScopedSimplifyMemo simplify_scope(options);
-
-    try
-    {
-        return try_dag_rewrite(ideal_generators, target, moduli, d, options);
-    }
-    catch (const CircularDependency &)
-    {
-        return functional_worklist_rewrite(ideal_generators, target, moduli, d, options);
-    }
-}
-
-RewriteTwoPhaseResult rewrite_assignments_two_phase(
-    const std::vector<AnnotatedPolynomial> &ideal_polynomials,
-    const std::vector<AnnotatedPostcondition> &postconditions,
-    const std::vector<z3::expr> &moduli,
-    RewriteOptions options)
-{
-    RewriteTwoPhaseResult out{ideal_polynomials, postconditions, {}, {}, {}};
-    if (!options.enable_rewriting)
-        return out;
-
-    std::vector<expr> roots;
-    for (const auto &p : ideal_polynomials)
-        roots.push_back(p.polynomial);
-    for (const auto &p : postconditions)
-    {
-        roots.push_back(p.postcondition);
-        roots.push_back(p.polynomial);
-        roots.insert(roots.end(), p.moduli.begin(), p.moduli.end());
-    }
-    roots.insert(roots.end(), moduli.begin(), moduli.end());
-    if (roots.empty())
-        return out;
-    PolyDecls d = collect_decls(roots);
-    if (!d.pconst)
-        return out;
-    ScopedSimplifyMemo simplify_scope(options);
-
-    auto post_moduli = [&](const AnnotatedPostcondition &p)
-    {
-        std::vector<expr> active = moduli;
-        active.insert(active.end(), p.moduli.begin(), p.moduli.end());
-        return active;
-    };
-
-    for (auto &p : out.postconditions)
-        p.polynomial = normalize_poly_under_moduli(p.polynomial, post_moduli(p), d, options, out.stats);
-    if (ideal_polynomials.empty())
-        return out;
-
-    std::vector<AnnotatedPolynomial> finished;
-    std::deque<AnnotatedPolynomial> todo(out.ideal_polynomials.begin(), out.ideal_polynomials.end());
-    for (std::size_t tp_iter = 0; !todo.empty(); ++tp_iter)
-    {
-        AnnotatedPolynomial cur = todo.front();
-        todo.pop_front();
-        std::vector<expr> others;
-        for (const auto &p : finished)
-            others.push_back(p.polynomial);
-        for (const auto &p : todo)
-            others.push_back(p.polynomial);
-        for (const auto &p : out.postconditions)
-        {
-            others.push_back(p.polynomial);
-            others.insert(others.end(), p.moduli.begin(), p.moduli.end());
-        }
-
-        GeneratorInfo info(cur.polynomial, simplify_poly(cur.polynomial, d), false, true,
-                           "tp-i" + std::to_string(tp_iter));
-        auto pat = extract_one_assignment(info, others, moduli, d, options, out.stats, out.diagnostics);
-        if (!pat)
-        {
-            finished.push_back(cur);
-            continue;
-        }
-
-        std::vector<RewriteRule> single{pat->rule};
-        out.rules_used.push_back(pat->rule);
-        for (auto &p : finished)
-            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d, options),
-                                                       moduli, d, options, out.stats);
-        for (auto &p : todo)
-            p.polynomial = normalize_poly_under_moduli(apply_rules(p.polynomial, single, d, options),
-                                                       moduli, d, options, out.stats);
-        for (auto &p : out.postconditions)
-        {
-            p.polynomial = simplify_poly(apply_rules(p.polynomial, single, d, options), d);
-            for (auto &m : p.moduli)
-                m = simplify_poly(apply_rules(m, single, d, options), d);
-            p.polynomial = normalize_poly_under_moduli(p.polynomial, post_moduli(p), d, options, out.stats);
-        }
-    }
-    out.ideal_polynomials = std::move(finished);
-    return out;
-}
-
 RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                      const std::vector<z3::expr> &input_asserts,
                                      const RewriteOptions &option,
@@ -3516,7 +3029,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
 
     AssertionRewriteTiming assertion_timing;
     phase_t0 = std::chrono::steady_clock::now();
-    AssertionRewriteResult unified = try_dag_rewrite_assertions(input_asserts, d, options, &assertion_timing);
+    AssertionRewriteResult unified = try_dag_rewrite(input_asserts, d, options, &assertion_timing);
     assertion_rewrite_time = std::chrono::steady_clock::now() - phase_t0;
 
     out.residual_assertions = unified.residual_assertions;
@@ -3528,7 +3041,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     out.stats = unified.stats;
     out.diagnostics = unified.diagnostics;
     if (unified.used_worklist_rewrite)
-        out.diagnostics.push_back("assertion worklist rewrite used");
+        out.diagnostics.push_back("worklist rewrite used");
 
     phase_t0 = std::chrono::steady_clock::now();
     for (const RewriteRule &r : unified.rules_used)
@@ -3646,27 +3159,6 @@ namespace
         return out;
     }
 
-    expr first_eqp_diff(const std::vector<expr> &asserts, const PolyDecls &d)
-    {
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        if (eqps.empty())
-            throw std::runtime_error("selftest expected eqP");
-        return mk_psub(d, eqps[0].arg(0), eqps[0].arg(1));
-    }
-
-    expr last_eqp_diff(const std::vector<expr> &asserts, const PolyDecls &d)
-    {
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        if (eqps.empty())
-            throw std::runtime_error("selftest expected eqP");
-        const expr &e = eqps.back();
-        return mk_psub(d, e.arg(0), e.arg(1));
-    }
-
     bool equivalent_for_test(const expr &a, const expr &b, const PolyDecls &d)
     {
         RewriteOptions opts;
@@ -3692,32 +3184,19 @@ namespace
         return cond;
     }
 
-    bool test_rule_target(const std::string &name,
-                          const std::string &body,
-                          const std::string &target_expr,
-                          const std::string &expected_expr,
-                          bool expect_rule,
-                          bool subexpr_rules = false)
+    bool pipeline_selftest(const char *name,
+                           const char *smt_body,
+                           const std::function<bool(context &, const std::vector<expr> &, const RewriteResult &)> &pred,
+                           RewriteOptions opts = {})
     {
         std::cout << "[selftest] " << name << "\n";
         context ctx;
-        std::vector<expr> asserts = parse_assertions(ctx, body);
-        std::vector<expr> roots = asserts;
-        std::vector<expr> t = parse_assertions(ctx, body + "(assert (eqP " + target_expr + " " + expected_expr + "))");
-        roots.insert(roots.end(), t.begin(), t.end());
-        PolyDecls d = collect_decls(roots);
-        expr diff = first_eqp_diff(asserts, d);
-        expr target = last_eqp_diff(parse_assertions(ctx, body + "(assert (eqP " + target_expr + " (PConst 0)))"), d);
-        expr expected = last_eqp_diff(parse_assertions(ctx, body + "(assert (eqP " + expected_expr + " (PConst 0)))"), d);
-        RewriteOptions opts;
+        auto asserts = parse_assertions(ctx, smt_body);
         opts.use_singular_normalization = false;
-        opts.use_subexpression_rules = subexpr_rules;
-        RewriteResult rr = rewrite_assignments({diff}, target, {}, opts);
-        bool ok = true;
-        ok &= check((!rr.rules_used.empty()) == expect_rule, expect_rule ? "missing rule" : "unexpected rule");
-        if (expect_rule)
-            ok &= check(equivalent_for_test(rr.rewritten_target, expected, d),
-                        "target mismatch: got " + rr.rewritten_target.to_string() + " expected " + expected.to_string());
+        util::Logger log;
+        log.set_global(util::LogLevel::Error);
+        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
+        bool ok = pred(ctx, asserts, rr);
         if (ok)
             std::cout << "  OK\n";
         return ok;
@@ -3736,520 +3215,154 @@ int run_rewrite_selftests()
             ++pass;
     };
 
-    run(test_rule_target("x - y - 1 gives x := y + 1",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PSub (PConst x) (PConst y)) (PConst 1)) (PConst 0)))",
-                         "(PConst x)", "(PAdd (PConst y) (PConst 1))", true));
+    run(pipeline_selftest("top-level conjunct eqP extracts rules",
+                          "(declare-const x Int)(declare-const y Int)"
+                          "(assert (and (eqP (PConst x) (PConst 1))"
+                          "             (eqP (PConst y) (PConst x))))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              bool ok = check(rr.rules_used.size() == 2,
+                                              "top-level conjunct eqP was not used for rewriting");
+                              ok &= check(rr.asserts.empty(),
+                                          "top-level conjunct eqP assertion was not rewritten away");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x - y gives x := y",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PConst x) (PConst y)) (PConst 0)))",
-                         "(PConst x)", "(PConst y)", true));
+    run(pipeline_selftest("nested eqP is not an unconditional rule source",
+                          "(declare-const x Int)(declare-const guard Bool)"
+                          "(assert (or guard (eqP (PConst x) (PConst 0))))",
+                          [](context &, const std::vector<expr> &input, const RewriteResult &rr)
+                          {
+                              bool ok = check(rr.rules_used.empty(),
+                                              "nested eqP was used as an unconditional rewrite");
+                              ok &= check(rr.asserts.size() == input.size(),
+                                          "nested eqP assertion was rewritten away");
+                              return ok;
+                          }));
 
-    run(test_rule_target("y - x gives y := x",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PConst y) (PConst x)) (PConst 0)))",
-                         "(PConst y)", "(PConst x)", true));
+    run(pipeline_selftest("top-level rule rewrites nested eqP residual",
+                          "(declare-const x Int)"
+                          "(assert (eqP (PConst x) (PConst 1)))"
+                          "(assert (not (eqP (PConst x) (PConst 2))))",
+                          [](context &ctx, const std::vector<expr> &input, const RewriteResult &rr)
+                          {
+                              PolyDecls d = collect_decls(input);
+                              std::vector<expr> eqps;
+                              for (const expr &a : rr.asserts)
+                                  collect_eqP_rec(a, eqps);
+                              bool ok = check(rr.rules_used.size() == 1,
+                                              "nested eqP was used as a rule source");
+                              ok &= check(rr.asserts.size() == 1,
+                                          "nested eqP residual was dropped unexpectedly");
+                              ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
+                                          "residual_assertions no longer mirrors final assertions");
+                              if (ok)
+                                  ok &= check(eqps.size() == 1 &&
+                                                  equivalent_for_test(eqps[0].arg(0), mk_pconst_mpz(d, ctx, 1), d),
+                                              "nested eqP residual was not rewritten by top-level rule");
+                              return ok;
+                          }));
 
-    run(test_rule_target("y + 1 - x gives x := y + 1",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PAdd (PConst y) (PConst 1)) (PConst x)) (PConst 0)))",
-                         "(PConst x)", "(PAdd (PConst y) (PConst 1))", true));
+    run(pipeline_selftest("cyclic assertions use worklist rewrite",
+                          "(declare-const x Int)(declare-const y Int)"
+                          "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
+                          "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))",
+                          [](context &, const std::vector<expr> &input, const RewriteResult &rr)
+                          {
+                              bool ok = check(rr.used_worklist_rewrite, "worklist rewrite not used");
+                              ok &= check(!rr.rules_used.empty(), "cyclic rewrite produced no rules");
+                              ok &= check(rr.rules_used.size() < input.size(),
+                                          "cyclic rewrite did not consume any eqP as rules");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x + y - z gives z := x + y",
-                         "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                         "(assert (eqP (PSub (PAdd (PConst x) (PConst y)) (PConst z)) (PConst 0)))",
-                         "(PConst z)", "(PAdd (PConst x) (PConst y))", true));
+    run(pipeline_selftest("cyclic worklist keeps non-poly residual",
+                          "(declare-const x Int)(declare-const y Int)"
+                          "(declare-const a Int)(declare-const b Int)"
+                          "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
+                          "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))"
+                          "(assert (= a b))",
+                          [](context &, const std::vector<expr> &input, const RewriteResult &rr)
+                          {
+                              bool has_int_equality = false;
+                              for (const expr &a : rr.residual_assertions)
+                                  has_int_equality =
+                                      has_int_equality || (a.is_app() && a.decl().name().str() == "=");
+                              bool ok = check(rr.used_worklist_rewrite, "worklist rewrite not used");
+                              ok &= check(!rr.asserts.empty(), "all assertions were dropped after cyclic worklist");
+                              ok &= check(has_int_equality, "non-poly equality missing after cyclic worklist");
+                              ok &= check(rr.asserts.size() < input.size(),
+                                          "cyclic worklist did not eliminate any assertions");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x + x - y gives y := 2*x",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PAdd (PConst x) (PConst x)) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PMul (PConst 2) (PConst x))", true, false));
+    run(pipeline_selftest("non-poly assertion remains in residual assertions",
+                          "(declare-const x Int)(declare-const a Int)(declare-const b Int)"
+                          "(assert (and (eqP (PConst x) (PConst 1)) (= a b)))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              bool has_int_equality = false;
+                              for (const expr &a : rr.residual_assertions)
+                                  has_int_equality =
+                                      has_int_equality || (a.is_app() && a.decl().name().str() == "=");
+                              bool ok = check(rr.rules_used.size() == 1, "top-level eqP did not produce a rule");
+                              ok &= check(rr.asserts.size() == 1,
+                                          "non-poly assertion was not the only residual assertion");
+                              ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
+                                          "residual_assertions no longer carries final SMT assertions");
+                              ok &= check(has_int_equality,
+                                          "non-poly equality was not preserved in residual_assertions");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x*y - z gives z := x*y",
-                         "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                         "(assert (eqP (PSub (PMul (PConst x) (PConst y)) (PConst z)) (PConst 0)))",
-                         "(PConst z)", "(PMul (PConst x) (PConst y))", true, false));
+    run(pipeline_selftest("eqmodP1 variables rewrite by default",
+                          "(declare-const x Int)(declare-const y Int)"
+                          "(assert (eqP (PConst x) (PConst 1)))"
+                          "(assert (not (eqmodP1 (PConst x) (PConst y) (PConst 7))))",
+                          [](context &ctx, const std::vector<expr> &input, const RewriteResult &rr)
+                          {
+                              std::vector<expr> ems;
+                              for (const expr &a : rr.asserts)
+                                  collect_eqmodP1_rec(a, ems);
+                              PolyDecls d = collect_decls(rr.asserts);
+                              bool ok = check(ems.size() == 1, "rewritten eqmodP1 atom missing");
+                              if (ok)
+                                  ok &= check(equivalent_for_test(ems[0].arg(0), mk_pconst_mpz(d, ctx, 1), d),
+                                              "eqmodP1 lhs was not rewritten from asserted eqP");
 
-    run(test_rule_target("x^2 - y gives y := x^2",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PPow (PConst x) 2) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PPow (PConst x) 2)", true, false));
+                              RewriteOptions preserve;
+                              preserve.use_singular_normalization = false;
+                              preserve.preserve_eqmodp1_vars = true;
+                              util::Logger log;
+                              log.set_global(util::LogLevel::Error);
+                              RewriteResult kept =
+                                  run_rewriting_pipeline(ctx, input, preserve, log);
+                              bool kept_rule = false;
+                              for (const RewriteRule &r : kept.rules_used)
+                                  kept_rule = kept_rule || variable_key(r.lhs) == "x";
+                              ok &= check(!kept_rule, "preserve mode still extracted eqmodP1 lhs rule");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x^2 + y gives y := -x^2",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PAdd (PPow (PConst x) 2) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PNeg (PPow (PConst x) 2))", true, false));
+    run(pipeline_selftest("eqmodP1 arguments rewrite by their own modulus",
+                          "(declare-const x Int)(declare-const m Int)"
+                          "(assert (eqmodP1 (PAdd (PConst x) (PMul (PConst 3) (PConst m))) (PConst x) (PConst m)))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              return check(rr.asserts.empty(),
+                                           "eqmodP1 did not reduce to true after dropping modulus multiple");
+                          }));
 
-    run(test_rule_target("x^2 + x gives no assignment",
-                         "(declare-const x Int)"
-                         "(assert (eqP (PAdd (PPow (PConst x) 2) (PConst x)) (PConst 0)))",
-                         "(PConst x)", "(PConst x)", false, false));
+    run(pipeline_selftest("single affine eqP is fully rewritten",
+                          "(declare-const x Int)(declare-const y Int)"
+                          "(assert (eqP (PSub (PConst x) (PConst y)) (PConst 0)))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              bool ok = check(rr.rules_used.size() == 1, "expected one extracted rule");
+                              ok &= check(rr.asserts.empty(), "affine eqP assertion was not rewritten away");
+                              return ok;
+                          }));
 
-    run(test_rule_target("x*y + x gives no assignment",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PAdd (PMul (PConst x) (PConst y)) (PConst x)) (PConst 0)))",
-                         "(PConst x)", "(PConst x)", false, false));
-
-    run(test_rule_target("2*x - y gives y := 2*x",
-                         "(declare-const x Int)(declare-const y Int)"
-                         "(assert (eqP (PSub (PMul (PConst 2) (PConst x)) (PConst y)) (PConst 0)))",
-                         "(PConst y)", "(PMul (PConst 2) (PConst x))", true, false));
-
-    {
-        std::cout << "[selftest] DAG chain rewrites x to 2\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst y) (PAdd (PConst z) (PConst 1))))"
-                                        "(assert (eqP (PConst z) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        std::vector<expr> ideal;
-        for (const expr &e : eqps)
-            ideal.push_back(mk_psub(d, e.arg(0), e.arg(1)));
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments(ideal, eqps[0].arg(0), {}, opts);
-        bool ok = check(equivalent_for_test(rr.rewritten_target, mk_pconst_mpz(d, ctx, 2), d), "x did not rewrite to 2");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] residual and target rewriting\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                                        "(assert (eqP (PSub (PConst x) (PAdd (PConst y) (PConst 1))) (PConst 0)))"
-                                        "(assert (eqP (PAdd (PMul (PConst 2) (PConst y)) (PAdd (PConst x) (PConst z))) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        std::vector<expr> ideal{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)), mk_psub(d, eqps[1].arg(0), eqps[1].arg(1))};
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        expr target_poly = mk_padd(d, mk_decl_app(ctx, d.pconst, {ctx.int_const("x")}),
-                                   mk_decl_app(ctx, d.pconst, {ctx.int_const("z")}));
-        RewriteResult rr = rewrite_assignments(ideal, target_poly, {}, opts);
-        expr expected = mk_pmul(d, mk_pconst_mpz(d, ctx, -2), mk_decl_app(ctx, d.pconst, {ctx.int_const("y")}));
-        bool ok = check(rr.residual_generators.empty(), "residual was not fully rewritten");
-        ok &= check(equivalent_for_test(rr.rewritten_target, expected, d), "target not fully rewritten through affine assignments");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] cycle triggers worklist rewrite and keeps residual\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        std::vector<expr> ideal{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)), mk_psub(d, eqps[1].arg(0), eqps[1].arg(1))};
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments(ideal, eqps[0].arg(0), {}, opts);
-        bool ok = check(rr.used_worklist_rewrite, "worklist rewrite not used");
-        ok &= check(!rr.residual_generators.empty(), "cycle residual was dropped");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] cyclic assertions use assertion worklist rewrite\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool ok = check(rr.used_worklist_rewrite, "assertion worklist rewrite not used");
-        ok &= check(!rr.rules_used.empty(), "cyclic assertion rewrite produced no rules");
-        ok &= check(rr.rules_used.size() < asserts.size(),
-                    "cyclic assertion rewrite did not consume any eqP as rules");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] cyclic assertion worklist keeps non-poly residual\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(declare-const a Int)(declare-const b Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst y) (PAdd (PConst x) (PConst 1))))"
-                                        "(assert (= a b))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool has_int_equality = false;
-        for (const expr &a : rr.residual_assertions)
-            has_int_equality = has_int_equality || (a.is_app() && a.decl().name().str() == "=");
-        bool ok = check(rr.used_worklist_rewrite, "assertion worklist rewrite not used");
-        ok &= check(!rr.asserts.empty(), "all assertions were dropped after cyclic worklist");
-        ok &= check(has_int_equality, "non-poly equality missing after cyclic worklist");
-        ok &= check(rr.asserts.size() < asserts.size(),
-                    "cyclic worklist did not eliminate any assertions");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] assertion rewrite ignores nested eqP until fixed true\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const guard Bool)"
-                                        "(assert (or guard (eqP (PConst x) (PConst 0))))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool ok = check(rr.rules_used.empty(), "nested eqP was used as an unconditional rewrite");
-        ok &= check(rr.asserts.size() == asserts.size(), "nested eqP assertion was rewritten away");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] assertion rewrite uses top-level conjunct eqP\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (and (eqP (PConst x) (PConst 1))"
-                                        "             (eqP (PConst y) (PConst x))))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool ok = check(rr.rules_used.size() == 2, "top-level conjunct eqP was not used for rewriting");
-        ok &= check(rr.asserts.empty(), "top-level conjunct eqP assertion was not rewritten away");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] nested eqP residual rewrites without extracting a rule\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)"
-                                        "(assert (eqP (PConst x) (PConst 1)))"
-                                        "(assert (not (eqP (PConst x) (PConst 2))))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : rr.asserts)
-            collect_eqP_rec(a, eqps);
-        bool ok = check(rr.rules_used.size() == 1, "nested eqP was used as a rule source");
-        ok &= check(rr.asserts.size() == 1, "nested eqP residual was dropped unexpectedly");
-        ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
-                    "residual_assertions no longer mirrors final assertions");
-        if (ok)
-            ok &= check(eqps.size() == 1 && equivalent_for_test(eqps[0].arg(0), mk_pconst_mpz(d, ctx, 1), d),
-                        "nested eqP residual was not rewritten by top-level rule");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] non-poly assertion remains in residual assertions\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const a Int)(declare-const b Int)"
-                                        "(assert (and (eqP (PConst x) (PConst 1)) (= a b)))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool has_int_equality = false;
-        for (const expr &a : rr.residual_assertions)
-            has_int_equality = has_int_equality || (a.is_app() && a.decl().name().str() == "=");
-        bool ok = check(rr.rules_used.size() == 1, "top-level eqP did not produce a rule");
-        ok &= check(rr.asserts.size() == 1, "non-poly assertion was not the only residual assertion");
-        ok &= check(rr.residual_assertions.size() == rr.asserts.size(),
-                    "residual_assertions no longer carries final SMT assertions");
-        ok &= check(has_int_equality, "non-poly equality was not preserved in residual_assertions");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] eqmodP1 variables rewrite by default\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PConst 1)))"
-                                        "(assert (not (eqmodP1 (PConst x) (PConst y) (PConst 7))))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        std::vector<expr> ems;
-        for (const expr &a : rr.asserts)
-            collect_eqmodP1_rec(a, ems);
-        PolyDecls d = collect_decls(rr.asserts);
-        bool ok = check(ems.size() == 1, "rewritten eqmodP1 atom missing");
-        if (ok)
-            ok &= check(equivalent_for_test(ems[0].arg(0), mk_pconst_mpz(d, ctx, 1), d),
-                        "eqmodP1 lhs was not rewritten from asserted eqP");
-
-        RewriteOptions preserve = opts;
-        preserve.preserve_eqmodp1_vars = true;
-        RewriteResult kept = run_rewriting_pipeline(ctx, asserts, preserve, log);
-        bool kept_rule = false;
-        for (const RewriteRule &r : kept.rules_used)
-            kept_rule = kept_rule || variable_key(r.lhs) == "x";
-        ok &= check(!kept_rule, "preserve mode still extracted eqmodP1 lhs rule");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] modular assignment requires active modulus\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqmodP1 (PConst x) (PConst y) (PConst 7)))");
-        std::vector<expr> ems;
-        for (const expr &a : asserts)
-            collect_eqmodP1_rec(a, ems);
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult no = rewrite_assignments({ems[0]}, ems[0].arg(0), {}, opts);
-        RewriteResult yes = rewrite_assignments({ems[0]}, ems[0].arg(0), {ems[0].arg(2)}, opts);
-        bool ok = check(no.rules_used.empty(), "modular assignment accepted without modulus");
-        ok &= check(!yes.rules_used.empty(), "modular assignment rejected with active modulus");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] modular common pattern requires active modulus\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)(declare-const m Int)"
-                                        "(assert (eqP (PSub (PSub (PConst x) (PConst y)) (PConst m)) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        expr residual = first_eqp_diff(asserts, d);
-        expr modulus = eqps[0].arg(0).arg(1);
-        expr target = eqps[0].arg(0).arg(0).arg(0);
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult inactive = rewrite_assignments({residual}, target, {}, opts);
-        RewriteResult active = rewrite_assignments({residual}, target, {modulus}, opts);
-        bool ok = check(equivalent_for_test(inactive.rewritten_target, target, d),
-                        "inactive modular common pattern rewrote x without active modulus");
-        ok &= check(equivalent_for_test(active.rewritten_target,
-                                        eqps[0].arg(0).arg(0).arg(1), d),
-                    "active modular common pattern did not rewrite x to y");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] active modulus rewrites target multiples to zero\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const m Int)"
-                                        "(assert (eqP (PConst x) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
-        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
-        expr target = mk_padd(d, x, mk_pmul(d, mk_pconst_mpz(d, ctx, 3), m));
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments({}, target, {m}, opts);
-        bool ok = check(equivalent_for_test(rr.rewritten_target, x, d),
-                        "target multiple of active modulus was not rewritten to zero");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] active modulus rewrites affine scalar multiples to zero\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
-        expr y = mk_decl_app(ctx, d.pconst, {ctx.int_const("y")});
-        expr two = mk_pconst_mpz(d, ctx, 2);
-        expr target = mk_psub(d, mk_pmul(d, two, x), mk_pmul(d, two, y));
-        expr modulus = mk_psub(d, x, y);
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments({}, target, {modulus}, opts);
-        bool ok = check(equivalent_for_test(rr.rewritten_target, mk_pconst_mpz(d, ctx, 0), d),
-                        "affine multiple 2*x - 2*y was not rewritten to zero under modulus x-y");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] active modulus simplifies generators before extracting rules\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const m Int)(declare-const z Int)"
-                                        "(assert (eqP (PSub (PAdd (PConst x) (PMul (PConst 3) (PConst m))) (PConst z)) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        expr residual = mk_psub(d, eqps[0].arg(0), eqps[0].arg(1));
-        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
-        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
-        expr z = mk_decl_app(ctx, d.pconst, {ctx.int_const("z")});
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteResult rr = rewrite_assignments({residual}, x, {m}, opts);
-        bool ok = check(equivalent_for_test(rr.rewritten_target, z, d),
-                        "active modulus simplification did not expose the source assignment direction");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] eqmodP1 arguments rewrite by their own modulus\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const m Int)"
-                                        "(assert (eqmodP1 (PAdd (PConst x) (PMul (PConst 3) (PConst m))) (PConst x) (PConst m)))");
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        util::Logger log;
-        log.set_global(util::LogLevel::Error);
-        RewriteResult rr = run_rewriting_pipeline(ctx, asserts, opts, log);
-        bool ok = check(rr.asserts.empty(), "eqmodP1 did not reduce to true after dropping modulus multiple");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] two-phase postcondition rewrites by its modulus\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const m Int)"
-                                        "(assert (eqP (PConst x) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
-        expr m = mk_decl_app(ctx, d.pconst, {ctx.int_const("m")});
-        expr post_poly = mk_padd(d, x, mk_pmul(d, mk_pconst_mpz(d, ctx, 3), m));
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        RewriteTwoPhaseResult rr = rewrite_assignments_two_phase({}, {AnnotatedPostcondition(asserts[0], post_poly, {m})}, {}, opts);
-        bool ok = check(rr.postconditions.size() == 1 &&
-                            equivalent_for_test(rr.postconditions[0].polynomial, x, d),
-                        "two-phase postcondition kept multiple of its modulus");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] rewrite lookup debug modes preserve results\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst y) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        std::vector<expr> ideal;
-        for (const expr &e : eqps)
-            ideal.push_back(mk_psub(d, e.arg(0), e.arg(1)));
-        expr x = mk_decl_app(ctx, d.pconst, {ctx.int_const("x")});
-        expr target = mk_padd(d, x, x);
-        expr expected = mk_pconst_mpz(d, ctx, 2);
-
-        RewriteOptions verify;
-        verify.use_singular_normalization = false;
-        verify.verify_rewrite_lookups = true;
-        RewriteResult verified = rewrite_assignments(ideal, target, {}, verify);
-
-        RewriteOptions no_cache = verify;
-        no_cache.verify_rewrite_lookups = false;
-        no_cache.disable_rewrite_cache = true;
-        RewriteResult uncached = rewrite_assignments(ideal, target, {}, no_cache);
-
-        bool ok = check(equivalent_for_test(verified.rewritten_target, expected, d),
-                        "verified lookup mode changed rewrite result");
-        ok &= check(equivalent_for_test(uncached.rewritten_target, expected, d),
-                    "disabled cache mode changed rewrite result");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    run(test_rule_target("subexpression rule extracts separable x+x when enabled",
-                         "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                         "(assert (eqP (PSub (PAdd (PAdd (PConst x) (PConst x)) (PAdd (PConst y) (PConst y))) (PAdd (PConst z) (PConst z))) (PConst 0)))",
-                         "(PAdd (PConst x) (PConst x))",
-                         "(PSub (PAdd (PConst z) (PConst z)) (PAdd (PConst y) (PConst y)))",
-                         true, true));
-
-    {
-        std::cout << "[selftest] Singular drops residual reducible by modulus\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)(declare-const z Int)"
-                                        "(assert (eqP (PMul (PSub (PConst x) (PConst y)) (PConst z)) (PConst 0)))");
-        PolyDecls d = collect_decls(asserts);
-        expr residual = first_eqp_diff(asserts, d);
-        expr modulus = mk_psub(d, mk_decl_app(ctx, d.pconst, {ctx.int_const("x")}), mk_decl_app(ctx, d.pconst, {ctx.int_const("y")}));
-        RewriteOptions opts;
-        opts.use_singular_normalization = true;
-        opts.use_subexpression_rules = false;
-        RewriteResult rr = rewrite_assignments({residual}, mk_pconst_mpz(d, ctx, 0), {modulus}, opts);
-        bool ok = check(rr.residual_generators.empty(), "residual was not reduced to zero by Singular");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
 
     std::cout << "\n[selftest] " << pass << "/" << total << " passed\n";
     return pass == total ? 0 : 2;
