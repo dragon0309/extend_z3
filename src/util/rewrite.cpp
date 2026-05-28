@@ -1753,12 +1753,13 @@ namespace
     struct RewriteItem
     {
         expr formula;
+        std::unordered_set<std::string> vars;
         std::optional<expr> poly_view;
         bool rule_candidate = false;
         std::size_t source_index = 0;
 
         RewriteItem(const expr &f, std::optional<expr> p, bool candidate, std::size_t idx)
-            : formula(f), poly_view(std::move(p)), rule_candidate(candidate), source_index(idx)
+            : formula(f), vars(collect_vars(f)), poly_view(std::move(p)), rule_candidate(candidate), source_index(idx)
         {
         }
     };
@@ -2499,7 +2500,18 @@ namespace
 
     AssertionWorkItem rewrite_item_to_work_item(const RewriteItem &item)
     {
-        return AssertionWorkItem{item.formula, collect_vars(item.formula), item.poly_view, item.rule_candidate};
+        return AssertionWorkItem{item.formula, item.vars, item.poly_view, item.rule_candidate};
+    }
+
+    bool intersects_lhs_keys(const std::unordered_set<std::string> &vars,
+                             const std::unordered_set<std::string> &lhs_keys)
+    {
+        if (vars.empty() || lhs_keys.empty())
+            return false;
+        for (const std::string &v : vars)
+            if (lhs_keys.count(v))
+                return true;
+        return false;
     }
 
     void update_env_dependents_on_new_rule(std::vector<RewriteRule> &env,
@@ -2861,6 +2873,14 @@ namespace
             ++res.dag_rounds;
             res.rules_used.insert(res.rules_used.end(), env.begin(), env.end());
 
+            std::unordered_set<std::string> rule_lhs_keys;
+            if (rewrite_env.all_variable_rules)
+            {
+                rule_lhs_keys.reserve(rewrite_env.by_lhs.size());
+                for (const auto &kv : rewrite_env.by_lhs)
+                    rule_lhs_keys.insert(kv.first);
+            }
+
             std::unordered_set<std::size_t> consumed(ex.consumed_input_indices.begin(),
                                                      ex.consumed_input_indices.end());
             std::vector<expr> rewritten;
@@ -2876,7 +2896,12 @@ namespace
                 if (timing)
                     ++timing->residual_rewrite_calls;
                 log_originals.emplace_back(current[i].formula, "", i);
-                expr rw = rewrite_assertion(current[i].formula, rewrite_env, options, res.stats);
+                const bool skip_rewrite =
+                    rewrite_env.all_variable_rules &&
+                    !intersects_lhs_keys(current[i].vars, rule_lhs_keys);
+                expr rw = skip_rewrite
+                              ? simplify_assertion_rec(current[i].formula, d, options, res.stats).simplify()
+                              : rewrite_assertion(current[i].formula, rewrite_env, options, res.stats);
                 log_rewritten.push_back(rw);
                 drop_reasons.push_back(is_true_expr(rw) ? "dropped because true" : "");
                 if (!is_true_expr(rw))
