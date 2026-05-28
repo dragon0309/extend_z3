@@ -1961,38 +1961,6 @@ namespace
         {
             auto &cands = kv.second;
             const std::string lhs_name = cands.empty() ? kv.first : cands[0].pattern.rule.lhs.to_string();
-            const bool has_duplicate_lhs = cands.size() > 1;
-            if (has_duplicate_lhs && options.reject_duplicate_lhs)
-                stats.duplicate_lhs += cands.size() - 1;
-
-            bool conflict = false;
-            if (has_duplicate_lhs && options.reject_conflicting_lhs)
-            {
-                for (std::size_t i = 1; i < cands.size(); ++i)
-                {
-                    if (!equivalent_poly(cands[0].pattern.rule.rhs, cands[i].pattern.rule.rhs,
-                                         moduli, d, options, stats))
-                    {
-                        conflict = true;
-                        break;
-                    }
-                }
-            }
-            if (conflict)
-            {
-                ++stats.conflicting_lhs;
-                diagnostics.push_back("duplicate lhs conflict: " + lhs_name);
-                for (const Candidate &c : cands)
-                    residual_reasons[c.index] = "conflicting LHS " + lhs_name + " has incompatible RHS";
-                continue;
-            }
-            if (has_duplicate_lhs && options.reject_duplicate_lhs)
-            {
-                diagnostics.push_back("duplicate lhs: " + lhs_name);
-                for (const Candidate &c : cands)
-                    residual_reasons[c.index] = "duplicate LHS " + lhs_name + " already assigned in this round";
-                continue;
-            }
 
             out.rules.push_back(cands[0].pattern.rule);
             out.consumed_input_indices.push_back(infos[cands[0].index].input_index);
@@ -2082,44 +2050,6 @@ namespace
         {
             auto &cands = kv.second;
             const std::string lhs_name = cands.empty() ? kv.first : cands[0].pattern.rule.lhs.to_string();
-            const bool has_duplicate_lhs = cands.size() > 1;
-            if (has_duplicate_lhs && options.reject_duplicate_lhs)
-                stats.duplicate_lhs += cands.size() - 1;
-
-            bool conflict = false;
-            if (has_duplicate_lhs && options.reject_conflicting_lhs)
-            {
-                for (std::size_t i = 1; i < cands.size(); ++i)
-                {
-                    if (!equivalent_poly(cands[0].pattern.rule.rhs, cands[i].pattern.rule.rhs,
-                                         moduli, d, options, stats))
-                    {
-                        conflict = true;
-                        break;
-                    }
-                }
-            }
-            if (conflict)
-            {
-                ++stats.conflicting_lhs;
-                diagnostics.push_back("duplicate lhs conflict: " + lhs_name);
-                for (const Candidate &c : cands)
-                {
-                    consumed[c.index] = false;
-                    residual_reasons[c.index] = "conflicting LHS " + lhs_name + " has incompatible RHS";
-                }
-                continue;
-            }
-            if (has_duplicate_lhs && options.reject_duplicate_lhs)
-            {
-                diagnostics.push_back("duplicate lhs: " + lhs_name);
-                for (const Candidate &c : cands)
-                {
-                    consumed[c.index] = false;
-                    residual_reasons[c.index] = "duplicate LHS " + lhs_name + " already assigned in this round";
-                }
-                continue;
-            }
 
             out.rules.push_back(cands[0].pattern.rule);
             out.consumed_input_indices.push_back(infos[cands[0].index].input_index);
@@ -2941,26 +2871,6 @@ namespace
             auto existing = env_index.find(pat->lhs_key);
             if (existing != env_index.end())
             {
-                bool conflict = false;
-                if (options.reject_conflicting_lhs)
-                {
-                    conflict = !equivalent_poly(env[existing->second].rhs, pat->rule.rhs,
-                                                moduli, d, options, res.stats);
-                }
-                if (conflict)
-                {
-                    ++res.stats.conflicting_lhs;
-                    res.diagnostics.push_back("duplicate lhs conflict: " + pretty_rewrite_atom_name(pat->lhs_key));
-                    residuals.push_back(info->polynomial);
-                    continue;
-                }
-                if (options.reject_duplicate_lhs)
-                {
-                    ++res.stats.duplicate_lhs;
-                    res.diagnostics.push_back("duplicate lhs: " + pretty_rewrite_atom_name(pat->lhs_key));
-                    residuals.push_back(info->polynomial);
-                    continue;
-                }
                 residuals.push_back(info->polynomial);
                 continue;
             }
@@ -3170,28 +3080,7 @@ namespace
                     auto existing = env_index.find(pat->lhs_key);
                     if (existing != env_index.end())
                     {
-                        bool conflict = false;
-                        if (options.reject_conflicting_lhs)
-                        {
-                            conflict = !equivalent_poly(env[existing->second].rhs, pat->rule.rhs,
-                                                        moduli, d, options, res.stats);
-                        }
-                        if (conflict)
-                        {
-                            ++res.stats.conflicting_lhs;
-                            res.diagnostics.push_back("duplicate lhs conflict: " +
-                                                      pretty_rewrite_atom_name(pat->lhs_key));
-                        }
-                        else if (options.reject_duplicate_lhs)
-                        {
-                            ++res.stats.duplicate_lhs;
-                            res.diagnostics.push_back("duplicate lhs: " +
-                                                      pretty_rewrite_atom_name(pat->lhs_key));
-                        }
-                        else
-                        {
-                            residuals.push_back(std::move(item));
-                        }
+                        residuals.push_back(std::move(item));
                     }
                     else
                     {
@@ -4021,47 +3910,6 @@ int run_rewrite_selftests()
         ok &= check(has_int_equality, "non-poly equality missing after cyclic worklist");
         ok &= check(rr.asserts.size() < asserts.size(),
                     "cyclic worklist did not eliminate any assertions");
-        if (ok)
-            std::cout << "  OK\n";
-        run(ok);
-    }
-
-    {
-        std::cout << "[selftest] duplicate lhs handling\n";
-        context ctx;
-        auto asserts = parse_assertions(ctx,
-                                        "(declare-const x Int)(declare-const y Int)"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 1))))"
-                                        "(assert (eqP (PConst x) (PAdd (PConst y) (PConst 2))))");
-        PolyDecls d = collect_decls(asserts);
-        std::vector<expr> eqps;
-        for (const expr &a : asserts)
-            collect_eqP_rec(a, eqps);
-        RewriteOptions opts;
-        opts.use_singular_normalization = false;
-        std::vector<expr> same_input{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
-                                     mk_psub(d, eqps[1].arg(0), eqps[1].arg(1))};
-        std::vector<expr> conflict_input{mk_psub(d, eqps[0].arg(0), eqps[0].arg(1)),
-                                         mk_psub(d, eqps[2].arg(0), eqps[2].arg(1))};
-        RewriteResult same = rewrite_assignments(same_input, eqps[0].arg(0), {}, opts);
-        RewriteResult conflict_default = rewrite_assignments(conflict_input, eqps[0].arg(0), {}, opts);
-
-        RewriteOptions reject_dups = opts;
-        reject_dups.reject_duplicate_lhs = true;
-        RewriteResult duplicate_rejected = rewrite_assignments(same_input, eqps[0].arg(0), {}, reject_dups);
-
-        RewriteOptions reject_conflicts = opts;
-        reject_conflicts.reject_conflicting_lhs = true;
-        RewriteResult conflict_rejected = rewrite_assignments(conflict_input, eqps[0].arg(0), {}, reject_conflicts);
-
-        bool ok = check(same.rules_used.size() == 1, "equivalent duplicate did not keep one rule by default");
-        ok &= check(conflict_default.rules_used.size() == 1 && !conflict_default.residual_generators.empty(),
-                    "conflicting duplicate was dropped by default");
-        ok &= check(duplicate_rejected.rules_used.empty() && !duplicate_rejected.residual_generators.empty(),
-                    "duplicate lhs option did not reject duplicates");
-        ok &= check(conflict_rejected.rules_used.empty() && conflict_rejected.residual_generators.size() == 2,
-                    "conflicting lhs option did not reject conflicts");
         if (ok)
             std::cout << "  OK\n";
         run(ok);

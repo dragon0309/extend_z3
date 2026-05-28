@@ -96,8 +96,6 @@ static bool ENABLE_REWRITING = true;
 //     sub-expression assignment extraction.
 //   * ENABLE_EXPRESSION_GROWTH_CHECK (default false): skip rewrite rules whose
 //     RHS grows beyond RewriteOptions::max_expression_growth.
-//   * REJECT_DUPLICATE_LHS / REJECT_CONFLICTING_LHS (default false): opt into
-//     dropping duplicate or conflicting rewrite candidates.
 //   * ENABLE_REWRITE_SINGULAR_NF (default true): allow Singular-backed zero
 //     checks during rewrite normalization.
 //   * DISABLE_REWRITE_CACHE / VERIFY_REWRITE_LOOKUPS (default false): debug
@@ -105,8 +103,6 @@ static bool ENABLE_REWRITING = true;
 static bool PRESERVE_EQMODP1_VARS = false;
 static bool ENABLE_SUBEXPRESSION_RULES = false;
 static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
-static bool REJECT_DUPLICATE_LHS = false;
-static bool REJECT_CONFLICTING_LHS = false;
 static bool ENABLE_REWRITE_SINGULAR_NF = true;
 static bool DISABLE_REWRITE_CACHE = false;
 static bool VERIFY_REWRITE_LOOKUPS = false;
@@ -256,7 +252,6 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--no-rewriting] [--no-singular-nf]"
           " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
           " [--enable-expression-growth-check]"
-          " [--reject-duplicate-lhs] [--reject-conflicting-lhs]"
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--show-model]"
           " [--rewrite-log] [--groebner-ring-order]\n";
@@ -3980,10 +3975,6 @@ int main(int argc, char **argv)
                 ENABLE_SUBEXPRESSION_RULES = true;
             else if (a == "--enable-expression-growth-check")
                 ENABLE_EXPRESSION_GROWTH_CHECK = true;
-            else if (a == "--reject-duplicate-lhs")
-                REJECT_DUPLICATE_LHS = true;
-            else if (a == "--reject-conflicting-lhs")
-                REJECT_CONFLICTING_LHS = true;
             else if (a == "--disable-rewrite-cache")
                 DISABLE_REWRITE_CACHE = true;
             else if (a == "--verify-rewrite-lookups")
@@ -4049,8 +4040,6 @@ int main(int argc, char **argv)
             rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
             rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
             rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
-            rwopt.reject_duplicate_lhs = REJECT_DUPLICATE_LHS;
-            rwopt.reject_conflicting_lhs = REJECT_CONFLICTING_LHS;
             rwopt.disable_rewrite_cache = DISABLE_REWRITE_CACHE;
             rwopt.verify_rewrite_lookups = VERIFY_REWRITE_LOOKUPS;
 

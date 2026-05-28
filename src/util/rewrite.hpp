@@ -23,8 +23,6 @@ struct RewriteOptions
     bool use_singular_normalization = true;
     bool use_subexpression_rules = false;
     bool enable_expression_growth_check = false;
-    bool reject_duplicate_lhs = false;
-    bool reject_conflicting_lhs = false;
     bool disable_rewrite_cache = false;
     bool verify_rewrite_lookups = false;
     std::size_t max_rounds = 100;
@@ -89,8 +87,6 @@ struct PolyRewriteRule
 struct RewriteStats
 {
     std::size_t rules_extracted = 0;
-    std::size_t duplicate_lhs = 0;
-    std::size_t conflicting_lhs = 0;
     std::size_t skipped_nonlinear = 0;
     std::size_t skipped_unsafe_coefficient = 0;
     std::size_t skipped_lhs_occurs_in_rhs = 0;
