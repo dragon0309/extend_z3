@@ -98,12 +98,15 @@ static bool ENABLE_REWRITING = true;
 //     RHS grows beyond RewriteOptions::max_expression_growth.
 //   * ENABLE_REWRITE_SINGULAR_NF (default true): allow Singular-backed zero
 //     checks during rewrite normalization.
+//   * ENABLE_MODULI_NORMALIZATION (default false): run normalize_poly_under_moduli
+//     during eqmodP1 simplification in the rewrite pipeline.
 //   * DISABLE_REWRITE_CACHE / VERIFY_REWRITE_LOOKUPS (default false): debug
 //     cache/memo correctness by disabling or rechecking rewrite memo hits.
 static bool PRESERVE_EQMODP1_VARS = false;
 static bool ENABLE_SUBEXPRESSION_RULES = false;
 static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
 static bool ENABLE_REWRITE_SINGULAR_NF = true;
+static bool ENABLE_MODULI_NORMALIZATION = false;
 static bool DISABLE_REWRITE_CACHE = false;
 static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
@@ -249,7 +252,7 @@ static void print_usage(std::ostream &os, const char *prog)
        << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
           " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
           " [--m-prime] [--disable-auto-lemmas]"
-          " [--no-rewriting] [--no-singular-nf]"
+          " [--no-rewriting] [--no-singular-nf] [--enable-moduli-normalization]"
           " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
           " [--enable-expression-growth-check]"
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
@@ -3969,6 +3972,8 @@ int main(int argc, char **argv)
                 ENABLE_REWRITING = false;
             else if (a == "--no-singular-nf")
                 ENABLE_REWRITE_SINGULAR_NF = false;
+            else if (a == "--enable-moduli-normalization")
+                ENABLE_MODULI_NORMALIZATION = true;
             else if (a == "--preserve-eqmodp1-vars")
                 PRESERVE_EQMODP1_VARS = true;
             else if (a == "--enable-subexpression-rules")
@@ -4037,6 +4042,7 @@ int main(int argc, char **argv)
             RewriteOptions rwopt;
             rwopt.enable_rewriting = ENABLE_REWRITING;
             rwopt.use_singular_normalization = ENABLE_REWRITE_SINGULAR_NF;
+            rwopt.enable_moduli_normalization = ENABLE_MODULI_NORMALIZATION;
             rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
             rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
             rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;

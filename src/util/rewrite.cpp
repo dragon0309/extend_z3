@@ -1639,6 +1639,9 @@ namespace
                                      const RewriteOptions &options,
                                      RewriteStats &stats)
     {
+        if (!options.enable_moduli_normalization)
+            return is_poly_ctor(e) ? simplify_poly(e, d) : e.simplify();
+        
         expr s = is_poly_ctor(e) ? simplify_poly(e, d) : e.simplify();
         if (moduli.empty() || !is_poly_ctor(s))
             return s;

@@ -21,6 +21,7 @@ struct RewriteOptions
 {
     bool enable_rewriting = true;
     bool use_singular_normalization = true;
+    bool enable_moduli_normalization = true;
     bool use_subexpression_rules = false;
     bool enable_expression_growth_check = false;
     bool disable_rewrite_cache = false;
