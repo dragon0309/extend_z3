@@ -111,6 +111,9 @@ static bool DISABLE_REWRITE_CACHE = false;
 static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
+// When true, register only coeff bases (BV leaves / Int indets) needed for
+// final_fixed_value_check, instead of coeff_int composites and full int/BV subtrees.
+static bool ENABLE_MINIMAL_FIXED_WATCH = false;
 static bool LOG_CONFLICT_ANTS = false;
 static bool USE_GROEBNER_RING_VAR_ORDER = true;
 
@@ -256,7 +259,8 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
           " [--enable-expression-growth-check]"
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
-          " [--disable-final-fixed-value-check] [--show-model]"
+          " [--disable-final-fixed-value-check] [--minimal-fixed-watch]"
+          " [--show-model]"
           " [--rewrite-log] [--groebner-ring-order]\n";
 }
 
@@ -1741,6 +1745,9 @@ class PolyPropagator : public user_propagator_base
 
     std::unordered_map<Z3_ast, std::string> m_label;
 
+    bool m_minimal_eval_watch_registered = false;
+    std::unordered_set<Z3_ast> m_eval_watch_registered;
+
     struct BoolTrailEntry
     {
         Z3_ast key = nullptr;
@@ -2072,6 +2079,99 @@ class PolyPropagator : public user_propagator_base
             collect_int_bv_subterms_rec(e.arg(i), seen, out);
     }
 
+    static void collect_minimal_eval_terms_from_int_expr_rec(const expr &e,
+                                                             std::unordered_set<Z3_ast> &seen,
+                                                             std::vector<expr> &out)
+    {
+        if (e.get_sort().is_bv() && !e.is_numeral())
+        {
+            Z3_ast k = (Z3_ast)e;
+            if (seen.insert(k).second)
+                out.push_back(e);
+            return;
+        }
+
+        if (e.is_const() && e.get_sort().is_int() && !e.is_numeral())
+        {
+            Z3_ast k = (Z3_ast)e;
+            if (seen.insert(k).second)
+                out.push_back(e);
+            return;
+        }
+
+        if (is_bv_to_int_app(e))
+        {
+            collect_minimal_eval_terms_from_int_expr_rec(e.arg(0), seen, out);
+            return;
+        }
+
+        if (!e.is_app())
+            return;
+        for (unsigned i = 0; i < e.num_args(); ++i)
+            collect_minimal_eval_terms_from_int_expr_rec(e.arg(i), seen, out);
+    }
+
+    static void collect_minimal_eval_terms_from_polyterm_rec(const expr &p,
+                                                             std::unordered_set<Z3_ast> &seen,
+                                                             std::vector<expr> &out)
+    {
+        if (is_ctor(p, "PConst", 1))
+        {
+            collect_minimal_eval_terms_from_int_expr_rec(p.arg(0), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PNeg", 1))
+        {
+            collect_minimal_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PAdd", 2) || is_ctor(p, "PSub", 2) || is_ctor(p, "PMul", 2))
+        {
+            collect_minimal_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            collect_minimal_eval_terms_from_polyterm_rec(p.arg(1), seen, out);
+            return;
+        }
+        if (is_ctor(p, "PPow", 2))
+        {
+            collect_minimal_eval_terms_from_polyterm_rec(p.arg(0), seen, out);
+            return;
+        }
+    }
+
+    void register_watch_term(const expr &t)
+    {
+        Z3_ast k = (Z3_ast)t;
+        if (!m_eval_watch_registered.insert(k).second)
+            return;
+        this->add(t);
+    }
+
+    void ensure_minimal_eval_watch_registered()
+    {
+        if (m_minimal_eval_watch_registered)
+            return;
+
+        std::size_t n = 0;
+        for (const auto &base : m_cmap.z3_bases)
+        {
+            if (is_bv_to_int_app(base))
+            {
+                register_watch_term(base.arg(0));
+                ++n;
+            }
+            else if (base.is_const() && base.get_sort().is_int() && !base.is_numeral())
+            {
+                register_watch_term(base);
+                ++n;
+            }
+        }
+
+        m_minimal_eval_watch_registered = true;
+        LOG_INFO(g_log, "init",
+                 "minimal fixed watch: registered " + std::to_string(n) +
+                     " coeff base term(s) for final_fixed_value_check");
+    }
+
     static void collect_eval_terms_from_polyterm_rec(const expr &p,
                                                      std::unordered_set<Z3_ast> &seen,
                                                      std::vector<expr> &out)
@@ -2102,6 +2202,15 @@ class PolyPropagator : public user_propagator_base
 
     void register_eval_terms_for_eqmod_atom(const expr &A, const expr &B, const expr &M)
     {
+        (void)A;
+        (void)B;
+        (void)M;
+        if (ENABLE_MINIMAL_FIXED_WATCH)
+        {
+            ensure_minimal_eval_watch_registered();
+            return;
+        }
+
         std::unordered_set<Z3_ast> seen;
         std::vector<expr> terms;
         collect_eval_terms_from_polyterm_rec(A, seen, terms);
@@ -2113,6 +2222,16 @@ class PolyPropagator : public user_propagator_base
 
     void register_eval_terms_for_eqmod_atom(const expr &A, const expr &B, const expr &M1, const expr &M2)
     {
+        (void)A;
+        (void)B;
+        (void)M1;
+        (void)M2;
+        if (ENABLE_MINIMAL_FIXED_WATCH)
+        {
+            ensure_minimal_eval_watch_registered();
+            return;
+        }
+
         std::unordered_set<Z3_ast> seen;
         std::vector<expr> terms;
         collect_eval_terms_from_polyterm_rec(A, seen, terms);
@@ -2129,7 +2248,10 @@ class PolyPropagator : public user_propagator_base
     {
         std::unordered_set<Z3_ast> eval_seen;
         std::vector<expr> eval_terms;
-        collect_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
+        if (ENABLE_MINIMAL_FIXED_WATCH)
+            collect_minimal_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
+        else
+            collect_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
 
         for (const auto &t : eval_terms)
         {
@@ -3583,11 +3705,17 @@ public:
         m_RE.build(cfZ, m_ring_vars, ringorder_lp);
         cmap_bind_ring_indices(m_cmap, m_RE, m_indet_ring_names);
 
+        if (ENABLE_MINIMAL_FIXED_WATCH)
+            ensure_minimal_eval_watch_registered();
+
         for (size_t i = 0; i < eqps.size(); ++i)
         {
             this->add(eqps[i]);
-            this->add(lhs[i]);
-            this->add(rhs[i]);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                this->add(lhs[i]);
+                this->add(rhs[i]);
+            }
 
             std::string label = "eqP#" + std::to_string(i);
             m_label[(Z3_ast)eqps[i]] = label;
@@ -3600,8 +3728,11 @@ public:
             for (auto &e : cp.coeff_eqs)
                 this->add(e);
             this->add(cp.coeff_neq_disj);
-            for (auto &ci : cp.coeff_ints)
-                this->add(ci);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                for (auto &ci : cp.coeff_ints)
+                    this->add(ci);
+            }
 
             m_eqp.push_back(std::move(cp));
         }
@@ -3613,8 +3744,11 @@ public:
         {
             auto &em = eqmodsP1[i];
             this->add(em);
-            for (unsigned j = 0; j < 3; ++j)
-                this->add(em.arg(j));
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                for (unsigned j = 0; j < 3; ++j)
+                    this->add(em.arg(j));
+            }
             register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2));
 
             std::string label = "eqmodP1#" + std::to_string(i);
@@ -3635,8 +3769,11 @@ public:
         {
             auto &em = eqmodsP2[i];
             this->add(em);
-            for (unsigned j = 0; j < 4; ++j)
-                this->add(em.arg(j));
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                for (unsigned j = 0; j < 4; ++j)
+                    this->add(em.arg(j));
+            }
             register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2), em.arg(3));
 
             std::string label = "eqmodP2#" + std::to_string(i);
@@ -3783,8 +3920,11 @@ public:
         {
             expr A = t.arg(0), B = t.arg(1);
             this->add(t);
-            this->add(A);
-            this->add(B);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                this->add(A);
+                this->add(B);
+            }
 
             std::string label = "eqP#" + std::to_string((int)m_eqp.size());
             m_label[(Z3_ast)t] = label;
@@ -3797,8 +3937,11 @@ public:
             for (auto &e : cp.coeff_eqs)
                 this->add(e);
             this->add(cp.coeff_neq_disj);
-            for (auto &ci : cp.coeff_ints)
-                this->add(ci);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                for (auto &ci : cp.coeff_ints)
+                    this->add(ci);
+            }
 
             m_eqp.push_back(std::move(cp));
 
@@ -3811,9 +3954,12 @@ public:
         {
             expr A = t.arg(0), B = t.arg(1), M = t.arg(2);
             this->add(t);
-            this->add(A);
-            this->add(B);
-            this->add(M);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                this->add(A);
+                this->add(B);
+                this->add(M);
+            }
             register_eval_terms_for_eqmod_atom(A, B, M);
 
             size_t idx = m_eqmodp.size();
@@ -3842,10 +3988,13 @@ public:
 
             expr A = t.arg(0), B = t.arg(1), M1 = t.arg(2), M2 = t.arg(3);
             this->add(t);
-            this->add(A);
-            this->add(B);
-            this->add(M1);
-            this->add(M2);
+            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            {
+                this->add(A);
+                this->add(B);
+                this->add(M1);
+                this->add(M2);
+            }
             register_eval_terms_for_eqmod_atom(A, B, M1, M2);
 
             size_t idx = m_eqmodp2.size();
@@ -3872,6 +4021,12 @@ public:
 
     void fixed(const expr &t, const expr &v) override
     {
+        if (ENABLE_MINIMAL_FIXED_WATCH && !t.is_bool())
+        {
+            cache_fixed_expr(t, v);
+            return;
+        }
+
         ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
         log_fixed(t, v);
         cache_fixed_expr(t, v);
@@ -3988,6 +4143,8 @@ int main(int argc, char **argv)
                 ENABLE_AUTO_LEMMAS = false;
             else if (a == "--disable-final-fixed-value-check")
                 ENABLE_FINAL_FIXED_VALUE_CHECK = false;
+            else if (a == "--minimal-fixed-watch")
+                ENABLE_MINIMAL_FIXED_WATCH = true;
             else if (a == "--show-model")
                 show_model_on_terminal = true;
             else if (a == "--rewrite-log")
