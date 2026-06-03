@@ -111,6 +111,7 @@ static bool DISABLE_REWRITE_CACHE = false;
 static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
+static bool ENABLE_EQMOD_TRUE_LEMMAS = false;
 // When true, register only coeff bases (BV leaves / Int indets) needed for
 // final_fixed_value_check, instead of coeff_int composites and full int/BV subtrees.
 static bool ENABLE_MINIMAL_FIXED_WATCH = false;
@@ -260,6 +261,7 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--enable-expression-growth-check]"
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--minimal-fixed-watch]"
+          " [--enable-eqmod-true-lemmas]"
           " [--show-model]"
           " [--rewrite-log] [--groebner-ring-order]\n";
 }
@@ -1544,6 +1546,7 @@ struct EqModPCompiled
     std::string u_name;      // fresh quotient variable in ring
     poly U_poly = nullptr;   // owned: monomial u_t
     poly true_gen = nullptr; // owned: D - U_poly * M_poly
+    Z3_lbool propagated_truth = Z3_L_UNDEF;
 };
 
 static bool extract_modulus_from_polyconst(const expr &Mterm, mpz_class &m_out)
@@ -1664,6 +1667,7 @@ struct EqModP2Compiled
     poly U1_poly = nullptr;  // owned: monomial u1
     poly U2_poly = nullptr;  // owned: monomial u2
     poly true_gen = nullptr; // owned: D - U1_poly*M1_poly - U2_poly*M2_poly
+    Z3_lbool propagated_truth = Z3_L_UNDEF;
 };
 
 static EqModP2Compiled compile_eqmodP2_singular(const expr &atom,
@@ -1747,6 +1751,9 @@ class PolyPropagator : public user_propagator_base
 
     bool m_minimal_eval_watch_registered = false;
     std::unordered_set<Z3_ast> m_eval_watch_registered;
+    std::size_t m_last_eqmod_true_lemma_true_count = static_cast<std::size_t>(-1);
+    std::size_t m_last_eqmod_true_lemma_p1_count = static_cast<std::size_t>(-1);
+    std::size_t m_last_eqmod_true_lemma_p2_count = static_cast<std::size_t>(-1);
 
     struct BoolTrailEntry
     {
@@ -2063,6 +2070,29 @@ class PolyPropagator : public user_propagator_base
         }
 
         return false;
+    }
+
+    std::size_t true_context_atom_count() const
+    {
+        std::size_t n = 0;
+        for (const auto &ep : m_eqp)
+            if (lbool_of(ep.atom) == Z3_L_TRUE)
+                ++n;
+        for (const auto &cp : m_eqmodp)
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ++n;
+        for (const auto &cp : m_eqmodp2)
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ++n;
+        return n;
+    }
+
+    bool all_eqp_fixed() const
+    {
+        for (const auto &ep : m_eqp)
+            if (lbool_of(ep.atom) == Z3_L_UNDEF)
+                return false;
+        return true;
     }
 
     static void collect_int_bv_subterms_rec(const expr &e,
@@ -2473,6 +2503,68 @@ class PolyPropagator : public user_propagator_base
         for (auto &a : ants_vec)
             ants.push_back(a);
         this->conflict(ants);
+    }
+
+    bool propagate_true_lemma_or_conflict(const expr &atom,
+                                          Z3_lbool current_value,
+                                          std::vector<expr> ants_vec,
+                                          const std::string &reason)
+    {
+        if (current_value == Z3_L_TRUE)
+            return false;
+
+        if (current_value == Z3_L_FALSE)
+        {
+            ants_vec.push_back(atom);
+            LOG_INFO(g_log, "singular", reason + "; conflicting with FALSE assignment");
+            conflict_with(ants_vec);
+            return true;
+        }
+
+        expr_vector ants(ctx());
+        for (auto &a : ants_vec)
+            ants.push_back(a);
+
+        this->add(atom);
+        LOG_INFO(g_log, "singular", reason + "; propagating TRUE lemma");
+        this->propagate(ants, atom);
+        return false;
+    }
+
+    void reset_propagated_truth_flags()
+    {
+        for (auto &cp : m_eqmodp)
+            cp.propagated_truth = Z3_L_UNDEF;
+        for (auto &cp : m_eqmodp2)
+            cp.propagated_truth = Z3_L_UNDEF;
+        m_last_eqmod_true_lemma_true_count = static_cast<std::size_t>(-1);
+        m_last_eqmod_true_lemma_p1_count = static_cast<std::size_t>(-1);
+        m_last_eqmod_true_lemma_p2_count = static_cast<std::size_t>(-1);
+    }
+
+    void collect_true_context_antecedents(std::vector<expr> &ants_out) const
+    {
+        for (const auto &ep : m_eqp)
+        {
+            if (ep.D_full == nullptr)
+                continue;
+            if (lbool_of(ep.atom) == Z3_L_TRUE)
+                ants_out.push_back(ep.atom);
+        }
+
+        for (const auto &cp : m_eqmodp)
+        {
+            if (cp.true_gen == nullptr)
+                continue;
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ants_out.push_back(cp.atom);
+        }
+
+        for (const auto &cp : m_eqmodp2)
+        {
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ants_out.push_back(cp.atom);
+        }
     }
 
     bool same_modulus_across_eqmodp() const
@@ -3253,6 +3345,8 @@ class PolyPropagator : public user_propagator_base
 
     void check_eqmodP1_conflicts()
     {
+        if (conflict_on_propagated_eqmodP1_true_false())
+            return;
         saturate_auto_lemmas();
         check_eqmodP1_all_false_refutation();
         check_eqmodP1_all_true_refutation();
@@ -3277,6 +3371,8 @@ class PolyPropagator : public user_propagator_base
     void check_eqmodP1_conflicts_when_ready()
     {
         if (m_eqmodp.empty())
+            return;
+        if (conflict_on_propagated_eqmodP1_true_false())
             return;
         if (!all_eqp_eqmodp_fixed())
             return;
@@ -3650,8 +3746,277 @@ class PolyPropagator : public user_propagator_base
         LOG_INFO(g_log, "singular", "=== eqmodP2(mixed) refutation end ===");
     }
 
+    bool conflict_on_propagated_eqmodP1_true_false()
+    {
+        if (!ENABLE_EQMOD_TRUE_LEMMAS)
+            return false;
+
+        for (auto &cp : m_eqmodp)
+        {
+            if (cp.propagated_truth != Z3_L_TRUE)
+                continue;
+            if (lbool_of(cp.atom) != Z3_L_FALSE)
+                continue;
+
+            std::vector<expr> ants;
+            collect_true_context_antecedents(ants);
+            ants.push_back(cp.atom);
+            LOG_INFO(g_log, "singular",
+                     "[eqmodP1] propagated TRUE refute: " + label_of(cp.atom) +
+                         " was already implied TRUE; conflicting with FALSE assignment without mixed GB");
+            conflict_with(ants);
+            return true;
+        }
+        return false;
+    }
+
+    bool conflict_on_propagated_eqmodP2_true_false()
+    {
+        if (!ENABLE_EQMOD_TRUE_LEMMAS)
+            return false;
+
+        for (auto &cp : m_eqmodp2)
+        {
+            if (cp.propagated_truth != Z3_L_TRUE)
+                continue;
+            if (lbool_of(cp.atom) != Z3_L_FALSE)
+                continue;
+
+            std::vector<expr> ants;
+            collect_true_context_antecedents(ants);
+            ants.push_back(cp.atom);
+            LOG_INFO(g_log, "singular",
+                     "[eqmodP2] propagated TRUE refute: " + label_of(cp.atom) +
+                         " was already implied TRUE; conflicting with FALSE assignment without mixed GB");
+            conflict_with(ants);
+            return true;
+        }
+        return false;
+    }
+
+    template <typename CompiledAtom, typename SameModuli, typename AppendModulusGens, typename ConflictCheck>
+    void propagate_true_lemmas_from_context_impl(std::vector<CompiledAtom> &atoms,
+                                                 const std::string &kind,
+                                                 const std::string &gb_label,
+                                                 SameModuli same_moduli,
+                                                 AppendModulusGens append_modulus_gens,
+                                                 ConflictCheck conflict_check)
+    {
+        if (atoms.empty())
+            return;
+
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        std::vector<expr> true_ants;
+        std::vector<poly> base_gens;
+        collect_true_eqp_generators(base_gens, true_ants);
+        collect_true_eqmod_true_generators(base_gens, true_ants);
+        collect_true_eqmodp2_true_generators(base_gens, true_ants);
+
+        struct BvFixedGroup
+        {
+            size_t rep = 0;
+            std::vector<size_t> members;
+        };
+
+        std::vector<BvFixedGroup> groups;
+        for (size_t idx = 0; idx < atoms.size(); ++idx)
+        {
+            auto &cp = atoms[idx];
+            Z3_lbool current_value = lbool_of(cp.atom);
+            if (current_value == Z3_L_TRUE || cp.propagated_truth == Z3_L_TRUE)
+                continue;
+
+            bool placed = false;
+            for (auto &group : groups)
+            {
+                auto &rep = atoms[group.rep];
+                if (same_moduli(cp, rep))
+                {
+                    group.members.push_back(idx);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed)
+                groups.push_back({idx, {idx}});
+        }
+
+        for (auto &group : groups)
+        {
+            auto &rep = atoms[group.rep];
+            std::vector<poly> gens;
+            gens.reserve(base_gens.size() + 2);
+            append_modulus_gens(rep, gens);
+            for (auto p : base_gens)
+                if (p)
+                    gens.push_back(p_Copy(p, R));
+
+            bool needs_gb = false;
+            for (size_t idx : group.members)
+            {
+                auto &cp = atoms[idx];
+                if (cp.D != nullptr && !gens.empty())
+                {
+                    needs_gb = true;
+                    break;
+                }
+            }
+
+            ideal I = nullptr;
+            ideal G = nullptr;
+            if (needs_gb)
+            {
+                I = ideal_from_polys(gens, m_RE);
+                G = groebner_std(I, R, gb_label);
+            }
+            else
+            {
+                for (auto &p : gens)
+                    delete_poly_if_nonnull(p, R);
+            }
+
+            bool hit_conflict = false;
+            for (size_t idx : group.members)
+            {
+                auto &cp = atoms[idx];
+                bool in = false;
+                if (cp.D == nullptr)
+                    in = true;
+                else if (G != nullptr)
+                {
+                    poly target = p_Copy(cp.D, R);
+                    poly nf = kNF(G, NULL, target, 0, 0);
+                    in = nf_is_zero(nf);
+                    delete_poly_if_nonnull(nf, R);
+                    delete_poly_if_nonnull(target, R);
+                }
+
+                if (in)
+                {
+                    cp.propagated_truth = Z3_L_TRUE;
+                    if (propagate_true_lemma_or_conflict(
+                            cp.atom,
+                            lbool_of(cp.atom),
+                            true_ants,
+                            "[" + kind + "] eqmod true/context lemma: " + label_of(cp.atom) + " is implied TRUE"))
+                    {
+                        hit_conflict = true;
+                        break;
+                    }
+                }
+            }
+
+            if (G)
+                idDelete(&G);
+            if (I)
+                idDelete(&I);
+
+            if (hit_conflict || conflict_check())
+            {
+                for (auto &p : base_gens)
+                    delete_poly_if_nonnull(p, R);
+                return;
+            }
+        }
+
+        for (auto &p : base_gens)
+            delete_poly_if_nonnull(p, R);
+    }
+
+    static bool same_optional_poly(poly a, poly b, const ring R)
+    {
+        if (a == nullptr || b == nullptr)
+            return a == b;
+        return poly_equal(a, b, R);
+    }
+
+    void propagate_eqmodP1_true_lemmas_from_context_impl()
+    {
+        ring R = m_RE.R;
+        propagate_true_lemmas_from_context_impl(
+            m_eqmodp,
+            "eqmodP1",
+            "eqmodP1-true-lemma",
+            [R](const EqModPCompiled &a, const EqModPCompiled &b)
+            {
+                return same_optional_poly(a.M_poly, b.M_poly, R);
+            },
+            [R](const EqModPCompiled &cp, std::vector<poly> &gens)
+            {
+                if (cp.M_poly)
+                    gens.push_back(p_Copy(cp.M_poly, R));
+            },
+            [this]()
+            {
+                return conflict_on_propagated_eqmodP1_true_false();
+            });
+    }
+
+    void propagate_eqmodP2_true_lemmas_from_context_impl()
+    {
+        ring R = m_RE.R;
+        propagate_true_lemmas_from_context_impl(
+            m_eqmodp2,
+            "eqmodP2",
+            "eqmodP2-true-lemma",
+            [R](const EqModP2Compiled &a, const EqModP2Compiled &b)
+            {
+                return same_optional_poly(a.M1_poly, b.M1_poly, R) &&
+                       same_optional_poly(a.M2_poly, b.M2_poly, R);
+            },
+            [R](const EqModP2Compiled &cp, std::vector<poly> &gens)
+            {
+                if (cp.M1_poly)
+                    gens.push_back(p_Copy(cp.M1_poly, R));
+                if (cp.M2_poly)
+                    gens.push_back(p_Copy(cp.M2_poly, R));
+            },
+            [this]()
+            {
+                return conflict_on_propagated_eqmodP2_true_false();
+            });
+    }
+
+    void propagate_eqmod_true_lemmas_from_context()
+    {
+        if (!ENABLE_EQMOD_TRUE_LEMMAS)
+            return;
+        if (m_eqmodp.empty() && m_eqmodp2.empty())
+            return;
+
+        ring R = m_RE.R;
+        if (R == nullptr)
+            return;
+        rChangeCurrRing(R);
+
+        if (!all_eqp_fixed())
+            return;
+
+        std::size_t true_count = true_context_atom_count();
+        std::size_t p1_count = m_eqmodp.size();
+        std::size_t p2_count = m_eqmodp2.size();
+        if (true_count == m_last_eqmod_true_lemma_true_count &&
+            p1_count == m_last_eqmod_true_lemma_p1_count &&
+            p2_count == m_last_eqmod_true_lemma_p2_count)
+            return;
+        m_last_eqmod_true_lemma_true_count = true_count;
+        m_last_eqmod_true_lemma_p1_count = p1_count;
+        m_last_eqmod_true_lemma_p2_count = p2_count;
+
+        if (!m_eqmodp.empty())
+            propagate_eqmodP1_true_lemmas_from_context_impl();
+        if (conflict_on_propagated_eqmodP1_true_false())
+            return;
+        if (!m_eqmodp2.empty())
+            propagate_eqmodP2_true_lemmas_from_context_impl();
+    }
+
     void check_eqmodP2_conflicts()
     {
+        if (conflict_on_propagated_eqmodP2_true_false())
+            return;
         saturate_auto_lemmas();
         check_eqmodP2_all_false_refutation();
         check_eqmodP2_all_true_refutation();
@@ -3661,6 +4026,8 @@ class PolyPropagator : public user_propagator_base
     void check_eqmodP2_conflicts_when_ready()
     {
         if (m_eqmodp2.empty())
+            return;
+        if (conflict_on_propagated_eqmodP2_true_false())
             return;
         if (!all_eqp_eqmodp2_fixed())
             return;
@@ -3907,6 +4274,8 @@ public:
                 m_fixed_ast_trail.pop_back();
                 restore_fixed_ast_entry(entry);
             }
+
+            reset_propagated_truth_flags();
         }
     }
     void eq(const expr &, const expr &) override {}
@@ -3976,6 +4345,7 @@ public:
                                                          m_qvar_names[idx]);
             m_eqmodp.push_back(std::move(cp));
 
+            propagate_eqmod_true_lemmas_from_context();
             check_eqmodP1_conflicts_when_ready();
             check_eqmodP2_conflicts_when_ready();
             return;
@@ -4014,6 +4384,7 @@ public:
             m_compiled_eqmodp2_atoms.insert((Z3_ast)t);
             m_eqmodp2.push_back(std::move(cp));
 
+            propagate_eqmod_true_lemmas_from_context();
             check_eqmodP2_conflicts_when_ready();
             return;
         }
@@ -4042,18 +4413,21 @@ public:
             if (t.is_app() && t.decl().name().str() == "eqP" && t.num_args() == 2)
             {
                 on_fixed_eqP(t, bv);
+                propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP1_conflicts_when_ready();
                 check_eqmodP2_conflicts_when_ready();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
             {
+                propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP1_conflicts_when_ready();
                 check_eqmodP2_conflicts_when_ready();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP2" && t.num_args() == 4)
             {
+                propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP2_conflicts_when_ready();
             }
         }
@@ -4145,6 +4519,8 @@ int main(int argc, char **argv)
                 ENABLE_FINAL_FIXED_VALUE_CHECK = false;
             else if (a == "--minimal-fixed-watch")
                 ENABLE_MINIMAL_FIXED_WATCH = true;
+            else if (a == "--enable-eqmod-true-lemmas")
+                ENABLE_EQMOD_TRUE_LEMMAS = true;
             else if (a == "--show-model")
                 show_model_on_terminal = true;
             else if (a == "--rewrite-log")
