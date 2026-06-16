@@ -27,6 +27,7 @@
 #include <functional>
 
 #include "util/fmt_duration.hpp"
+#include "util/eq_experiment.hpp"
 #include "util/logger.hpp"
 #include "util/rewrite.hpp"
 
@@ -117,6 +118,7 @@ static bool ENABLE_EQMOD_TRUE_LEMMAS = false;
 static bool ENABLE_MINIMAL_FIXED_WATCH = false;
 static bool LOG_CONFLICT_ANTS = false;
 static bool USE_GROEBNER_RING_VAR_ORDER = true;
+static util::EqExperimentOptions g_eq_experiment_options;
 
 struct AccumulatedTiming
 {
@@ -262,6 +264,8 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--minimal-fixed-watch]"
           " [--enable-eqmod-true-lemmas]"
+       << util::eq_experiment_usage() <<
+          ""
           " [--show-model]"
           " [--rewrite-log] [--groebner-ring-order]\n";
 }
@@ -1721,6 +1725,7 @@ static EqModP2Compiled compile_eqmodP2_singular(const expr &atom,
 }
 
 // -------------------------- Propagator --------------------------
+
 class PolyPropagator : public user_propagator_base
 {
     IndetEnv m_env;
@@ -1748,6 +1753,9 @@ class PolyPropagator : public user_propagator_base
     RingEnv m_RE;
 
     std::unordered_map<Z3_ast, std::string> m_label;
+    std::unordered_set<Z3_ast> m_registered_terms;
+    util::EqExperimentOptions m_eq_experiment_options;
+    util::EqExperimentTracker m_eq_experiment;
 
     bool m_minimal_eval_watch_registered = false;
     std::unordered_set<Z3_ast> m_eval_watch_registered;
@@ -1785,6 +1793,25 @@ class PolyPropagator : public user_propagator_base
         if (it != m_label.end())
             return it->second;
         return e.to_string();
+    }
+
+    std::string format_fixed_value_for_log(const expr &t) const
+    {
+        expr v = t;
+        if (!try_get_fixed_expr(t, v))
+            return "<not-fixed>";
+        return v.to_string();
+    }
+
+    bool is_registered_term(const expr &e) const
+    {
+        return m_registered_terms.count((Z3_ast)e) != 0;
+    }
+
+    void tracked_add(const expr &e)
+    {
+        m_registered_terms.insert((Z3_ast)e);
+        this->add(e);
     }
 
     void log_fixed(const expr &t, const expr &v)
@@ -2173,7 +2200,7 @@ class PolyPropagator : public user_propagator_base
         Z3_ast k = (Z3_ast)t;
         if (!m_eval_watch_registered.insert(k).second)
             return;
-        this->add(t);
+        tracked_add(t);
     }
 
     void ensure_minimal_eval_watch_registered()
@@ -2247,7 +2274,7 @@ class PolyPropagator : public user_propagator_base
         collect_eval_terms_from_polyterm_rec(B, seen, terms);
         collect_eval_terms_from_polyterm_rec(M, seen, terms);
         for (const auto &t : terms)
-            this->add(t);
+            tracked_add(t);
     }
 
     void register_eval_terms_for_eqmod_atom(const expr &A, const expr &B, const expr &M1, const expr &M2)
@@ -2269,7 +2296,7 @@ class PolyPropagator : public user_propagator_base
         collect_eval_terms_from_polyterm_rec(M1, seen, terms);
         collect_eval_terms_from_polyterm_rec(M2, seen, terms);
         for (const auto &t : terms)
-            this->add(t);
+            tracked_add(t);
     }
 
     void collect_fixed_ants_from_polyterm(const expr &p,
@@ -2480,7 +2507,7 @@ class PolyPropagator : public user_propagator_base
         ants.push_back(ante);
         for (auto &cns : cons)
         {
-            this->add(cns);
+            tracked_add(cns);
             log_propagate(ante, cns);
             this->propagate(ants, cns);
         }
@@ -2490,7 +2517,7 @@ class PolyPropagator : public user_propagator_base
     {
         expr_vector ants(ctx());
         ants.push_back(ante);
-        this->add(conseq);
+        tracked_add(conseq);
         log_propagate(ante, conseq);
         this->propagate(ants, conseq);
     }
@@ -2525,7 +2552,7 @@ class PolyPropagator : public user_propagator_base
         for (auto &a : ants_vec)
             ants.push_back(a);
 
-        this->add(atom);
+        tracked_add(atom);
         LOG_INFO(g_log, "singular", reason + "; propagating TRUE lemma");
         this->propagate(ants, atom);
         return false;
@@ -4053,14 +4080,18 @@ public:
                    const std::vector<std::string> &indet_ring_names,
                    const std::vector<std::string> &ring_vars,
                    const std::vector<std::string> &qvar_names,
-                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names)
+                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names,
+                   const util::EqExperimentOptions &eq_experiment_options)
         : user_propagator_base(s), m_env(env), m_cmap(cmap),
           m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names),
-          m_eqmodp2_qvar_names(eqmodp2_qvar_names)
+          m_eqmodp2_qvar_names(eqmodp2_qvar_names),
+          m_eq_experiment_options(eq_experiment_options),
+          m_eq_experiment(g_log, true)
     {
         init_singular();
 
         register_fixed();
+        register_eq();
         register_final();
         register_created();
 
@@ -4077,11 +4108,11 @@ public:
 
         for (size_t i = 0; i < eqps.size(); ++i)
         {
-            this->add(eqps[i]);
+            tracked_add(eqps[i]);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
-                this->add(lhs[i]);
-                this->add(rhs[i]);
+                tracked_add(lhs[i]);
+                tracked_add(rhs[i]);
             }
 
             std::string label = "eqP#" + std::to_string(i);
@@ -4093,12 +4124,12 @@ public:
                                                   m_Nc, m_Mi);
 
             for (auto &e : cp.coeff_eqs)
-                this->add(e);
-            this->add(cp.coeff_neq_disj);
+                tracked_add(e);
+            tracked_add(cp.coeff_neq_disj);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
                 for (auto &ci : cp.coeff_ints)
-                    this->add(ci);
+                    tracked_add(ci);
             }
 
             m_eqp.push_back(std::move(cp));
@@ -4110,11 +4141,11 @@ public:
         for (size_t i = 0; i < eqmodsP1.size(); ++i)
         {
             auto &em = eqmodsP1[i];
-            this->add(em);
+            tracked_add(em);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
                 for (unsigned j = 0; j < 3; ++j)
-                    this->add(em.arg(j));
+                    tracked_add(em.arg(j));
             }
             register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2));
 
@@ -4135,11 +4166,11 @@ public:
         for (size_t i = 0; i < eqmodsP2.size(); ++i)
         {
             auto &em = eqmodsP2[i];
-            this->add(em);
+            tracked_add(em);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
                 for (unsigned j = 0; j < 4; ++j)
-                    this->add(em.arg(j));
+                    tracked_add(em.arg(j));
             }
             register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2), em.arg(3));
 
@@ -4156,6 +4187,12 @@ public:
             m_compiled_eqmodp2_atoms.insert((Z3_ast)em);
             m_eqmodp2.push_back(std::move(cp));
         }
+
+        m_eq_experiment.register_configured_terms(ctx(), eqps, m_eq_experiment_options,
+                                                  [this](const expr &t)
+                                                  {
+                                                      tracked_add(t);
+                                                  });
     }
 
     PolyPropagator(context &c,
@@ -4164,13 +4201,17 @@ public:
                    const std::vector<std::string> &indet_ring_names,
                    const std::vector<std::string> &ring_vars,
                    const std::vector<std::string> &qvar_names,
-                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names)
+                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names,
+                   const util::EqExperimentOptions &eq_experiment_options)
         : user_propagator_base(c), m_env(env), m_cmap(cmap),
           m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names),
-          m_eqmodp2_qvar_names(eqmodp2_qvar_names)
+          m_eqmodp2_qvar_names(eqmodp2_qvar_names),
+          m_eq_experiment_options(eq_experiment_options),
+          m_eq_experiment(g_log, false)
     {
         init_singular();
         register_fixed();
+        register_eq();
         register_final();
         register_created();
 
@@ -4278,7 +4319,18 @@ public:
             reset_propagated_truth_flags();
         }
     }
-    void eq(const expr &, const expr &) override {}
+    void eq(const expr &x, const expr &y) override
+    {
+        m_eq_experiment.on_eq(x, y,
+                              [this](const expr &e)
+                              {
+                                  return is_registered_term(e);
+                              },
+                              [this](const expr &e)
+                              {
+                                  return format_fixed_value_for_log(e);
+                              });
+    }
 
     void created(const expr &t) override
     {
@@ -4288,11 +4340,11 @@ public:
         if (t.decl().name().str() == "eqP" && t.num_args() == 2)
         {
             expr A = t.arg(0), B = t.arg(1);
-            this->add(t);
+            tracked_add(t);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
-                this->add(A);
-                this->add(B);
+                tracked_add(A);
+                tracked_add(B);
             }
 
             std::string label = "eqP#" + std::to_string((int)m_eqp.size());
@@ -4304,12 +4356,12 @@ public:
                                                   m_Nc, m_Mi);
 
             for (auto &e : cp.coeff_eqs)
-                this->add(e);
-            this->add(cp.coeff_neq_disj);
+                tracked_add(e);
+            tracked_add(cp.coeff_neq_disj);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
                 for (auto &ci : cp.coeff_ints)
-                    this->add(ci);
+                    tracked_add(ci);
             }
 
             m_eqp.push_back(std::move(cp));
@@ -4322,12 +4374,12 @@ public:
         if (t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
         {
             expr A = t.arg(0), B = t.arg(1), M = t.arg(2);
-            this->add(t);
+            tracked_add(t);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
-                this->add(A);
-                this->add(B);
-                this->add(M);
+                tracked_add(A);
+                tracked_add(B);
+                tracked_add(M);
             }
             register_eval_terms_for_eqmod_atom(A, B, M);
 
@@ -4357,13 +4409,13 @@ public:
                 return;
 
             expr A = t.arg(0), B = t.arg(1), M1 = t.arg(2), M2 = t.arg(3);
-            this->add(t);
+            tracked_add(t);
             if (!ENABLE_MINIMAL_FIXED_WATCH)
             {
-                this->add(A);
-                this->add(B);
-                this->add(M1);
-                this->add(M2);
+                tracked_add(A);
+                tracked_add(B);
+                tracked_add(M1);
+                tracked_add(M2);
             }
             register_eval_terms_for_eqmod_atom(A, B, M1, M2);
 
@@ -4395,12 +4447,14 @@ public:
         if (ENABLE_MINIMAL_FIXED_WATCH && !t.is_bool())
         {
             cache_fixed_expr(t, v);
+            m_eq_experiment.on_fixed(t, v);
             return;
         }
 
         ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
         log_fixed(t, v);
         cache_fixed_expr(t, v);
+        m_eq_experiment.on_fixed(t, v);
 
         if (t.is_numeral())
             return;
@@ -4442,12 +4496,14 @@ public:
             if (final_fixed_value_check_eqmodP1())
                 final_fixed_value_check_eqmodP2();
         }
+        m_eq_experiment.print_summary(std::cout);
         std::cout << "===== [final] =====\n";
     }
 
     user_propagator_base *fresh(context &nctx) override
     {
-        return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars, m_qvar_names, m_eqmodp2_qvar_names);
+        return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars,
+                                  m_qvar_names, m_eqmodp2_qvar_names, m_eq_experiment_options);
     }
 };
 
@@ -4533,10 +4589,24 @@ int main(int argc, char **argv)
                 PRINT_FIXED_ALL = false;
             else
             {
-                std::cerr << "Unknown option: " << a << "\n";
-                print_usage(std::cerr, argv[0]);
-                runlog << "Unknown option: " << a << "\n";
-                return 1;
+                std::string eqexp_error;
+                int opt_index = i;
+                if (util::parse_eq_experiment_option(a, opt_index, argc, argv,
+                                                     g_eq_experiment_options, eqexp_error))
+                {
+                    i = opt_index;
+                }
+                else
+                {
+                    std::cerr << "Unknown option: " << a << "\n";
+                    if (!eqexp_error.empty())
+                        std::cerr << eqexp_error << "\n";
+                    print_usage(std::cerr, argv[0]);
+                    runlog << "Unknown option: " << a << "\n";
+                    if (!eqexp_error.empty())
+                        runlog << eqexp_error << "\n";
+                    return 1;
+                }
             }
         }
 
@@ -4741,7 +4811,8 @@ int main(int argc, char **argv)
                           std::to_string(eqmodsP2.size()) + " eqmodP2 constraint(s).");
 
             PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1, eqmodsP2,
-                              env, cmap, indet_ring_names, ring_vars, qvar_names, eqmodp2_qvar_names);
+                              env, cmap, indet_ring_names, ring_vars, qvar_names,
+                              eqmodp2_qvar_names, g_eq_experiment_options);
 
             begin_cli_timed_row(terminal_out, "Solving with Z3:");
             auto solve_t0 = clk::now();
