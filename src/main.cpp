@@ -28,6 +28,7 @@
 
 #include "util/fmt_duration.hpp"
 #include "util/eq_experiment.hpp"
+#include "util/gb_preprocess.hpp"
 #include "util/logger.hpp"
 #include "util/rewrite.hpp"
 
@@ -88,21 +89,6 @@ static bool ENABLE_ALL_TRUE = true;
 static bool ENABLE_MIXED = true;
 static bool ALL_FALSE_ASSUME_M_PRIME = false;
 static bool ENABLE_REWRITING = true;
-// The OCaml-style rewriter extracts variable assignments by default. Optional
-// safety/coverage knobs remain exposed:
-//   * PRESERVE_EQMODP1_VARS (default false): opt back into the older
-//     conservative mode that never extracts a rule whose LHS appears in any
-//     eqmodP1 atom.
-//   * ENABLE_SUBEXPRESSION_RULES (default false): opt into separable
-//     sub-expression assignment extraction.
-//   * ENABLE_EXPRESSION_GROWTH_CHECK (default false): skip rewrite rules whose
-//     RHS grows beyond RewriteOptions::max_expression_growth.
-//   * ENABLE_REWRITE_SINGULAR_NF (default true): allow Singular-backed zero
-//     checks during rewrite normalization.
-//   * ENABLE_MODULI_NORMALIZATION (default false): run normalize_poly_under_moduli
-//     during eqmodP1 simplification in the rewrite pipeline.
-//   * DISABLE_REWRITE_CACHE / VERIFY_REWRITE_LOOKUPS (default false): debug
-//     cache/memo correctness by disabling or rechecking rewrite memo hits.
 static bool PRESERVE_EQMODP1_VARS = false;
 static bool ENABLE_SUBEXPRESSION_RULES = false;
 static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
@@ -113,8 +99,8 @@ static bool VERIFY_REWRITE_LOOKUPS = false;
 static bool ENABLE_AUTO_LEMMAS = false;
 static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
 static bool ENABLE_EQMOD_TRUE_LEMMAS = false;
-// When true, register only coeff bases (BV leaves / Int indets) needed for
-// final_fixed_value_check, instead of coeff_int composites and full int/BV subtrees.
+static bool ENABLE_GB_PREPROCESS = false;
+static bool VERIFY_GB_PREPROCESS = false;
 static bool ENABLE_MINIMAL_FIXED_WATCH = false;
 static bool LOG_CONFLICT_ANTS = false;
 static bool USE_GROEBNER_RING_VAR_ORDER = true;
@@ -264,6 +250,7 @@ static void print_usage(std::ostream &os, const char *prog)
           " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
           " [--disable-final-fixed-value-check] [--minimal-fixed-watch]"
           " [--enable-eqmod-true-lemmas]"
+          " [--enable-gb-preprocess] [--verify-gb-preprocess]"
        << util::eq_experiment_usage() <<
           ""
           " [--show-model]"
@@ -1313,6 +1300,127 @@ static ideal groebner_std(ideal I, const ring R, const std::string &label = "")
 }
 
 static inline bool nf_is_zero(poly nf) { return nf == nullptr; }
+
+struct GroebnerBatchResult
+{
+    std::vector<bool> membership;
+    std::vector<std::string> nf_strings;
+    bool used_preprocess = false;
+};
+
+static std::vector<bool> run_raw_groebner_membership_batch(std::vector<poly> gens,
+                                                           const std::vector<poly> &targets,
+                                                           RingEnv &RE,
+                                                           const ring R,
+                                                           const std::string &gb_label,
+                                                           std::vector<std::string> *nf_out)
+{
+    rChangeCurrRing(R);
+    std::vector<bool> out(targets.size(), false);
+    if (nf_out)
+        nf_out->assign(targets.size(), "not-computed");
+
+    if (gens.empty())
+    {
+        for (std::size_t i = 0; i < targets.size(); ++i)
+        {
+            out[i] = (targets[i] == nullptr);
+            if (nf_out)
+                (*nf_out)[i] = poly_to_string(targets[i], R);
+        }
+        return out;
+    }
+
+    ideal I = ideal_from_polys(gens, RE);
+    ideal G = groebner_std(I, R, gb_label);
+    for (std::size_t i = 0; i < targets.size(); ++i)
+    {
+        if (targets[i] == nullptr)
+        {
+            out[i] = true;
+            if (nf_out)
+                (*nf_out)[i] = "0";
+            continue;
+        }
+        poly nf = kNF(G, NULL, p_Copy(targets[i], R), 0, 0);
+        out[i] = nf_is_zero(nf);
+        if (nf_out)
+            (*nf_out)[i] = poly_to_string(nf, R);
+        delete_poly_if_nonnull(nf, R);
+    }
+    if (G)
+        idDelete(&G);
+    if (I)
+        idDelete(&I);
+    return out;
+}
+
+static GroebnerBatchResult run_groebner_membership_batch(std::vector<poly> gens,
+                                                         const std::vector<poly> &targets_in,
+                                                         RingEnv &RE,
+                                                         const ring R,
+                                                         const std::string &gb_label)
+{
+    rChangeCurrRing(R);
+
+    GroebnerBatchResult result;
+    result.membership.assign(targets_in.size(), false);
+    result.nf_strings.assign(targets_in.size(), "not-computed");
+
+    std::vector<poly> raw_gens_for_verify;
+    std::vector<poly> raw_targets_for_verify;
+    if (VERIFY_GB_PREPROCESS)
+    {
+        for (poly g : gens)
+            raw_gens_for_verify.push_back(copy_poly_or_null(g, R));
+        for (poly t : targets_in)
+            raw_targets_for_verify.push_back(copy_poly_or_null(t, R));
+    }
+
+    std::vector<poly> targets;
+    targets.reserve(targets_in.size());
+    for (poly t : targets_in)
+        targets.push_back(copy_poly_or_null(t, R));
+
+    if (ENABLE_GB_PREPROCESS)
+    {
+        result.used_preprocess = true;
+        GbPreprocessStats stats;
+        preprocess_groebner_inputs(gens, targets, R, gb_label, stats, &g_log);
+    }
+
+    result.membership =
+        run_raw_groebner_membership_batch(std::move(gens), targets, RE, R, gb_label, &result.nf_strings);
+
+    if (VERIFY_GB_PREPROCESS)
+    {
+        std::vector<std::string> raw_nf;
+        std::vector<bool> raw_membership =
+            run_raw_groebner_membership_batch(std::move(raw_gens_for_verify), raw_targets_for_verify, RE, R,
+                                              gb_label + "-verify-raw", &raw_nf);
+        if (raw_membership != result.membership)
+        {
+            std::ostringstream oss;
+            oss << "GB preprocess verification failed [" << gb_label << "]";
+            for (std::size_t i = 0; i < raw_membership.size(); ++i)
+                oss << "\n  target#" << i
+                    << " raw=" << (raw_membership[i] ? "true" : "false")
+                    << " optimized=" << (result.membership[i] ? "true" : "false")
+                    << " raw_nf=" << raw_nf[i]
+                    << " opt_nf=" << result.nf_strings[i];
+            LOG_INFO(g_log, "singular", oss.str());
+            throw std::runtime_error(oss.str());
+        }
+        LOG_INFO(g_log, "singular", "[gb-preprocess] " + gb_label + ": verify membership OK");
+    }
+
+    for (poly &t : targets)
+        delete_poly_if_nonnull(t, R);
+    for (poly &t : raw_targets_for_verify)
+        delete_poly_if_nonnull(t, R);
+
+    return result;
+}
 
 static bool poly_equal(poly a, poly b, const ring R)
 {
@@ -2743,22 +2851,16 @@ class PolyPropagator : public user_propagator_base
         ring R = m_RE.R;
         rChangeCurrRing(R);
 
-        ideal I = ideal_from_polys(gens, m_RE);
-        print_ideal(ideal_label.c_str(), I, R);
-        LOG_INFO(g_log, "singular", "Computing Groebner basis " + gb_label + " = std(" + ideal_label + ") ...");
-        ideal G = groebner_std(I, R, gb_label);
-        print_ideal(gb_label.c_str(), G, R);
-        poly nf = kNF(G, NULL, p_Copy(target, R), 0, 0);
-        bool in = nf_is_zero(nf);
-        nf_out = poly_to_string(nf, R);
-
-        if (nf)
-            p_Delete(&nf, R);
-        if (G)
-            idDelete(&G);
-        if (I)
-            idDelete(&I);
-        return in;
+        std::vector<poly> owned_gens;
+        owned_gens.reserve(gens.size());
+        for (poly g : gens)
+            owned_gens.push_back(copy_poly_or_null(g, R));
+        std::vector<poly> targets = {target};
+        LOG_INFO(g_log, "singular", "Computing Groebner membership " + gb_label + " from " + ideal_label + " ...");
+        GroebnerBatchResult result =
+            run_groebner_membership_batch(std::move(owned_gens), targets, m_RE, R, gb_label);
+        nf_out = result.nf_strings.empty() ? "not-computed" : result.nf_strings[0];
+        return !result.membership.empty() && result.membership[0];
     }
 
     void on_fixed_eqP(const expr &atom, Z3_lbool bv)
@@ -3880,45 +3982,23 @@ class PolyPropagator : public user_propagator_base
                 if (p)
                     gens.push_back(p_Copy(p, R));
 
-            bool needs_gb = false;
+            std::vector<poly> targets;
+            targets.reserve(group.members.size());
             for (size_t idx : group.members)
             {
                 auto &cp = atoms[idx];
-                if (cp.D != nullptr && !gens.empty())
-                {
-                    needs_gb = true;
-                    break;
-                }
+                targets.push_back(cp.D);
             }
 
-            ideal I = nullptr;
-            ideal G = nullptr;
-            if (needs_gb)
-            {
-                I = ideal_from_polys(gens, m_RE);
-                G = groebner_std(I, R, gb_label);
-            }
-            else
-            {
-                for (auto &p : gens)
-                    delete_poly_if_nonnull(p, R);
-            }
+            GroebnerBatchResult batch =
+                run_groebner_membership_batch(std::move(gens), targets, m_RE, R, gb_label);
 
             bool hit_conflict = false;
-            for (size_t idx : group.members)
+            for (std::size_t pos = 0; pos < group.members.size(); ++pos)
             {
+                size_t idx = group.members[pos];
                 auto &cp = atoms[idx];
-                bool in = false;
-                if (cp.D == nullptr)
-                    in = true;
-                else if (G != nullptr)
-                {
-                    poly target = p_Copy(cp.D, R);
-                    poly nf = kNF(G, NULL, target, 0, 0);
-                    in = nf_is_zero(nf);
-                    delete_poly_if_nonnull(nf, R);
-                    delete_poly_if_nonnull(target, R);
-                }
+                bool in = pos < batch.membership.size() && batch.membership[pos];
 
                 if (in)
                 {
@@ -3934,11 +4014,6 @@ class PolyPropagator : public user_propagator_base
                     }
                 }
             }
-
-            if (G)
-                idDelete(&G);
-            if (I)
-                idDelete(&I);
 
             if (hit_conflict || conflict_check())
             {
@@ -4577,6 +4652,13 @@ int main(int argc, char **argv)
                 ENABLE_MINIMAL_FIXED_WATCH = true;
             else if (a == "--enable-eqmod-true-lemmas")
                 ENABLE_EQMOD_TRUE_LEMMAS = true;
+            else if (a == "--enable-gb-preprocess")
+                ENABLE_GB_PREPROCESS = true;
+            else if (a == "--verify-gb-preprocess")
+            {
+                ENABLE_GB_PREPROCESS = true;
+                VERIFY_GB_PREPROCESS = true;
+            }
             else if (a == "--show-model")
                 show_model_on_terminal = true;
             else if (a == "--rewrite-log")
