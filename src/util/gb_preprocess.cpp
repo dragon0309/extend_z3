@@ -196,24 +196,16 @@ static mpz_class poly_content(poly p, const ring R)
     return g;
 }
 
-static mpz_class coprime_content_divisor(const mpz_class &content, const mpz_class &d)
+static mpz_class content_gcd_replacement_divisor(const mpz_class &content, const mpz_class &d)
 {
     if (content <= 1)
         return 1;
-    if (mpz_gcd_abs(content, d) == 1)
-        return content;
 
-    // Select the largest divisor of content that is coprime to d by removing
-    // every prime-power factor shared with d.
-    mpz_class unit = content;
-    while (unit > 1)
-    {
-        mpz_class shared = mpz_gcd_abs(unit, d);
-        if (shared == 1)
-            break;
-        unit /= shared;
-    }
-    return unit > 1 ? unit : mpz_class(1);
+    // If p = content * g and r = gcd(content, d), replace p by r * g.
+    // Bezout's identity gives <d, content * g> = <d, r * g>, so the exact
+    // coefficient divisor is content / r even when it is not coprime to d.
+    const mpz_class retained_content = mpz_gcd_abs(content, d);
+    return content / retained_content;
 }
 
 static void replace_poly(poly &slot, poly next, const ring R)
@@ -363,12 +355,12 @@ void preprocess_groebner_inputs(std::vector<poly> &gens,
             mpz_class content = poly_content(g, R);
             if (content > 1)
             {
-                mpz_class c_unit = coprime_content_divisor(content, d);
-                if (c_unit > 1)
+                mpz_class divisor = content_gcd_replacement_divisor(content, d);
+                if (divisor > 1)
                 {
-                    poly q = poly_divide_coeffs_exact(g, c_unit, R);
+                    poly q = poly_divide_coeffs_exact(g, divisor, R);
                     replace_poly(g, q, R);
-                    ++stats.content_divisions;
+                    ++stats.content_gcd_replacements;
                 }
             }
             canonicalize_poly_mod_constant(g, d, R, stats);
@@ -402,7 +394,7 @@ void preprocess_groebner_inputs(std::vector<poly> &gens,
             << " ; terms " << stats.terms_before << " -> " << stats.terms_after
             << " ; coeff_abs " << stats.coeff_abs_before.get_str() << " -> " << stats.coeff_abs_after.get_str()
             << " ; const_gcd=" << (d == 0 ? std::string("-") : d.get_str())
-            << " ; content_div=" << stats.content_divisions
+            << " ; content_gcd=" << stats.content_gcd_replacements
             << " ; coeff_mod=" << stats.coefficient_canonicalizations;
         LOG_INFO(*logger, "singular", oss.str());
     }

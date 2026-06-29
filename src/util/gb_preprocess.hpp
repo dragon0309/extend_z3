@@ -24,7 +24,7 @@ struct GbPreprocessStats
     mpz_class coeff_abs_after = 0;
     mpz_class constant_gcd = 0;
     int constants_merged = 0;
-    int content_divisions = 0;
+    int content_gcd_replacements = 0;
     int coefficient_canonicalizations = 0;
 };
 
