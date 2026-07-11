@@ -23,6 +23,7 @@ struct RewriteOptions
     bool use_singular_normalization = true;
     bool enable_moduli_normalization = true;
     bool use_subexpression_rules = false;
+    bool use_raw_poly_power_rules = false;
     bool enable_expression_growth_check = false;
     bool disable_rewrite_cache = false;
     bool verify_rewrite_lookups = false;
@@ -120,11 +121,29 @@ struct RewriteResult
     explicit RewriteResult(const z3::expr &target);
 };
 
+struct RewrittenCoeffBase
+{
+    z3::expr original_base;
+    z3::expr rewritten_int;
+
+    RewrittenCoeffBase(const z3::expr &original_base_, const z3::expr &rewritten_int_)
+        : original_base(original_base_), rewritten_int(rewritten_int_)
+    {
+    }
+};
+
 RewriteResult run_rewriting_pipeline(
     z3::context &ctx,
     const std::vector<z3::expr> &input_asserts,
     const RewriteOptions &option,
     util::Logger &log);
+
+// Rewrite PConst(base) through the same ordered substitutions used by the
+// assertion pipeline, then lower the resulting Poly expression back to Int.
+// This lets late user-propagator equalities refer to the post-rewrite ring.
+std::vector<RewrittenCoeffBase> rewrite_coeff_bases_to_int(
+    const std::vector<z3::expr> &bases,
+    const std::vector<RewriteRule> &rules);
 
 std::string rule_rhs_pretty(const PolyRewriteRule &rr);
 

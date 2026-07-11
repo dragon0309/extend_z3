@@ -22,6 +22,7 @@
 
 #include "util/fmt_duration.hpp"
 #include "util/logger.hpp"
+#include "util/singular_dump.hpp"
 
 using namespace z3;
 
@@ -378,6 +379,33 @@ namespace
         return is_ctor(e, "PConst", 1) && is_int_atom(e.arg(0));
     }
 
+    bool is_raw_poly_symbol(const expr &e)
+    {
+        if (!e.is_const() || e.is_numeral() || !e.get_sort().is_datatype())
+            return false;
+        Z3_context c = (Z3_context)e.ctx();
+        Z3_symbol sym = Z3_get_sort_name(c, (Z3_sort)e.get_sort());
+        const char *name = Z3_get_symbol_string(c, sym);
+        return name && std::string(name) == "Poly";
+    }
+
+    bool contains_raw_poly_symbol(const expr &e)
+    {
+        if (is_raw_poly_symbol(e))
+            return true;
+        if (!e.is_app())
+            return false;
+        for (unsigned i = 0; i < e.num_args(); ++i)
+            if (contains_raw_poly_symbol(e.arg(i)))
+                return true;
+        return false;
+    }
+
+    std::string raw_poly_symbol_key(const expr &e)
+    {
+        return "PolySymbol:" + e.to_string();
+    }
+
     std::string variable_key(const expr &e)
     {
         if (is_ctor(e, "PVar", 1))
@@ -394,6 +422,11 @@ namespace
 
     void collect_vars_rec(const expr &e, std::unordered_set<std::string> &out)
     {
+        if (is_raw_poly_symbol(e))
+        {
+            out.insert(raw_poly_symbol_key(e));
+            return;
+        }
         if (is_poly_variable(e))
         {
             out.insert(variable_key(e));
@@ -438,6 +471,11 @@ namespace
 
     void collect_vars_vec_rec(const expr &e, std::vector<std::string> &out)
     {
+        if (is_raw_poly_symbol(e))
+        {
+            out.push_back(raw_poly_symbol_key(e));
+            return;
+        }
         if (is_poly_variable(e))
         {
             out.push_back(variable_key(e));
@@ -966,6 +1004,10 @@ namespace
         Pattern(const RewriteRule &r, std::string k) : rule(r), lhs_key(std::move(k)) {}
     };
 
+    bool is_raw_poly_power_expr(const expr &e);
+
+    bool poly_to_int_expr(const expr &p, const PolyDecls &d, expr &out);
+
     std::optional<Pattern> make_variable_assignment(const expr &lhs,
                                                     const expr &rhs0,
                                                     const expr &poly,
@@ -984,6 +1026,17 @@ namespace
         if (options.suppressed_lhs_keys.count(key))
             return std::nullopt;
         expr rhs = simplify_poly(rhs0, d);
+        if (is_ctor(lhs, "PConst", 1))
+        {
+            expr rhs_int(rhs.ctx());
+            if (!poly_to_int_expr(rhs, d, rhs_int))
+            {
+                ++stats.skipped_unsafe_coefficient;
+                diagnostics.push_back(label + ": skipped " + diagnostic_tag +
+                                      " coefficient rhs is not an Int polynomial");
+                return std::nullopt;
+            }
+        }
         std::vector<std::string> rhs_dependencies = collect_sorted_vars(rhs);
         if (std::binary_search(rhs_dependencies.begin(), rhs_dependencies.end(), key))
         {
@@ -1377,6 +1430,11 @@ namespace
 
     void collect_singular_var_keys(const expr &e, std::set<std::string> &out)
     {
+        if (is_raw_poly_symbol(e))
+        {
+            out.insert(raw_poly_symbol_key(e));
+            return;
+        }
         if (is_poly_variable(e))
         {
             out.insert(variable_key(e));
@@ -1411,6 +1469,8 @@ namespace
         mpz_class k;
         if (extract_poly_int_constant(e, k))
             return singular_poly_from_mpz(k, R);
+        if (is_raw_poly_symbol(e))
+            return singular_var_poly(raw_poly_symbol_key(e), idx, R);
         if (is_poly_variable(e))
             return singular_var_poly(variable_key(e), idx, R);
         if (is_ctor(e, "PNeg", 1))
@@ -1500,11 +1560,9 @@ namespace
             ideal I = idInit((int)moduli.size(), 1);
             for (int i = 0; i < (int)moduli.size(); ++i)
                 I->m[i] = singular_from_poly_expr(moduli[(std::size_t)i], d, idx, R);
-            intvec *w0 = nullptr;
-            intvec **w = &w0;
-            ideal G = kStd(I, NULL, testHomog, w, NULL, 0, 0, NULL);
+            ideal G = util::singular::groebner(I, R, "rewrite-normalization");
             poly pp = singular_from_poly_expr(p, d, idx, R);
-            poly nf = kNF(G, NULL, pp, 0, 0);
+            poly nf = util::singular::normal_form(G, pp, R, "rewrite-normalization");
             const bool zero = (nf == nullptr);
             if (nf)
                 p_Delete(&nf, R);
@@ -1707,6 +1765,64 @@ namespace
         }
     };
 
+    bool is_raw_poly_power_expr(const expr &e)
+    {
+        return is_ctor(e, "PPow", 2) && is_raw_poly_symbol(e.arg(0));
+    }
+
+    bool same_raw_poly_power_expr(const expr &a, const expr &b)
+    {
+        return is_raw_poly_power_expr(a) && is_raw_poly_power_expr(b) &&
+               raw_poly_symbol_key(a.arg(0)) == raw_poly_symbol_key(b.arg(0)) &&
+               same_ast(a.arg(1), b.arg(1));
+    }
+
+    bool contains_ast_fast(const expr &root, const expr &needle)
+    {
+        std::unordered_set<Z3_ast> visited;
+        std::function<bool(const expr &)> rec = [&](const expr &cur) -> bool
+        {
+            if (same_ast(cur, needle))
+                return true;
+            if (!visited.insert((Z3_ast)cur).second || !cur.is_app())
+                return false;
+            for (unsigned i = 0; i < cur.num_args(); ++i)
+                if (rec(cur.arg(i)))
+                    return true;
+            return false;
+        };
+        return rec(root);
+    }
+
+    std::optional<Pattern> extract_raw_poly_power_assignment(const GeneratorInfo &info,
+                                                             const PolyDecls &d,
+                                                             const RewriteOptions &options)
+    {
+        const expr &source = info.residual;
+        if (!source.is_app() || source.decl().name().str() != "eqP" || source.num_args() != 2)
+            return std::nullopt;
+
+        auto make = [&](const expr &lhs0, const expr &rhs0) -> std::optional<Pattern>
+        {
+            if (!is_raw_poly_power_expr(lhs0) || contains_ast_fast(rhs0, lhs0) ||
+                contains_ast_fast(rhs0, lhs0.arg(0)))
+                return std::nullopt;
+            expr lhs = simplify_poly(lhs0, d);
+            expr rhs = simplify_poly(rhs0, d);
+            if (options.enable_expression_growth_check &&
+                expr_size(rhs) > expr_size(info.polynomial) + options.max_expression_growth)
+                return std::nullopt;
+            RewriteRule rule(lhs, rhs, source, RewriteRule::Kind::SubExpression,
+                             info.modular, info.label);
+            rule.rhs_dependencies = collect_sorted_vars(rhs);
+            return Pattern(rule, "Sub:" + lhs.to_string());
+        };
+
+        if (auto pat = make(source.arg(0), source.arg(1)))
+            return pat;
+        return make(source.arg(1), source.arg(0));
+    }
+
     std::optional<Pattern> extract_one_assignment(const GeneratorInfo &info,
                                                   const std::vector<expr> &others,
                                                   const std::vector<expr> &moduli,
@@ -1767,6 +1883,32 @@ namespace
         }
     };
 
+    bool raw_poly_power_rule_is_safe(const Pattern &pattern,
+                                     const std::vector<RewriteItem> &items)
+    {
+        const expr raw_symbol = pattern.rule.lhs.arg(0);
+        std::unordered_set<Z3_ast> visited;
+        std::function<bool(const expr &)> rec = [&](const expr &cur) -> bool
+        {
+            if (same_ast(cur, pattern.rule.lhs))
+                return true;
+            if (same_ast(cur, raw_symbol))
+                return false;
+            if (!visited.insert((Z3_ast)cur).second)
+                return true;
+            if (!cur.is_app())
+                return true;
+            for (unsigned i = 0; i < cur.num_args(); ++i)
+                if (!rec(cur.arg(i)))
+                    return false;
+            return true;
+        };
+        for (const RewriteItem &item : items)
+            if (!rec(item.formula))
+                return false;
+        return true;
+    }
+
     struct AssertionRewriteResult
     {
         std::vector<expr> residual_assertions;
@@ -1802,6 +1944,7 @@ namespace
     void append_rewrite_items_rec(const expr &assertion,
                                   std::vector<RewriteItem> &items,
                                   const PolyDecls &d,
+                                  const RewriteOptions &options,
                                   std::size_t source_index)
     {
         if (is_true_expr(assertion))
@@ -1809,12 +1952,20 @@ namespace
         if (assertion.is_app() && assertion.decl().name().str() == "and")
         {
             for (unsigned i = 0; i < assertion.num_args(); ++i)
-                append_rewrite_items_rec(assertion.arg(i), items, d, source_index);
+                append_rewrite_items_rec(assertion.arg(i), items, d, options, source_index);
             return;
         }
 
         if (is_eqP_atom(assertion))
         {
+            // A raw (Poly Int) constant denotes an opaque polynomial symbol,
+            // not an assignment variable.  Keep such eqP atoms as relations;
+            // other extracted rules may still rewrite their children.
+            if (contains_raw_poly_symbol(assertion) && !options.use_raw_poly_power_rules)
+            {
+                items.emplace_back(assertion, std::nullopt, false, source_index);
+                return;
+            }
             expr poly = simplify_poly(mk_psub(d, assertion.arg(0), assertion.arg(1)), d);
             items.emplace_back(assertion, poly, true, source_index);
             return;
@@ -1824,11 +1975,12 @@ namespace
     }
 
     std::vector<RewriteItem> make_rewrite_items(const std::vector<expr> &assertions,
-                                                const PolyDecls &d)
+                                                const PolyDecls &d,
+                                                const RewriteOptions &options)
     {
         std::vector<RewriteItem> items;
         for (std::size_t i = 0; i < assertions.size(); ++i)
-            append_rewrite_items_rec(assertions[i], items, d, i);
+            append_rewrite_items_rec(assertions[i], items, d, options, i);
         return items;
     }
 
@@ -1889,6 +2041,22 @@ namespace
         grouped.reserve(infos.size());
         std::vector<bool> has_candidate(infos.size(), false);
         const std::vector<expr> empty_others;
+        std::vector<std::optional<Pattern>> raw_candidates(infos.size());
+        bool have_raw_candidate = false;
+        if (options.use_raw_poly_power_rules)
+        {
+            for (std::size_t i = 0; i < infos.size(); ++i)
+            {
+                raw_candidates[i] = extract_raw_poly_power_assignment(infos[i], d, options);
+                if (raw_candidates[i] && !raw_poly_power_rule_is_safe(*raw_candidates[i], items))
+                {
+                    diagnostics.push_back(infos[i].label +
+                                          ": skipped raw Poly power rule because its symbol occurs outside the lhs pattern");
+                    raw_candidates[i].reset();
+                }
+                have_raw_candidate = have_raw_candidate || raw_candidates[i].has_value();
+            }
+        }
         for (std::size_t i = 0; i < infos.size(); ++i)
         {
             std::vector<expr> others;
@@ -1902,7 +2070,11 @@ namespace
                 others_ref = &others;
             }
 
-            auto pat = extract_one_assignment(infos[i], *others_ref, moduli, d, options, stats, diagnostics);
+            std::optional<Pattern> pat = raw_candidates[i];
+            // Keep a nonlinear raw-Poly rule in its own DAG round. Mixing it
+            // with hundreds of variable rules disables the indexed fast path.
+            if (!have_raw_candidate)
+                pat = extract_one_assignment(infos[i], *others_ref, moduli, d, options, stats, diagnostics);
             if (pat)
             {
                 grouped[pat->lhs_key].emplace_back(*pat, i);
@@ -1998,6 +2170,8 @@ namespace
     {
         if (same_ast(e, r.lhs))
             return true;
+        if (is_raw_poly_power_expr(r.lhs))
+            return same_raw_poly_power_expr(e, r.lhs);
         if (is_poly_variable(r.lhs))
             return is_poly_variable(e) && variable_key(e) == lhs_key;
         return expr_key(e) == lhs_key;
@@ -2052,6 +2226,14 @@ namespace
 
     expr apply_rules_sequential(const expr &e, const std::vector<RewriteRule> &rules, const PolyDecls &d)
     {
+        if (rules.size() == 1 && is_raw_poly_power_expr(rules[0].lhs))
+        {
+            expr_vector src(e.ctx()), dst(e.ctx());
+            src.push_back(rules[0].lhs);
+            dst.push_back(rules[0].rhs);
+            expr input = e;
+            return input.substitute(src, dst);
+        }
         expr cur = e;
         for (const RewriteRule &r : rules)
         {
@@ -2796,7 +2978,7 @@ namespace
         res.used_worklist_rewrite = true;
 
         auto make_t0 = std::chrono::steady_clock::now();
-        std::vector<RewriteItem> out = make_rewrite_items(formulas, d);
+        std::vector<RewriteItem> out = make_rewrite_items(formulas, d, options);
         if (timing)
             timing->make_items += std::chrono::steady_clock::now() - make_t0;
         return out;
@@ -2809,10 +2991,48 @@ namespace
     {
         AssertionRewriteResult res;
         auto make_t0 = std::chrono::steady_clock::now();
-        std::vector<RewriteItem> current = make_rewrite_items(input_asserts, d);
+        std::vector<RewriteItem> current = make_rewrite_items(input_asserts, d, options);
         if (timing)
             timing->make_items += std::chrono::steady_clock::now() - make_t0;
         const std::vector<expr> moduli;
+
+        if (options.use_raw_poly_power_rules)
+        {
+            for (std::size_t i = 0; i < current.size(); ++i)
+            {
+                const expr &formula = current[i].formula;
+                if (!formula.is_app() || formula.decl().name().str() != "eqP" ||
+                    formula.num_args() != 2)
+                    continue;
+                GeneratorInfo info(formula, formula.arg(0), false, true,
+                                   "raw-poly-prepass/item#" + std::to_string(i), i);
+                auto pattern = extract_raw_poly_power_assignment(info, d, options);
+                if (!pattern || !raw_poly_power_rule_is_safe(*pattern, current))
+                    continue;
+
+                expr_vector src(formula.ctx()), dst(formula.ctx());
+                src.push_back(pattern->rule.lhs);
+                dst.push_back(pattern->rule.rhs);
+                const std::string raw_key = raw_poly_symbol_key(pattern->rule.lhs.arg(0));
+                std::vector<expr> rewritten;
+                rewritten.reserve(current.size() - 1);
+                for (std::size_t j = 0; j < current.size(); ++j)
+                {
+                    if (j == i)
+                        continue;
+                    expr f = current[j].formula;
+                    rewritten.push_back(current[j].vars.count(raw_key) ? f.substitute(src, dst) : f);
+                }
+                res.rules_used.push_back(pattern->rule);
+                ++res.stats.rules_extracted;
+                ++res.dag_rounds;
+                make_t0 = std::chrono::steady_clock::now();
+                current = make_rewrite_items(rewritten, d, options);
+                if (timing)
+                    timing->make_items += std::chrono::steady_clock::now() - make_t0;
+                break;
+            }
+        }
 
         for (std::size_t round = 0; round < options.max_rounds; ++round)
         {
@@ -2850,7 +3070,7 @@ namespace
                     timing->residual_rewrite_calls += current.size();
                 }
                 make_t0 = std::chrono::steady_clock::now();
-                current = make_rewrite_items(simplified, d);
+                current = make_rewrite_items(simplified, d, options);
                 if (timing)
                     timing->make_items += std::chrono::steady_clock::now() - make_t0;
                 if (options.rewrite_log)
@@ -2944,7 +3164,7 @@ namespace
                 write_residual_rewrite_log(*options.rewrite_log, log_originals, log_rewritten, drop_reasons, d);
             }
             make_t0 = std::chrono::steady_clock::now();
-            current = make_rewrite_items(rewritten, d);
+            current = make_rewrite_items(rewritten, d, options);
             if (timing)
                 timing->make_items += std::chrono::steady_clock::now() - make_t0;
         }
@@ -3113,6 +3333,16 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     }
     out.rewrite_atoms_after = (int)(eqps_after.size() + eqmods_after.size());
     out.unique_vars_after = count_rewrite_vars(out.asserts);
+    std::size_t relational_eqps_after = 0;
+    for (const expr &eqp : eqps_after)
+    {
+        if (!contains_raw_poly_symbol(eqp))
+            continue;
+        ++relational_eqps_after;
+        if (relational_eqps_after == 1)
+            out.diagnostics.push_back(
+                "preserved relational eqP containing opaque Poly symbol (not an assignment source)");
+    }
     post_scan_time = std::chrono::steady_clock::now() - phase_t0;
 
     const auto rewrite_t1 = std::chrono::steady_clock::now();
@@ -3121,6 +3351,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
             << " asserted_eqP=" << asserted_eqps_before.size()
             << " assignments=" << out.rules_used.size()
             << " residual_assertions=" << out.residual_assertions.size()
+            << " relational_eqP=" << relational_eqps_after
             << " dag_rounds=" << out.dag_rounds
             << " worklist=" << (out.used_worklist_rewrite ? "yes" : "no")
             << " singular_nf=" << out.stats.singular_nf_checks
@@ -3172,6 +3403,57 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
                                       util::fmt_duration(substitution_log_time));
     }
 
+    return out;
+}
+
+std::vector<RewrittenCoeffBase> rewrite_coeff_bases_to_int(
+    const std::vector<z3::expr> &bases,
+    const std::vector<RewriteRule> &rules)
+{
+    std::vector<RewrittenCoeffBase> out;
+    out.reserve(bases.size());
+    if (bases.empty())
+        return out;
+
+    std::vector<expr> roots;
+    roots.reserve(1 + 2 * rules.size());
+    roots.push_back(bases.front());
+    for (const RewriteRule &rule : rules)
+    {
+        roots.push_back(rule.lhs);
+        roots.push_back(rule.rhs);
+    }
+    PolyDecls d = collect_decls(roots);
+    RewriteEnv env(rules, d);
+
+    for (const expr &base : bases)
+    {
+        if (!d.pconst)
+        {
+            out.emplace_back(base, base);
+            continue;
+        }
+
+        expr poly_base = mk_pconst(d, base);
+        expr rewritten = poly_base;
+        if (env.all_variable_rules)
+        {
+            bool changed = false;
+            rewritten = apply_variable_env_rec(poly_base, env, changed);
+            if (changed && is_poly_ctor(rewritten))
+                rewritten = simplify_poly(rewritten, d);
+        }
+        else
+        {
+            rewritten = apply_rules_sequential(poly_base, rules, d);
+        }
+        expr rewritten_int(base.ctx());
+        if (!poly_to_int_expr(rewritten, d, rewritten_int))
+            throw std::runtime_error(
+                "rewrite_coeff_bases_to_int: rewritten PConst is not an Int polynomial: " +
+                rewritten.to_string());
+        out.emplace_back(base, rewritten_int.simplify());
+    }
     return out;
 }
 
@@ -3314,6 +3596,56 @@ int run_rewrite_selftests()
                                               "nested eqP residual was not rewritten by top-level rule");
                               return ok;
                           }));
+
+    run(pipeline_selftest("raw Poly symbol eqP stays relational while rhs rewrites",
+                          "(declare-const p (Poly Int))(declare-const f Int)"
+                          "(assert (eqP (PConst f) (PConst 7)))"
+                          "(assert (eqP (PPow p 2) (PAdd (PConst f) (PVar \"x\"))))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              std::vector<expr> eqps;
+                              for (const expr &a : rr.asserts)
+                                  collect_eqP_rec(a, eqps);
+                              bool ok = check(rr.rules_used.size() == 1,
+                                              "relational eqP produced an assignment rule");
+                              ok &= check(eqps.size() == 1,
+                                          "relational eqP was consumed or dropped");
+                              if (eqps.size() == 1)
+                              {
+                                  const std::string text = eqps[0].to_string();
+                                  ok &= check(text.find("p") != std::string::npos,
+                                              "raw Poly symbol disappeared from relation");
+                                  ok &= check(text.find("(PConst f)") == std::string::npos,
+                                              "ordinary assignment did not rewrite relation rhs");
+                                  ok &= check(text.find("(PConst 7)") != std::string::npos,
+                                              "rewritten relation rhs is missing replacement value");
+                              }
+                              return ok;
+                          }));
+
+    RewriteOptions raw_poly_power_options;
+    raw_poly_power_options.use_raw_poly_power_rules = true;
+    run(pipeline_selftest("raw Poly power relation rewrites in opt-in prepass",
+                          "(declare-const p (Poly Int))(declare-const f Int)"
+                          "(assert (eqP (PConst f) (PConst 7)))"
+                          "(assert (eqP (PPow p 2) (PAdd (PConst f) (PVar \"x\"))))"
+                          "(assert (not (eqP (PPow p 2) (PAdd (PConst 8) (PVar \"x\")))))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              bool used_power_rule = false;
+                              for (const RewriteRule &rule : rr.rules_used)
+                                  used_power_rule = used_power_rule ||
+                                                    rule.kind == RewriteRule::Kind::SubExpression;
+                              bool raw_symbol_remains = false;
+                              for (const expr &a : rr.asserts)
+                                  raw_symbol_remains = raw_symbol_remains || contains_raw_poly_symbol(a);
+                              bool ok = check(used_power_rule,
+                                              "raw Poly power relation did not produce a rewrite rule");
+                              ok &= check(!raw_symbol_remains,
+                                          "raw Poly symbol remained after power rewrite prepass");
+                              return ok;
+                          },
+                          raw_poly_power_options));
 
     run(pipeline_selftest("cyclic assertions use worklist rewrite",
                           "(declare-const x Int)(declare-const y Int)"
