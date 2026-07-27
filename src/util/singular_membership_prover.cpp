@@ -7,6 +7,7 @@
 
 #include "util/fmt_duration.hpp"
 #include "util/gb_preprocess.hpp"
+#include "util/ideal_rewrite.hpp"
 #include "util/singular_dump.hpp"
 
 namespace util::singular
@@ -31,6 +32,42 @@ void delete_polys(std::vector<poly> &values, ring R)
     values.clear();
 }
 
+class PolyVectorOwner
+{
+    std::vector<poly> &values_;
+    ring ring_;
+
+public:
+    PolyVectorOwner(std::vector<poly> &values, ring R)
+        : values_(values), ring_(R)
+    {
+    }
+
+    ~PolyVectorOwner() { delete_polys(values_, ring_); }
+};
+
+class IdealOwner
+{
+    ideal value_ = nullptr;
+    ring ring_ = nullptr;
+
+public:
+    IdealOwner(ideal value, ring R) : value_(value), ring_(R) {}
+    IdealOwner(const IdealOwner &) = delete;
+    IdealOwner &operator=(const IdealOwner &) = delete;
+
+    ~IdealOwner()
+    {
+        if (value_)
+        {
+            rChangeCurrRing(ring_);
+            idDelete(&value_);
+        }
+    }
+
+    ideal get() const { return value_; }
+};
+
 std::string poly_to_string(poly value, ring R)
 {
     if (value == nullptr)
@@ -51,6 +88,7 @@ std::vector<bool> raw_membership(std::vector<poly> owned_generators,
                                  util::Logger *log)
 {
     rChangeCurrRing(R);
+    PolyVectorOwner generator_owner(owned_generators, R);
     std::vector<bool> membership(targets.size(), false);
     if (normal_forms)
         normal_forms->assign(targets.size(), "not-computed");
@@ -65,9 +103,12 @@ std::vector<bool> raw_membership(std::vector<poly> owned_generators,
         return membership;
     }
 
-    ideal source = membership_detail::ideal_from_owned_polys(owned_generators, R);
-    ideal basis = membership_detail::timed_groebner(
-        source, R, label, timing, log);
+    IdealOwner source(
+        membership_detail::ideal_from_owned_polys(owned_generators, R), R);
+    IdealOwner basis(
+        membership_detail::timed_groebner(
+            source.get(), R, label, timing, log),
+        R);
     for (std::size_t i = 0; i < targets.size(); ++i)
     {
         if (targets[i] == nullptr)
@@ -78,16 +119,12 @@ std::vector<bool> raw_membership(std::vector<poly> owned_generators,
             continue;
         }
         poly normal = util::singular::normal_form(
-            basis, p_Copy(targets[i], R), R, label);
+            basis.get(), p_Copy(targets[i], R), R, label);
         membership[i] = normal == nullptr;
         if (normal_forms)
             (*normal_forms)[i] = poly_to_string(normal, R);
         delete_poly(normal, R);
     }
-    if (basis)
-        idDelete(&basis);
-    if (source)
-        idDelete(&source);
     return membership;
 }
 
@@ -202,7 +239,6 @@ MembershipBatchResult prove_membership(
 {
     MembershipBatchResult result;
     result.membership.assign(targets.size(), false);
-    result.normal_forms.assign(targets.size(), "not-computed");
     if (R == nullptr)
         return result;
     rChangeCurrRing(R);
@@ -211,6 +247,7 @@ MembershipBatchResult prove_membership(
     std::vector<poly> owned_targets;
     std::vector<poly> raw_generators;
     std::vector<poly> raw_targets;
+    std::vector<poly> preprocess_input_generators;
     try
     {
         owned_generators.reserve(generators.size());
@@ -232,6 +269,13 @@ MembershipBatchResult prove_membership(
 
         if (options.preprocess)
         {
+            if (options.verify_preprocess)
+            {
+                preprocess_input_generators.reserve(owned_generators.size());
+                for (poly generator : owned_generators)
+                    preprocess_input_generators.push_back(
+                        generator ? p_Copy(generator, R) : nullptr);
+            }
             result.used_preprocess = true;
             util::gb::GbPreprocessStats stats;
             util::gb::preprocess_groebner_inputs(
@@ -239,12 +283,34 @@ MembershipBatchResult prove_membership(
         }
 
         if (options.verify_preprocess)
-            membership_detail::verify_ideal_equality(
-                raw_generators, owned_generators, R, label, result.groebner, log);
+        {
+            if (options.preprocess)
+                membership_detail::verify_ideal_equality(
+                    preprocess_input_generators, owned_generators, R, label,
+                    result.groebner, log);
+        }
 
+        // Content/modulus normalization can expose monic live-equality
+        // generators. Run ideal rewriting after that normalization so those
+        // equalities can rewrite the rest of the ideal, instead of merely
+        // being rewritten by older generators.
+        if (options.ideal_rewrite)
+        {
+            util::ideal_rewrite::IdealRewriteStats stats;
+            util::ideal_rewrite::rewrite_inputs(
+                owned_generators, owned_targets, R, label, stats, log);
+        }
+
+        std::vector<std::string> verification_normal_forms;
+        std::vector<std::string> *optimized_normal_forms =
+            options.return_normal_forms
+                ? &result.normal_forms
+                : (options.verify_preprocess
+                       ? &verification_normal_forms
+                       : nullptr);
         result.membership = raw_membership(
             std::move(owned_generators), owned_targets, R, label,
-            &result.normal_forms, result.groebner, log);
+            optimized_normal_forms, result.groebner, log);
 
         if (options.verify_preprocess)
         {
@@ -255,26 +321,28 @@ MembershipBatchResult prove_membership(
             if (raw_membership_result != result.membership)
             {
                 std::ostringstream message;
-                message << "GB preprocess verification failed [" << label << "]";
+                message << "Membership transform verification failed [" << label << "]";
                 for (std::size_t i = 0; i < raw_membership_result.size(); ++i)
                     message << "\n  target#" << i
                             << " raw=" << (raw_membership_result[i] ? "true" : "false")
                             << " optimized=" << (result.membership[i] ? "true" : "false")
                             << " raw_nf=" << raw_normal_forms[i]
-                            << " opt_nf=" << result.normal_forms[i];
+                            << " opt_nf=" << (*optimized_normal_forms)[i];
                 if (log)
                     LOG_INFO(*log, "singular", message.str());
                 throw std::runtime_error(message.str());
             }
             if (log)
                 LOG_INFO(*log, "singular",
-                         "[gb-preprocess] " + label + ": verify membership OK");
+                         "[membership-transform] " + label +
+                             ": verify membership OK");
         }
 
         delete_polys(owned_generators, R);
         delete_polys(owned_targets, R);
         delete_polys(raw_generators, R);
         delete_polys(raw_targets, R);
+        delete_polys(preprocess_input_generators, R);
         return result;
     }
     catch (...)
@@ -284,6 +352,7 @@ MembershipBatchResult prove_membership(
         delete_polys(owned_targets, R);
         delete_polys(raw_generators, R);
         delete_polys(raw_targets, R);
+        delete_polys(preprocess_input_generators, R);
         throw;
     }
 }

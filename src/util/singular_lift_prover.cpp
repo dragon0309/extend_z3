@@ -74,7 +74,7 @@ poly copy_lift_vector_component(ideal lift,
 
 std::vector<std::size_t> extract_support(ideal source,
                                          poly target,
-                                         const std::vector<int> &origins,
+                                         const std::vector<std::size_t> &origins,
                                          ring R,
                                          const std::string &label,
                                          bool &certified,
@@ -107,8 +107,7 @@ std::vector<std::size_t> extract_support(ideal source,
                 certificate, i, origins.size(), R);
             if (coefficient != nullptr)
             {
-                if (origins[i] >= 0)
-                    original_indices.insert(static_cast<std::size_t>(origins[i]));
+                original_indices.insert(origins[i]);
                 delete_poly(coefficient, R);
             }
         }
@@ -150,17 +149,19 @@ LiftBatchResult prove_with_lift_support(
     std::vector<poly> owned_generators;
     std::vector<poly> owned_targets;
     std::vector<poly> raw_generators;
-    std::vector<int> origins;
+    std::vector<poly> support_generators;
+    std::vector<std::size_t> support_origins;
     ideal source = nullptr;
     ideal basis = nullptr;
+    ideal support_source = nullptr;
     try
     {
         owned_generators.reserve(generators.size());
-        origins.reserve(generators.size());
         for (std::size_t i = 0; i < generators.size(); ++i)
         {
             owned_generators.push_back(generators[i] ? p_Copy(generators[i], R) : nullptr);
-            origins.push_back(static_cast<int>(i));
+            if (generators[i])
+                result.active_generator_indices.push_back(i);
         }
         owned_targets.reserve(targets.size());
         for (poly target : targets)
@@ -176,7 +177,7 @@ LiftBatchResult prove_with_lift_support(
             }
             util::gb::GbPreprocessStats stats;
             util::gb::preprocess_groebner_inputs(
-                owned_generators, owned_targets, R, label, stats, log, &origins);
+                owned_generators, owned_targets, R, label, stats, log);
             if (options.verify_preprocess)
                 membership_detail::verify_ideal_equality(
                     raw_generators, owned_generators, R, label,
@@ -184,14 +185,18 @@ LiftBatchResult prove_with_lift_support(
         }
 
         result.preprocessed_generator_count = owned_generators.size();
+        if (options.extract_support)
         {
-            std::unordered_set<std::size_t> active;
-            for (int origin : origins)
-                if (origin >= 0)
-                    active.insert(static_cast<std::size_t>(origin));
-            result.active_generator_indices.assign(active.begin(), active.end());
-            std::sort(result.active_generator_indices.begin(),
-                      result.active_generator_indices.end());
+            support_generators.reserve(result.active_generator_indices.size());
+            support_origins.reserve(result.active_generator_indices.size());
+            for (std::size_t index : result.active_generator_indices)
+            {
+                support_generators.push_back(p_Copy(generators[index], R));
+                support_origins.push_back(index);
+            }
+            if (!support_generators.empty())
+                support_source = membership_detail::ideal_from_owned_polys(
+                    support_generators, R);
         }
 
         if (owned_generators.empty())
@@ -199,7 +204,6 @@ LiftBatchResult prove_with_lift_support(
             for (std::size_t i = 0; i < owned_targets.size(); ++i)
             {
                 result.targets[i].member = owned_targets[i] == nullptr;
-                result.targets[i].support_certified = result.targets[i].member;
             }
         }
         else
@@ -214,31 +218,44 @@ LiftBatchResult prove_with_lift_support(
                 if (owned_targets[i] == nullptr)
                 {
                     target_result.member = true;
-                    target_result.support_certified = true;
                     continue;
                 }
                 poly normal = util::singular::normal_form(
                     basis, p_Copy(owned_targets[i], R), R, label);
                 target_result.member = normal == nullptr;
                 delete_poly(normal, R);
-                if (target_result.member && options.extract_support)
-                {
-                    const std::string &target_label =
-                        i < target_labels.size() ? target_labels[i] : label;
-                    target_result.used_generator_indices = extract_support(
-                        source, owned_targets[i], origins, R,
-                        target_label, target_result.support_certified, log);
-                }
             }
+        }
+
+        for (std::size_t i = 0; i < result.targets.size(); ++i)
+        {
+            TargetLiftResult &target_result = result.targets[i];
+            if (!target_result.member)
+                continue;
+            if (targets[i] == nullptr)
+            {
+                target_result.support_certified = true;
+                continue;
+            }
+            if (!options.extract_support)
+                continue;
+            const std::string &target_label =
+                i < target_labels.size() ? target_labels[i] : label;
+            target_result.used_generator_indices = extract_support(
+                support_source, targets[i], support_origins, R,
+                target_label, target_result.support_certified, log);
         }
 
         if (basis)
             idDelete(&basis);
         if (source)
             idDelete(&source);
+        if (support_source)
+            idDelete(&support_source);
         delete_polys(owned_generators, R);
         delete_polys(owned_targets, R);
         delete_polys(raw_generators, R);
+        delete_polys(support_generators, R);
         return result;
     }
     catch (...)
@@ -248,9 +265,12 @@ LiftBatchResult prove_with_lift_support(
             idDelete(&basis);
         if (source)
             idDelete(&source);
+        if (support_source)
+            idDelete(&support_source);
         delete_polys(owned_generators, R);
         delete_polys(owned_targets, R);
         delete_polys(raw_generators, R);
+        delete_polys(support_generators, R);
         throw;
     }
 }

@@ -22,6 +22,8 @@ struct LiftProverOptions
 struct TargetLiftResult
 {
     bool member = false;
+    // True only when used_generator_indices is a certificate support over the
+    // original, unpreprocessed generator vector.
     bool support_certified = false;
     std::vector<std::size_t> used_generator_indices;
 };
@@ -37,6 +39,8 @@ struct LiftBatchResult
 
 // generators and targets are borrowed. The module copies every non-null poly
 // it needs and owns all copies, ideals, bases, and lift certificates it creates.
+// Membership may use preprocessed inputs, but support certificates are always
+// extracted against the original generators so returned indices remain sound.
 LiftBatchResult prove_with_lift_support(
     const std::vector<poly> &generators,
     const std::vector<poly> &targets,

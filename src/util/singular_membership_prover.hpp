@@ -22,6 +22,11 @@ struct MembershipOptions
 {
     bool preprocess = false;
     bool verify_preprocess = false;
+    bool ideal_rewrite = false;
+    // Disable textual normal-form materialization when callers only need the
+    // membership bits. Verification may still materialize temporary strings
+    // for diagnostics, but they are not retained in the result.
+    bool return_normal_forms = true;
 };
 
 struct MembershipBatchResult
@@ -33,7 +38,10 @@ struct MembershipBatchResult
 };
 
 // generators and targets are borrowed. All Singular objects created by this
-// workflow are copied and owned internally.
+// workflow are copied and owned internally. The ring must use integer (n_Z)
+// coefficients and remain alive for the call. Like libSingular itself, this
+// workflow mutates currRing and must not run concurrently with another
+// in-process Singular workflow.
 MembershipBatchResult prove_membership(
     const std::vector<poly> &generators,
     const std::vector<poly> &targets,

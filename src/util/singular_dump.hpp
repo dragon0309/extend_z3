@@ -18,9 +18,10 @@ struct DumpConfig
 };
 
 /**
- * Configure the process-wide recorder. Calling this resets all basis-to-dump
- * associations. Existing dump files are preserved and numbering continues
- * after the greatest existing call number.
+ * Configure the process-wide recorder before Singular worker threads or
+ * processes are started. Calling this resets all basis-to-dump associations.
+ * Existing dump files are preserved and numbering continues after the
+ * greatest existing call number.
  */
 void configure_dump(DumpConfig config);
 

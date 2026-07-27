@@ -1,8 +1,10 @@
 #include "util/gb_preprocess.hpp"
 
+#include <chrono>
 #include <sstream>
 
 #include "util/logger.hpp"
+#include "util/singular_runtime_stats.hpp"
 
 namespace util::gb
 {
@@ -281,6 +283,7 @@ void preprocess_groebner_inputs(std::vector<poly> &gens,
                                 util::Logger *logger,
                                 std::vector<int> *gen_origins)
 {
+    const auto timing_started = std::chrono::steady_clock::now();
     stats = GbPreprocessStats{};
     rChangeCurrRing(R);
     if (gen_origins && gen_origins->size() != gens.size())
@@ -398,6 +401,8 @@ void preprocess_groebner_inputs(std::vector<poly> &gens,
             << " ; coeff_mod=" << stats.coefficient_canonicalizations;
         LOG_INFO(*logger, "singular", oss.str());
     }
+    util::singular::record_preprocess(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - timing_started));
 }
 
 } // namespace util::gb

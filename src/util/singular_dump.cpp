@@ -1,5 +1,7 @@
 #include "util/singular_dump.hpp"
 
+#include "util/singular_runtime_stats.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -18,6 +20,8 @@ namespace util::singular
 {
 namespace
 {
+
+constexpr std::size_t kMaxBasisAssociations = 64;
 
 struct Replay
 {
@@ -327,7 +331,14 @@ ideal groebner(ideal input, ring R, const std::string &label)
     if (write_replay(replay))
         log_message("wrote Singular replay: " + replay.path.string());
     if (result)
+    {
+        // A basis has no destruction callback in libSingular. Keep only a
+        // bounded set of short-lived associations; evicted bases still receive
+        // correct standalone NF replays.
+        if (state.basis_replays.size() >= kMaxBasisAssociations)
+            state.basis_replays.clear();
         state.basis_replays[result] = std::move(replay);
+    }
     return result;
 }
 
@@ -339,7 +350,10 @@ poly normal_form(ideal basis, poly target, ring R, const std::string &label)
     const std::string ring_text = enabled ? ring_declaration(R) : std::string();
     const std::vector<std::string> basis_text =
         enabled ? ideal_to_strings(basis, R) : std::vector<std::string>();
+    const auto timing_started = std::chrono::steady_clock::now();
     poly result = kNF(basis, nullptr, target, 0, 0);
+    record_normal_form(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - timing_started));
     if (!enabled)
         return result;
 
@@ -349,6 +363,14 @@ poly normal_form(ideal basis, poly target, ring R, const std::string &label)
         return result;
 
     auto found = state.basis_replays.find(basis);
+    if (found != state.basis_replays.end() &&
+        found->second.result_generators != basis_text)
+    {
+        // The allocator may reuse a deleted ideal's address. Content matching
+        // prevents a stale pointer association from capturing an unrelated NF.
+        state.basis_replays.erase(found);
+        found = state.basis_replays.end();
+    }
     if (found != state.basis_replays.end())
     {
         found->second.normal_forms.emplace_back(target_text, poly_to_string(result, R));
