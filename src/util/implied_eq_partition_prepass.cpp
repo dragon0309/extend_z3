@@ -45,6 +45,27 @@ bool assertion_contains_poly(const z3::expr &expression)
     return false;
 }
 
+void collect_projected_constraints(
+    const z3::expr &expression,
+    std::vector<z3::expr> &out)
+{
+    // An asserted positive conjunction implies each of its children, so it is
+    // sound to flatten only AND nodes reached from the assertion root.  Do not
+    // recurse through OR, NOT, implication, ITE, XOR, Boolean equality, or
+    // other contexts: extracting a Poly-free descendant there could strengthen
+    // the projection and make an injected equality unsound.
+    if (expression.is_app() &&
+        expression.decl().decl_kind() == Z3_OP_AND)
+    {
+        for (unsigned i = 0; i < expression.num_args(); ++i)
+            collect_projected_constraints(expression.arg(i), out);
+        return;
+    }
+
+    if (!assertion_contains_poly(expression))
+        out.push_back(expression);
+}
+
 void collect_conversion_bases(const z3::expr &expression,
                               std::unordered_set<Z3_ast> &out)
 {
@@ -121,8 +142,7 @@ PrepassResult run_eqp_prepass(
     PrepassResult output;
     std::vector<z3::expr> constraints;
     for (const z3::expr &assertion : source_assertions)
-        if (!assertion_contains_poly(assertion))
-            constraints.push_back(assertion);
+        collect_projected_constraints(assertion, constraints);
     output.constraints = constraints.size();
 
     std::unordered_set<Z3_ast> conversion_bases;

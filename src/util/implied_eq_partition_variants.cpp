@@ -683,11 +683,10 @@ Result run_parallel_bpr(
     return output;
 }
 
-Result run_incremental_bpr(z3::context &context,
-                           const std::vector<z3::expr> &constraints,
-                           const std::vector<z3::expr> &terms,
-                           Variant variant,
-                           util::Logger *log)
+Result run_hipr(z3::context &context,
+                const std::vector<z3::expr> &constraints,
+                const std::vector<z3::expr> &terms,
+                util::Logger *log)
 {
     Result output;
     output.statistics.terms = terms.size();
@@ -776,29 +775,20 @@ Result run_incremental_bpr(z3::context &context,
             for (std::size_t i = 1; i < block.size(); ++i)
             {
                 const std::size_t member = block[i];
-                if (variant == Variant::Hipr)
+                const std::uint64_t key = edge_key(representative, member);
+                auto found = hipr_edges.find(key);
+                if (found == hipr_edges.end())
                 {
-                    const std::uint64_t key = edge_key(representative, member);
-                    auto found = hipr_edges.find(key);
-                    if (found == hipr_edges.end())
-                    {
-                        auto inserted = hipr_edges.emplace(
-                            key, terms[representative] != terms[member]);
-                        found = inserted.first;
-                        ++fresh_edges;
-                    }
-                    else
-                    {
-                        ++reused_edges;
-                    }
-                    differences.push_back(found->second);
+                    auto inserted = hipr_edges.emplace(
+                        key, terms[representative] != terms[member]);
+                    found = inserted.first;
+                    ++fresh_edges;
                 }
                 else
                 {
-                    differences.push_back(
-                        terms[representative] != terms[member]);
-                    ++fresh_edges;
+                    ++reused_edges;
                 }
+                differences.push_back(found->second);
             }
         }
 
@@ -813,9 +803,6 @@ Result run_incremental_bpr(z3::context &context,
         }
 
         const z3::expr splitter = z3::mk_or(differences);
-        const bool scoped = variant == Variant::ScopedBpr;
-        if (scoped)
-            solver.push();
         solver.add(splitter);
 
         const auto check_started = clk::now();
@@ -829,7 +816,7 @@ Result run_incremental_bpr(z3::context &context,
         {
             LOG_INFO(*log, "eqpartition",
                      std::string("partition variant progress: algorithm=") +
-                         variant_name(variant) +
+                         variant_name(Variant::Hipr) +
                          " checks=" +
                          std::to_string(output.statistics.checks) +
                          " blocks=" + std::to_string(blocks.size()) +
@@ -861,9 +848,6 @@ Result run_incremental_bpr(z3::context &context,
                 throw std::runtime_error(
                     "SAT splitter model did not refine any partition block");
         }
-
-        if (scoped)
-            solver.pop();
     }
 
     if (output.status == Status::Error)
@@ -1349,10 +1333,6 @@ const char *variant_name(Variant variant)
     {
     case Variant::Z3Mpm:
         return "z3-mpm";
-    case Variant::ScopedBpr:
-        return "scoped-bpr";
-    case Variant::AccumulatingBpr:
-        return "accumulating-bpr";
     case Variant::Hipr:
         return "hipr";
     case Variant::Ipr:
@@ -1424,9 +1404,10 @@ Result run_variant(z3::context &source_context,
         else if (variant == Variant::ParallelBpr)
             output = run_parallel_bpr(
                 context, constraints, terms, options, log);
+        else if (variant == Variant::Hipr)
+            output = run_hipr(context, constraints, terms, log);
         else
-            output = run_incremental_bpr(
-                context, constraints, terms, variant, log);
+            throw std::runtime_error("unsupported partition variant");
     }
     catch (const z3::exception &ex)
     {

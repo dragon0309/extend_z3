@@ -17,8 +17,6 @@ namespace util::eqpartition
 enum class Variant
 {
     Z3Mpm,
-    ScopedBpr,
-    AccumulatingBpr,
     Hipr,
     Ipr,
     Abipr,
