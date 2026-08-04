@@ -59,6 +59,7 @@ struct LiveValidatorStatistics
     std::size_t queue_high_water = 0;
     std::size_t tasks_started = 0;
     std::size_t seed_checks = 0;
+    std::size_t seed_unsat = 0;
     std::size_t seed_models = 0;
     std::size_t seed_initial_pruned = 0;
     std::size_t seed_late_pruned = 0;
@@ -94,9 +95,10 @@ public:
     LiveGlobalEqValidator(const LiveGlobalEqValidator &) = delete;
     LiveGlobalEqValidator &operator=(const LiveGlobalEqValidator &) = delete;
 
-    // Candidates observed directly by the Main Solver equality callback.
-    bool submit_callback_candidate(std::size_t lhs, std::size_t rhs,
-                                   std::size_t scope_depth);
+    // Primary candidates, including direct Main Solver observations and
+    // offline clients that do not use the derived-candidate queue.
+    bool submit_direct_candidate(std::size_t lhs, std::size_t rhs,
+                                 std::size_t scope_depth);
     // Candidates derived only from the Main Solver's scoped callback graph.
     bool submit_derived_candidate(std::size_t lhs, std::size_t rhs,
                                   std::size_t scope_depth);

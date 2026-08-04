@@ -60,6 +60,7 @@ struct WorkerState
     std::vector<z3::expr> constraints;
     std::vector<z3::expr> terms;
     std::unique_ptr<z3::solver> solver;
+    unsigned random_seed = 0;
 };
 
 struct Counterexample
@@ -84,6 +85,7 @@ std::unique_ptr<WorkerState> make_worker_state(
     bool seed_models)
 {
     auto worker = std::make_unique<WorkerState>();
+    worker->random_seed = static_cast<unsigned>(worker_index);
     worker->context = std::make_unique<z3::context>();
     worker->constraints.reserve(constraints.size());
     worker->terms.reserve(terms.size());
@@ -101,9 +103,8 @@ std::unique_ptr<WorkerState> make_worker_state(
     {
         worker->solver = std::make_unique<z3::solver>(*worker->context);
         worker->solver->set("timeout", timeout_ms);
-        if (worker_index != 0)
-            worker->solver->set("random_seed",
-                                static_cast<unsigned>(worker_index));
+        if (worker->random_seed != 0)
+            worker->solver->set("random_seed", worker->random_seed);
         for (const z3::expr &constraint : worker->constraints)
             worker->solver->add(constraint);
     }
@@ -182,7 +183,7 @@ struct LiveGlobalEqValidator::Impl
                          std::string(options.unified_queue
                                          ? "unified"
                                          : "split-direct-derived") +
-                         " survivor_policy=origin-64" +
+                         " survivor_policy=origin-batch" +
                          " terms=" + std::to_string(terms.size()) +
                          " candidate_source=main-callback");
     }
@@ -362,7 +363,6 @@ struct LiveGlobalEqValidator::Impl
         ++stats.counterexample_models;
         if (seed)
             ++stats.seed_models;
-
         // Mark queued tasks refuted eagerly. Stale queue entries are skipped by
         // pop_task; running batches finish against their own model.
         const auto &latest = counterexamples.back().values;
@@ -494,6 +494,8 @@ struct LiveGlobalEqValidator::Impl
             // substantially faster on these formulas.
             z3::solver validator(*worker.context);
             validator.set("timeout", options.timeout_ms);
+            if (worker.random_seed != 0)
+                validator.set("random_seed", worker.random_seed);
             for (const z3::expr &constraint : worker.constraints)
                 validator.add(constraint);
             z3::expr_vector differences(*worker.context);
@@ -531,7 +533,7 @@ struct LiveGlobalEqValidator::Impl
 
                 // Do not recursively validate a shrinking survivor set in
                 // isolation. Requeue survivors so they coalesce with later
-                // candidates into full 64-candidate batches. The split policy
+                // candidates into full batches. The split policy
                 // returns them to their origin; the unified policy mixes both
                 // origins while retaining the record's direct metadata.
                 {
@@ -650,6 +652,8 @@ struct LiveGlobalEqValidator::Impl
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 ++stats.seed_checks;
+                if (seed_result == z3::unsat)
+                    ++stats.seed_unsat;
                 stats.seed_time += seed_elapsed;
                 ++initial_models_ready;
                 if (initial_models_ready == worker_states.size())
@@ -714,8 +718,8 @@ struct LiveGlobalEqValidator::Impl
         }
     }
 
-    bool submit_callback(std::size_t lhs, std::size_t rhs,
-                         std::size_t scope_depth)
+    bool submit_direct(std::size_t lhs, std::size_t rhs,
+                       std::size_t scope_depth)
     {
         return enqueue_candidate(lhs, rhs, true, scope_depth);
     }
@@ -786,10 +790,10 @@ LiveGlobalEqValidator::LiveGlobalEqValidator(
 
 LiveGlobalEqValidator::~LiveGlobalEqValidator() = default;
 
-bool LiveGlobalEqValidator::submit_callback_candidate(
+bool LiveGlobalEqValidator::submit_direct_candidate(
     std::size_t lhs, std::size_t rhs, std::size_t scope_depth)
 {
-    return m_impl->submit_callback(lhs, rhs, scope_depth);
+    return m_impl->submit_direct(lhs, rhs, scope_depth);
 }
 
 bool LiveGlobalEqValidator::submit_derived_candidate(
