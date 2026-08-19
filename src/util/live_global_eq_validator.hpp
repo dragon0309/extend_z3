@@ -38,6 +38,10 @@ struct LiveValidatorOptions
     std::size_t batch_size = 64;
     bool start_paused = true;
     bool seed_models = true;
+    // When false, a SAT model only refutes candidates in the query that
+    // produced it. This is useful for backend benchmarks that must execute
+    // every singleton query instead of pruning queued work opportunistically.
+    bool share_counterexamples = true;
     bool unified_queue = false;
 };
 

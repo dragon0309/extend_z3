@@ -529,7 +529,8 @@ struct LiveGlobalEqValidator::Impl
                             survivors.push_back(task);
                     notify_idle_if_ready();
                 }
-                add_counterexample(std::move(values), false);
+                if (options.share_counterexamples)
+                    add_counterexample(std::move(values), false);
 
                 // Do not recursively validate a shrinking survivor set in
                 // isolation. Requeue survivors so they coalesce with later

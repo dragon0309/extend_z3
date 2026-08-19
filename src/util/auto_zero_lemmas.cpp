@@ -255,7 +255,11 @@ std::vector<expr> discover_bv1_zero_callback_candidates(
 std::vector<expr> validate_bv1_zero_candidates(
     context &ctx, const std::vector<expr> &projected_constraints,
     const std::vector<expr> &candidates, std::size_t batch_size,
-    const char *mode_name, util::Logger &log)
+    const char *mode_name, util::Logger *log,
+    SingletonZeroValidationResult *validation_result = nullptr,
+    unsigned timeout_ms = BV1_ZERO_TIMEOUT_MS,
+    std::size_t workers = BV1_ZERO_WORKERS,
+    bool exact_queries = false)
 {
     if (candidates.empty())
         return {};
@@ -266,11 +270,12 @@ std::vector<expr> validate_bv1_zero_candidates(
     validation_terms.push_back(zero);
 
     util::eqgb::LiveValidatorOptions options;
-    options.workers = BV1_ZERO_WORKERS;
-    options.timeout_ms = BV1_ZERO_TIMEOUT_MS;
+    options.workers = workers;
+    options.timeout_ms = timeout_ms;
     options.batch_size = batch_size;
     options.start_paused = true;
-    options.seed_models = true;
+    options.seed_models = !exact_queries;
+    options.share_counterexamples = !exact_queries;
     options.unified_queue = true;
 
     const auto started = clk::now();
@@ -299,36 +304,62 @@ std::vector<expr> validate_bv1_zero_candidates(
     // useful, and obscures whether zero discovery contributed to the proof.
     if (stats.seed_unsat != 0)
     {
-        LOG_INFO(log, "auto-zero-lemmas",
-                 "[auto-zero-lemmas] projected constraints are unsat; "
-                 "skipping vacuous zero lemmas");
+        if (validation_result)
+        {
+            validation_result->candidates = candidates.size();
+            validation_result->checks = stats.checks;
+            validation_result->refuted = stats.refuted;
+            validation_result->unknown = stats.unknown;
+            validation_result->model_pruned = stats.model_pruned;
+            validation_result->constraints_unsat = true;
+            validation_result->elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    clk::now() - started);
+        }
+        if (log)
+            LOG_INFO(*log, "auto-zero-lemmas",
+                     "[auto-zero-lemmas] projected constraints are unsat; "
+                     "skipping vacuous zero lemmas");
         return {};
     }
 
     sort_unique_exprs(proved);
-    for (const expr &term : proved)
-        LOG_INFO(log, "auto-zero-lemmas",
-                 "[auto-zero-lemmas] proved-validation-zero: " +
-                     term.to_string() +
-                     " == #b0");
-    LOG_INFO(log, "auto-zero-lemmas",
-             std::string("[auto-zero-lemmas] validation-summary mode=") +
-                 mode_name + " candidates=" +
-                 std::to_string(candidates.size()) +
-                 " workers=" +
-                 std::to_string(options.workers) +
-                 " batch=" + std::to_string(options.batch_size) +
-                 " timeout-ms=" + std::to_string(options.timeout_ms) +
-                 " checks=" + std::to_string(stats.checks) +
-                 " proved=" + std::to_string(proved.size()) +
-                 " refuted=" + std::to_string(stats.refuted) +
-                 " unknown=" + std::to_string(stats.unknown) +
-                 " pending=" + std::to_string(stats.pending) +
-                 " seed-checks=" + std::to_string(stats.seed_checks) +
-                 " seed-unsat=" + std::to_string(stats.seed_unsat) +
-                 " seed-models=" + std::to_string(stats.seed_models) +
-                 " model-pruned=" + std::to_string(stats.model_pruned) +
-                 " time=" + util::fmt_duration(clk::now() - started));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        clk::now() - started);
+    if (validation_result)
+    {
+        validation_result->proved_terms = proved;
+        validation_result->candidates = candidates.size();
+        validation_result->checks = stats.checks;
+        validation_result->refuted = stats.refuted;
+        validation_result->unknown = stats.unknown;
+        validation_result->model_pruned = stats.model_pruned;
+        validation_result->elapsed = elapsed;
+    }
+    if (log)
+    {
+        for (const expr &term : proved)
+            LOG_INFO(*log, "auto-zero-lemmas",
+                     "[auto-zero-lemmas] proved-validation-zero: " +
+                         term.to_string() + " == #b0");
+        LOG_INFO(*log, "auto-zero-lemmas",
+                 std::string("[auto-zero-lemmas] validation-summary mode=") +
+                     mode_name + " candidates=" +
+                     std::to_string(candidates.size()) +
+                     " workers=" + std::to_string(options.workers) +
+                     " batch=" + std::to_string(options.batch_size) +
+                     " timeout-ms=" + std::to_string(options.timeout_ms) +
+                     " checks=" + std::to_string(stats.checks) +
+                     " proved=" + std::to_string(proved.size()) +
+                     " refuted=" + std::to_string(stats.refuted) +
+                     " unknown=" + std::to_string(stats.unknown) +
+                     " pending=" + std::to_string(stats.pending) +
+                     " seed-checks=" + std::to_string(stats.seed_checks) +
+                     " seed-unsat=" + std::to_string(stats.seed_unsat) +
+                     " seed-models=" + std::to_string(stats.seed_models) +
+                     " model-pruned=" + std::to_string(stats.model_pruned) +
+                     " time=" + util::fmt_duration(elapsed));
+    }
     return proved;
 }
 
@@ -381,10 +412,26 @@ std::vector<expr> prove_bv1_zero_candidates(
                  std::to_string(BV1_ZERO_BATCH_SIZE));
     return validate_bv1_zero_candidates(
         ctx, projected_constraints, terms, BV1_ZERO_BATCH_SIZE,
-        "grouped-zero-anchor", log);
+        "grouped-zero-anchor", &log);
 }
 
 } // namespace
+
+SingletonZeroValidationResult validate_bv1_singleton_zeros(
+    context &ctx, const std::vector<expr> &projected_constraints,
+    const std::vector<expr> &candidates, util::Logger *log,
+    unsigned timeout_ms, std::size_t workers, bool exact_queries)
+{
+    SingletonZeroValidationResult result;
+    result.candidates = candidates.size();
+    if (candidates.empty())
+        return result;
+    (void)validate_bv1_zero_candidates(
+        ctx, projected_constraints, candidates,
+        BV1_ZERO_CALLBACK_BATCH_SIZE, "partition-bv1-singleton-zero",
+        log, &result, timeout_ms, workers, exact_queries);
+    return result;
+}
 
 Result discover_implied_zeros(context &ctx,
                               const std::vector<expr> &assertions,
@@ -444,7 +491,7 @@ Result discover_implied_zeros(context &ctx,
         result.validation_candidate_count = callback_candidates.size();
         proved_terms = validate_bv1_zero_candidates(
             ctx, projected_constraints, callback_candidates,
-            BV1_ZERO_CALLBACK_BATCH_SIZE, "callback", log);
+            BV1_ZERO_CALLBACK_BATCH_SIZE, "callback", &log);
     }
     else
     {
