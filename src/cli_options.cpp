@@ -110,8 +110,6 @@ ParseResult parse_options(int argc, char **argv)
         const std::string arg = argv[i];
         if (arg == "--ring-detail")
             options.ring_detail = true;
-        else if (arg == "--env")
-            options.env = true;
         else if (arg == "--no-trace")
             options.no_trace = true;
         else if (arg == "--disable-all-false")
@@ -154,8 +152,8 @@ ParseResult parse_options(int argc, char **argv)
             options.eq_gb_live_hybrid = true;
         else if (arg == "--eq-gb-live-partition-refinement")
             options.eq_gb_live_partition_refinement = true;
-        else if (arg == "--eq-gb-live-partition-propagation")
-            options.eq_gb_live_partition_propagation = true;
+        else if (arg == "--eq-gb-partition-prepass-propagation")
+            options.eq_gb_partition_prepass_propagation = true;
         else if (arg == "--eq-gb-live-unified-queue")
             options.eq_gb_live_unified_queue = true;
         else if (arg == "--eq-gb-live-no-propagation")
@@ -571,11 +569,11 @@ ParseResult parse_options(int argc, char **argv)
         return error_result(
             std::move(options),
             "--eq-gb-live-hybrid and --eq-gb-live-partition-refinement are mutually exclusive");
-    if (options.eq_gb_live_partition_propagation &&
+    if (options.eq_gb_partition_prepass_propagation &&
         !options.enable_eq_gb_partition_prepass)
         return error_result(
             std::move(options),
-            "--eq-gb-live-partition-propagation requires --enable-eq-gb-partition-prepass");
+            "--eq-gb-partition-prepass-propagation requires --enable-eq-gb-partition-prepass");
     if (options.eq_gb_partition_prepass_workers &&
         !options.enable_eq_gb_partition_prepass)
         return error_result(
@@ -791,7 +789,7 @@ ParseResult parse_options(int argc, char **argv)
 void print_usage(std::ostream &os, const char *program)
 {
     os << "Usage: " << program
-       << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
+       << " <input.smt2> [--ring-detail] [--no-trace]"
           " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
           " [--m-prime]"
           " [--auto-zero-lemmas]"
@@ -805,7 +803,7 @@ void print_usage(std::ostream &os, const char *program)
           " [--enable-eq-gb-live]"
           " [--eq-gb-live-hybrid]"
           " [--eq-gb-live-partition-refinement]"
-          " [--eq-gb-live-partition-propagation]"
+          " [--eq-gb-partition-prepass-propagation]"
           " [--eq-gb-live-workers <N>]"
           " [--eq-gb-live-unified-queue]"
           " [--eq-gb-live-no-seed-models]"
@@ -855,7 +853,7 @@ void print_usage(std::ostream &os, const char *program)
           " [--eq-gb-refutation-processes <N>]"
        << util::eq_callback_usage()
        << " [--show-model]"
-          " [--rewrite-log] [--groebner-ring-order]\n";
+          " [--rewrite-log] [--disable-groebner-ring-order]\n";
 }
 
 } // namespace cli

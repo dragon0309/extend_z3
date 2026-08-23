@@ -46,7 +46,6 @@ struct Options
     std::string option_summary = "(none)";
 
     bool ring_detail = false;
-    bool env = false;
     bool no_trace = false;
     bool enable_all_false = true;
     bool enable_all_true = true;
@@ -76,7 +75,7 @@ struct Options
     bool enable_eq_gb_live = false;
     bool eq_gb_live_hybrid = false;
     bool eq_gb_live_partition_refinement = false;
-    bool eq_gb_live_partition_propagation = false;
+    bool eq_gb_partition_prepass_propagation = false;
     bool eq_gb_live_propagate = true;
     bool eq_gb_live_generators = true;
     bool eq_gb_live_seed_models = true;

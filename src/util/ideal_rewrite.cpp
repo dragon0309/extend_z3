@@ -369,7 +369,7 @@ void rewrite_inputs(std::vector<poly> &owned_generators,
     if (log)
     {
         std::ostringstream message;
-        message << "[ideal-rewrite] " << label
+        message << "[monic-variable-elimination] " << label
                 << ": generators=" << stats.input_generators
                 << "->" << stats.output_generators
                 << " targets=" << stats.input_targets

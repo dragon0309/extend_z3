@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "util/gb_preprocess.hpp"
+#include "util/ideal_rewrite.hpp"
 #include "util/singular_dump.hpp"
 
 namespace util::singular
@@ -182,6 +183,13 @@ LiftBatchResult prove_with_lift_support(
                 membership_detail::verify_ideal_equality(
                     raw_generators, owned_generators, R, label,
                     result.groebner, log);
+        }
+
+        if (options.ideal_rewrite)
+        {
+            util::ideal_rewrite::IdealRewriteStats stats;
+            util::ideal_rewrite::rewrite_inputs(
+                owned_generators, owned_targets, R, label, stats, log);
         }
 
         result.preprocessed_generator_count = owned_generators.size();

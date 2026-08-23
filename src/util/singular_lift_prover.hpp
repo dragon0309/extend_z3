@@ -16,6 +16,7 @@ struct LiftProverOptions
 {
     bool preprocess = false;
     bool verify_preprocess = false;
+    bool ideal_rewrite = false;
     bool extract_support = false;
 };
 
