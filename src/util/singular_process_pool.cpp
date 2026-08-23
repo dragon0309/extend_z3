@@ -23,6 +23,7 @@
 #include "util/gb_preprocess.hpp"
 #include "util/logger.hpp"
 #include "util/singular_dump.hpp"
+#include "util/singular_poly.hpp"
 #include "util/singular_runtime_stats.hpp"
 
 namespace util::singular
@@ -277,15 +278,6 @@ poly poly_from_wire(const std::string &value, ring R)
             p_Delete(&result, R);
         throw;
     }
-}
-
-void delete_polys(std::vector<poly> &values, ring R)
-{
-    rChangeCurrRing(R);
-    for (poly &value : values)
-        if (value)
-            p_Delete(&value, R);
-    values.clear();
 }
 
 class PolyVectorGuard

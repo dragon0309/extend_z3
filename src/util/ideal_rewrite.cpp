@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "util/fmt_duration.hpp"
+#include "util/singular_poly.hpp"
 
 namespace util::ideal_rewrite
 {
@@ -24,21 +25,9 @@ struct Rule
     std::size_t source = 0;
 };
 
-void delete_poly(poly &value, ring R)
-{
-    if (value != nullptr)
-        p_Delete(&value, R);
-    value = nullptr;
-}
-
-poly one_poly(ring R)
-{
-    return p_NSet(n_Init(1, R->cf), R);
-}
-
 poly variable_poly(int variable, ring R)
 {
-    poly result = one_poly(R);
+    poly result = util::singular::poly_one(R);
     p_SetExp(result, variable, 1, R);
     p_Setm(result, R);
     return result;
@@ -114,12 +103,12 @@ bool extract_rule(poly generator, std::size_t source, ring R, Rule &out)
 
 poly power_copy(poly base, int exponent, ring R)
 {
-    poly result = one_poly(R);
+    poly result = util::singular::poly_one(R);
     for (int i = 0; i < exponent; ++i)
     {
         if (base == nullptr)
         {
-            delete_poly(result, R);
+            util::singular::delete_poly_if_nonnull(result, R);
             return nullptr;
         }
         result = p_Mult_q(result, p_Copy(base, R), R);
@@ -150,7 +139,7 @@ poly substitute_copy(poly input, int variable, poly rhs, ring R, bool &changed)
                                   ? nullptr
                                   : p_Mult_q(monomial, replacement, R);
         if (replacement == nullptr)
-            delete_poly(monomial, R);
+            util::singular::delete_poly_if_nonnull(monomial, R);
         if (rewritten_term != nullptr)
             result = result == nullptr
                          ? rewritten_term
@@ -167,7 +156,7 @@ bool substitute_owned(poly &value, const Rule &rule, ring R)
         return false;
     bool changed = false;
     poly rewritten = substitute_copy(value, rule.variable, rule.rhs, R, changed);
-    delete_poly(value, R);
+    util::singular::delete_poly_if_nonnull(value, R);
     value = rewritten;
     return changed;
 }
@@ -227,7 +216,7 @@ void compose_rules(std::vector<Rule> &rules,
 void delete_rules(std::vector<Rule> &rules, ring R)
 {
     for (Rule &rule : rules)
-        delete_poly(rule.rhs, R);
+        util::singular::delete_poly_if_nonnull(rule.rhs, R);
     rules.clear();
 }
 
@@ -252,7 +241,7 @@ bool compact_and_deduplicate(std::vector<poly> &generators,
             });
         if (duplicate)
         {
-            delete_poly(generator, R);
+            util::singular::delete_poly_if_nonnull(generator, R);
             ++stats.duplicate_generators_dropped;
             changed = true;
             continue;
@@ -296,7 +285,7 @@ void rewrite_inputs(std::vector<poly> &owned_generators,
                     continue;
                 if (!first_by_variable.emplace(candidate.variable, rules.size()).second)
                 {
-                    delete_poly(candidate.rhs, R);
+                    util::singular::delete_poly_if_nonnull(candidate.rhs, R);
                     continue;
                 }
                 rules.push_back(candidate);
@@ -310,7 +299,7 @@ void rewrite_inputs(std::vector<poly> &owned_generators,
                 // Match the assertion pipeline's functional worklist fallback:
                 // consume one safe rule, then extract again from the residuals.
                 for (std::size_t i = 1; i < rules.size(); ++i)
-                    delete_poly(rules[i].rhs, R);
+                    util::singular::delete_poly_if_nonnull(rules[i].rhs, R);
                 rules.resize(1);
                 order.assign(1, 0);
                 ++stats.cycle_worklist_steps;
@@ -332,7 +321,7 @@ void rewrite_inputs(std::vector<poly> &owned_generators,
                 owned_generators[i] = nullptr;
                 if (consumed[i])
                 {
-                    delete_poly(value, R);
+                    util::singular::delete_poly_if_nonnull(value, R);
                     continue;
                 }
                 bool rewritten = false;

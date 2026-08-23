@@ -1,5 +1,6 @@
 #include "util/singular_dump.hpp"
 
+#include "util/singular_poly.hpp"
 #include "util/singular_runtime_stats.hpp"
 
 #include <algorithm>
@@ -68,47 +69,6 @@ std::string sanitize_label(std::string label)
     if (label.size() > max_length)
         label.resize(max_length);
     return label;
-}
-
-std::string term_to_string(poly term, ring R)
-{
-    number coefficient = n_Copy(p_GetCoeff(term, R), R->cf);
-    poly copy = p_NSet(coefficient, R);
-    for (int i = 1; i <= R->N; ++i)
-    {
-        const long exponent = p_GetExp(term, i, R);
-        if (exponent != 0)
-            p_SetExp(copy, i, exponent, R);
-    }
-    const long component = p_GetComp(term, R);
-    if (component != 0)
-        p_SetComp(copy, component, R);
-    p_Setm(copy, R);
-
-    char *raw = p_String(copy, R);
-    std::string result = raw ? std::string(raw) : std::string("0");
-    if (raw)
-        omFree(raw);
-    p_Delete(&copy, R);
-    return result;
-}
-
-std::string poly_to_string(poly value, ring R)
-{
-    if (!value)
-        return "0";
-
-    std::ostringstream out;
-    bool first = true;
-    for (poly term = value; term; term = pNext(term))
-    {
-        const std::string text = term_to_string(term, R);
-        if (!first && !text.empty() && text.front() != '-')
-            out << '+';
-        out << text;
-        first = false;
-    }
-    return first ? std::string("0") : out.str();
 }
 
 std::vector<std::string> ideal_to_strings(ideal value, ring R)

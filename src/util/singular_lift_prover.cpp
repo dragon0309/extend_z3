@@ -7,26 +7,12 @@
 #include "util/gb_preprocess.hpp"
 #include "util/ideal_rewrite.hpp"
 #include "util/singular_dump.hpp"
+#include "util/singular_poly.hpp"
 
 namespace util::singular
 {
 namespace
 {
-
-void delete_poly(poly &p, ring R)
-{
-    if (p != nullptr)
-        p_Delete(&p, R);
-    p = nullptr;
-}
-
-void delete_polys(std::vector<poly> &polys, ring R)
-{
-    rChangeCurrRing(R);
-    for (poly &p : polys)
-        delete_poly(p, R);
-    polys.clear();
-}
 
 poly copy_lift_vector_component(ideal lift,
                                 std::size_t index,
@@ -109,7 +95,7 @@ std::vector<std::size_t> extract_support(ideal source,
             if (coefficient != nullptr)
             {
                 original_indices.insert(origins[i]);
-                delete_poly(coefficient, R);
+                delete_poly_if_nonnull(coefficient, R);
             }
         }
         support.assign(original_indices.begin(), original_indices.end());
@@ -160,13 +146,13 @@ LiftBatchResult prove_with_lift_support(
         owned_generators.reserve(generators.size());
         for (std::size_t i = 0; i < generators.size(); ++i)
         {
-            owned_generators.push_back(generators[i] ? p_Copy(generators[i], R) : nullptr);
+            owned_generators.push_back(copy_poly_or_null(generators[i], R));
             if (generators[i])
                 result.active_generator_indices.push_back(i);
         }
         owned_targets.reserve(targets.size());
         for (poly target : targets)
-            owned_targets.push_back(target ? p_Copy(target, R) : nullptr);
+            owned_targets.push_back(copy_poly_or_null(target, R));
 
         if (options.preprocess)
         {
@@ -174,7 +160,7 @@ LiftBatchResult prove_with_lift_support(
             {
                 raw_generators.reserve(owned_generators.size());
                 for (poly generator : owned_generators)
-                    raw_generators.push_back(generator ? p_Copy(generator, R) : nullptr);
+                    raw_generators.push_back(copy_poly_or_null(generator, R));
             }
             util::gb::GbPreprocessStats stats;
             util::gb::preprocess_groebner_inputs(
@@ -231,7 +217,7 @@ LiftBatchResult prove_with_lift_support(
                 poly normal = util::singular::normal_form(
                     basis, p_Copy(owned_targets[i], R), R, label);
                 target_result.member = normal == nullptr;
-                delete_poly(normal, R);
+                delete_poly_if_nonnull(normal, R);
             }
         }
 

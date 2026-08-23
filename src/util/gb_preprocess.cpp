@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "util/logger.hpp"
+#include "util/singular_poly.hpp"
 #include "util/singular_runtime_stats.hpp"
 
 namespace util::gb
@@ -12,49 +13,11 @@ namespace util::gb
 namespace
 {
 
-static number num_from_si_local(long v, const coeffs cf)
-{
-    mpz_t z;
-    mpz_init_set_si(z, v);
-    number n = n_InitMPZ(z, cf);
-    mpz_clear(z);
-    return n;
-}
-
-static poly poly_from_mpz_local(const mpz_class &v, const ring R)
-{
-    mpz_t z;
-    mpz_init_set(z, v.get_mpz_t());
-    number n = n_InitMPZ(z, R->cf);
-    mpz_clear(z);
-    return p_NSet(n, R);
-}
-
-static poly poly_from_si_local(long v, const ring R)
-{
-    return p_NSet(num_from_si_local(v, R->cf), R);
-}
-
-static poly copy_poly_or_null_local(poly p, const ring R)
-{
-    return p ? p_Copy(p, R) : nullptr;
-}
-
-static void delete_poly_if_nonnull_local(poly &p, const ring R)
-{
-    if (p)
-        p_Delete(&p, R);
-    p = nullptr;
-}
-
-static poly poly_add_owned_local(poly a, poly b, const ring R)
-{
-    if (!a)
-        return b;
-    if (!b)
-        return a;
-    return p_Add_q(a, b, R);
-}
+using util::singular::copy_poly_or_null;
+using util::singular::delete_poly_if_nonnull;
+using util::singular::poly_add_owned;
+using util::singular::poly_from_mpz;
+using util::singular::poly_from_si;
 
 static mpz_class number_to_mpz(number n, const ring R)
 {
@@ -122,7 +85,7 @@ static poly poly_term_from_source(poly src, const mpz_class &coeff, const ring R
 {
     if (coeff == 0)
         return nullptr;
-    poly out = poly_from_mpz_local(coeff, R);
+    poly out = poly_from_mpz(coeff, R);
     for (int i = 1; i <= R->N; ++i)
     {
         int e = p_GetExp(src, i, R);
@@ -153,7 +116,7 @@ static poly poly_coeffs_mod(poly p, const mpz_class &modulus, const ring R, bool
         }
         changed = changed || c != original;
         poly nt = poly_term_from_source(t, c, R);
-        out = poly_add_owned_local(out, nt, R);
+        out = poly_add_owned(out, nt, R);
     }
     if (out != nullptr)
         p_Normalize(out, R);
@@ -172,11 +135,11 @@ static poly poly_divide_coeffs_exact(poly p, const mpz_class &divisor, const rin
         {
             if (out)
                 p_Delete(&out, R);
-            return copy_poly_or_null_local(p, R);
+            return copy_poly_or_null(p, R);
         }
         c /= divisor;
         poly nt = poly_term_from_source(t, c, R);
-        out = poly_add_owned_local(out, nt, R);
+        out = poly_add_owned(out, nt, R);
     }
     if (out != nullptr)
         p_Normalize(out, R);
@@ -329,18 +292,18 @@ void preprocess_groebner_inputs(std::vector<poly> &gens,
     if (d == 1)
     {
         for (poly &g : gens)
-            delete_poly_if_nonnull_local(g, R);
+            delete_poly_if_nonnull(g, R);
         gens.clear();
         if (gen_origins)
             gen_origins->clear();
-        gens.push_back(poly_from_si_local(1, R));
+        gens.push_back(poly_from_si(1, R));
         if (gen_origins)
             gen_origins->push_back(-1);
     }
     else if (d > 0)
     {
         // Keep <d> in the generators. Coefficient reduction modulo d relies on this invariant.
-        gens.push_back(poly_from_mpz_local(d, R));
+        gens.push_back(poly_from_mpz(d, R));
         if (gen_origins)
             gen_origins->push_back(-1);
     }

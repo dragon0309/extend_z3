@@ -9,6 +9,7 @@
 #include "util/gb_preprocess.hpp"
 #include "util/ideal_rewrite.hpp"
 #include "util/singular_dump.hpp"
+#include "util/singular_poly.hpp"
 
 namespace util::singular
 {
@@ -16,21 +17,6 @@ namespace
 {
 
 using clk = std::chrono::steady_clock;
-
-void delete_poly(poly &value, ring R)
-{
-    if (value != nullptr)
-        p_Delete(&value, R);
-    value = nullptr;
-}
-
-void delete_polys(std::vector<poly> &values, ring R)
-{
-    rChangeCurrRing(R);
-    for (poly &value : values)
-        delete_poly(value, R);
-    values.clear();
-}
 
 class PolyVectorOwner
 {
@@ -67,17 +53,6 @@ public:
 
     ideal get() const { return value_; }
 };
-
-std::string poly_to_string(poly value, ring R)
-{
-    if (value == nullptr)
-        return "0";
-    char *raw = p_String(value, R);
-    std::string result = raw ? std::string(raw) : std::string("?");
-    if (raw)
-        omFree(raw);
-    return result;
-}
 
 std::vector<bool> raw_membership(std::vector<poly> owned_generators,
                                  const std::vector<poly> &targets,
@@ -123,7 +98,7 @@ std::vector<bool> raw_membership(std::vector<poly> owned_generators,
         membership[i] = normal == nullptr;
         if (normal_forms)
             (*normal_forms)[i] = poly_to_string(normal, R);
-        delete_poly(normal, R);
+        delete_poly_if_nonnull(normal, R);
     }
     return membership;
 }
@@ -180,7 +155,7 @@ void verify_ideal_equality(const std::vector<poly> &raw_generators,
     std::vector<poly> optimized_owned;
     optimized_owned.reserve(optimized_generators.size());
     for (poly generator : optimized_generators)
-        optimized_owned.push_back(generator ? p_Copy(generator, R) : nullptr);
+        optimized_owned.push_back(copy_poly_or_null(generator, R));
     std::vector<std::string> raw_normal_forms;
     const std::vector<bool> raw_in_optimized = raw_membership(
         std::move(optimized_owned), raw_generators, R,
@@ -189,7 +164,7 @@ void verify_ideal_equality(const std::vector<poly> &raw_generators,
     std::vector<poly> raw_owned;
     raw_owned.reserve(raw_generators.size());
     for (poly generator : raw_generators)
-        raw_owned.push_back(generator ? p_Copy(generator, R) : nullptr);
+        raw_owned.push_back(copy_poly_or_null(generator, R));
     std::vector<std::string> optimized_normal_forms;
     const std::vector<bool> optimized_in_raw = raw_membership(
         std::move(raw_owned), optimized_generators, R,
@@ -252,19 +227,19 @@ MembershipBatchResult prove_membership(
     {
         owned_generators.reserve(generators.size());
         for (poly generator : generators)
-            owned_generators.push_back(generator ? p_Copy(generator, R) : nullptr);
+            owned_generators.push_back(copy_poly_or_null(generator, R));
         owned_targets.reserve(targets.size());
         for (poly target : targets)
-            owned_targets.push_back(target ? p_Copy(target, R) : nullptr);
+            owned_targets.push_back(copy_poly_or_null(target, R));
 
         if (options.verify_preprocess)
         {
             raw_generators.reserve(owned_generators.size());
             for (poly generator : owned_generators)
-                raw_generators.push_back(generator ? p_Copy(generator, R) : nullptr);
+                raw_generators.push_back(copy_poly_or_null(generator, R));
             raw_targets.reserve(targets.size());
             for (poly target : targets)
-                raw_targets.push_back(target ? p_Copy(target, R) : nullptr);
+                raw_targets.push_back(copy_poly_or_null(target, R));
         }
 
         if (options.preprocess)
@@ -274,7 +249,7 @@ MembershipBatchResult prove_membership(
                 preprocess_input_generators.reserve(owned_generators.size());
                 for (poly generator : owned_generators)
                     preprocess_input_generators.push_back(
-                        generator ? p_Copy(generator, R) : nullptr);
+                        copy_poly_or_null(generator, R));
             }
             result.used_preprocess = true;
             util::gb::GbPreprocessStats stats;
