@@ -1,7 +1,16 @@
 #include "util/eqmod_slots.hpp"
+#include "eqmod_engine.hpp"
 
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
+
+static_assert(!std::is_copy_constructible_v<eqmod::P1Compiled>);
+static_assert(!std::is_copy_assignable_v<eqmod::P1Compiled>);
+static_assert(std::is_nothrow_move_constructible_v<eqmod::P1Compiled>);
+static_assert(!std::is_copy_constructible_v<eqmod::NCompiled>);
+static_assert(!std::is_copy_assignable_v<eqmod::NCompiled>);
+static_assert(std::is_nothrow_move_constructible_v<eqmod::NCompiled>);
 
 int main()
 {
