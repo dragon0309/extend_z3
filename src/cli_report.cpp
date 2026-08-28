@@ -151,6 +151,8 @@ void print_summary(
             std::to_string(summary.singular_runtime.worker_max_rss_kb) +
             " KiB");
     output << "\n# Summary\n\n";
+    if (!summary.eqmod_summary.empty())
+        print_value_row(output, "eqmod semantic status:", summary.eqmod_summary);
     begin_timed_row(output, "Verification result:");
     finish_timed_row(output, result_name(summary.result), summary.total_time);
     if (show_model && !terminal_model.empty())

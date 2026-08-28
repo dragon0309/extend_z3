@@ -240,6 +240,9 @@ namespace
         Z3_func_decl ppow = nullptr;
         Z3_func_decl eqp = nullptr;
         Z3_func_decl eqmodp1 = nullptr;
+        Z3_func_decl eqmodp2 = nullptr;
+        Z3_func_decl eqmodp3 = nullptr;
+        Z3_func_decl eqmodp4 = nullptr;
     };
 
     void fill_poly_decls_from_sort(const expr &e, PolyDecls &d)
@@ -296,6 +299,12 @@ namespace
                 d.eqp = fd;
             else if (n == "eqmodP1" && e.num_args() == 3)
                 d.eqmodp1 = fd;
+            else if (n == "eqmodP2" && e.num_args() == 4)
+                d.eqmodp2 = fd;
+            else if (n == "eqmodP3" && e.num_args() == 5)
+                d.eqmodp3 = fd;
+            else if (n == "eqmodP4" && e.num_args() == 6)
+                d.eqmodp4 = fd;
 
             for (unsigned i = 0; i < e.num_args(); ++i)
                 collect_decls_rec(e.arg(i), d);
@@ -353,9 +362,16 @@ namespace
         return mk_decl_app(a.ctx(), d.eqp, {a, b});
     }
 
-    expr mk_eqmodp1(const PolyDecls &d, const expr &a, const expr &b, const expr &m)
+    expr mk_eqmodpn(const PolyDecls &d, unsigned arity,
+                    const expr &a, const expr &b,
+                    const std::vector<expr> &moduli)
     {
-        return mk_decl_app(a.ctx(), d.eqmodp1, {a, b, m});
+        Z3_func_decl decl = arity == 1 ? d.eqmodp1 :
+                            arity == 2 ? d.eqmodp2 :
+                            arity == 3 ? d.eqmodp3 : d.eqmodp4;
+        std::vector<expr> args{a, b};
+        args.insert(args.end(), moduli.begin(), moduli.end());
+        return mk_decl_app(a.ctx(), decl, args);
     }
 
     bool extract_poly_int_constant(const expr &p, mpz_class &k)
@@ -2788,6 +2804,23 @@ namespace
             collect_eqmodP1_rec(e.arg(i), atoms);
     }
 
+    void collect_eqmod_rec(const expr &e, std::vector<expr> &atoms)
+    {
+        if (!e.is_app())
+            return;
+        const std::string name = e.decl().name().str();
+        if ((name == "eqmodP1" && e.num_args() == 3) ||
+            (name == "eqmodP2" && e.num_args() == 4) ||
+            (name == "eqmodP3" && e.num_args() == 5) ||
+            (name == "eqmodP4" && e.num_args() == 6))
+        {
+            atoms.push_back(e);
+            return;
+        }
+        for (unsigned i = 0; i < e.num_args(); ++i)
+            collect_eqmod_rec(e.arg(i), atoms);
+    }
+
     int count_rewrite_vars(const std::vector<expr> &roots)
     {
         std::unordered_set<std::string> vars;
@@ -2811,15 +2844,22 @@ namespace
                 return e.ctx().bool_val(true);
             return mk_eqp(d, a, b);
         }
-        if (e.decl().name().str() == "eqmodP1" && e.num_args() == 3)
+        const std::string name = e.decl().name().str();
+        if ((name == "eqmodP1" && e.num_args() == 3) ||
+            (name == "eqmodP2" && e.num_args() == 4) ||
+            (name == "eqmodP3" && e.num_args() == 5) ||
+            (name == "eqmodP4" && e.num_args() == 6))
         {
-            expr m = simplify_poly(e.arg(2), d);
-            std::vector<expr> active_moduli{m};
+            const unsigned arity = e.num_args() - 2;
+            std::vector<expr> active_moduli;
+            active_moduli.reserve(arity);
+            for (unsigned i = 0; i < arity; ++i)
+                active_moduli.push_back(simplify_poly(e.arg(i + 2), d));
             expr a = normalize_poly_under_moduli(e.arg(0), active_moduli, d, options, stats);
             expr b = normalize_poly_under_moduli(e.arg(1), active_moduli, d, options, stats);
             if (equivalent_poly(a, b, active_moduli, d, options, stats))
                 return e.ctx().bool_val(true);
-            return mk_eqmodp1(d, a, b, m);
+            return mk_eqmodpn(d, arity, a, b, active_moduli);
         }
 
         std::vector<expr> args;
@@ -3250,7 +3290,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     for (const expr &a : input_asserts)
     {
         collect_eqP_rec(a, eqps_before);
-        collect_eqmodP1_rec(a, eqmods_before);
+        collect_eqmod_rec(a, eqmods_before);
     }
     collect_asserted_eqP(input_asserts, asserted_eqps_before);
     out.rewrite_atoms_before = (int)(eqps_before.size() + eqmods_before.size());
@@ -3290,6 +3330,8 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
         std::unordered_set<std::string> suppressed;
         for (const expr &em : eqmods_before)
         {
+            if (em.decl().name().str() != "eqmodP1")
+                continue;
             collect_vars_rec(em.arg(0), suppressed);
             collect_vars_rec(em.arg(1), suppressed);
             collect_vars_rec(em.arg(2), suppressed);
@@ -3329,7 +3371,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     for (const expr &a : out.asserts)
     {
         collect_eqP_rec(a, eqps_after);
-        collect_eqmodP1_rec(a, eqmods_after);
+        collect_eqmod_rec(a, eqmods_after);
     }
     out.rewrite_atoms_after = (int)(eqps_after.size() + eqmods_after.size());
     out.unique_vars_after = count_rewrite_vars(out.asserts);
@@ -3473,6 +3515,9 @@ namespace
 
 (declare-fun eqP ((Poly Int) (Poly Int)) Bool)
 (declare-fun eqmodP1 ((Poly Int) (Poly Int) (Poly Int)) Bool)
+(declare-fun eqmodP2 ((Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
+(declare-fun eqmodP3 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
+(declare-fun eqmodP4 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
 )PRE";
 
     std::vector<expr> parse_assertions(context &ctx, const std::string &body)
@@ -3736,6 +3781,31 @@ int run_rewrite_selftests()
                               return check(rr.asserts.empty(),
                                            "eqmodP1 did not reduce to true after dropping modulus multiple");
                           }));
+
+    run(pipeline_selftest("eqmodP3 uses every modulus during simplification",
+                          "(declare-const m1 Int)(declare-const m2 Int)"
+                          "(assert (eqmodP3 "
+                          "  (PAdd (PMul (PConst 2) (PConst m1))"
+                          "        (PMul (PConst -3) (PConst m2)))"
+                          "  (PConst 0) (PConst m1) (PConst m2) (PConst 0)))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              return check(rr.asserts.empty(),
+                                           "eqmodP3 did not reduce a combination of all moduli to true");
+                          }));
+
+    RewriteOptions preserve_p1_only;
+    preserve_p1_only.preserve_eqmodp1_vars = true;
+    run(pipeline_selftest("preserve-eqmodp1-vars does not suppress eqmodP4 variables",
+                          "(declare-const x Int)"
+                          "(assert (eqP (PConst x) (PConst 9)))"
+                          "(assert (eqmodP4 (PConst x) (PConst 9)"
+                          " (PConst 0) (PConst 0) (PConst 0) (PConst 0)))",
+                          [](context &, const std::vector<expr> &, const RewriteResult &rr)
+                          {
+                              return check(rr.asserts.empty(),
+                                           "P1-only preserve flag prevented eqmodP4 simplification");
+                          }, preserve_p1_only));
 
     run(pipeline_selftest("single affine eqP is fully rewritten",
                           "(declare-const x Int)(declare-const y Int)"

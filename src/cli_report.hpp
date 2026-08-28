@@ -73,6 +73,7 @@ struct Summary
     std::chrono::nanoseconds final_fixed_value_check_time{0};
     util::singular::RuntimeStatistics singular_runtime;
     std::size_t self_max_rss_kb = 0;
+    std::string eqmod_summary;
     z3::check_result result = z3::unknown;
 };
 

@@ -63,6 +63,7 @@ bool assertion_contains_poly(const expr &e)
         return false;
     const std::string name = e.decl().name().str();
     if (name == "eqP" || name == "eqmodP1" || name == "eqmodP2" ||
+        name == "eqmodP3" || name == "eqmodP4" ||
         name == "PConst" || name == "PVar" || name == "PNeg" ||
         name == "PAdd" || name == "PSub" || name == "PMul" || name == "PPow")
         return true;
