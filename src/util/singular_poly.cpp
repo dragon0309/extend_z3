@@ -52,6 +52,59 @@ void delete_polys(std::vector<poly> &values, ring R)
     values.clear();
 }
 
+ScopedPolyOwner::~ScopedPolyOwner()
+{
+    if (value_ && ring_)
+    {
+        rChangeCurrRing(ring_);
+        delete_poly_if_nonnull(value_, ring_);
+    }
+}
+
+ScopedPolyOwner::ScopedPolyOwner(ScopedPolyOwner &&other) noexcept
+    : value_(other.release()), ring_(other.ring_)
+{
+}
+
+ScopedPolyOwner &ScopedPolyOwner::operator=(ScopedPolyOwner &&other) noexcept
+{
+    if (this == &other)
+        return *this;
+    reset();
+    ring_ = other.ring_;
+    value_ = other.release();
+    return *this;
+}
+
+poly ScopedPolyOwner::release() noexcept
+{
+    poly value = value_;
+    value_ = nullptr;
+    return value;
+}
+
+void ScopedPolyOwner::reset(poly value) noexcept
+{
+    if (value_ && ring_)
+    {
+        rChangeCurrRing(ring_);
+        delete_poly_if_nonnull(value_, ring_);
+    }
+    value_ = value;
+}
+
+ScopedPolyVectorOwner::~ScopedPolyVectorOwner()
+{
+    delete_polys(values_, ring_);
+}
+
+std::vector<poly> ScopedPolyVectorOwner::release() noexcept
+{
+    std::vector<poly> values = std::move(values_);
+    values_.clear();
+    return values;
+}
+
 poly poly_mul_clone(poly lhs, poly rhs, ring R)
 {
     return p_Mult_q(p_Copy(lhs, R), p_Copy(rhs, R), R);

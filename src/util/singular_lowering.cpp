@@ -508,12 +508,24 @@ poly polyterm_to_singular_poly(
     if (is_ctor(value, "PNeg", 1))
         return poly_negate_owned(lower_child(0), R);
     if (is_ctor(value, "PAdd", 2))
-        return poly_add_owned(lower_child(0), lower_child(1), R);
+    {
+        ScopedPolyOwner lhs(R, lower_child(0));
+        ScopedPolyOwner rhs(R, lower_child(1));
+        return poly_add_owned(lhs.release(), rhs.release(), R);
+    }
     if (is_ctor(value, "PSub", 2))
-        return poly_add_owned(
-            lower_child(0), poly_negate_owned(lower_child(1), R), R);
+    {
+        ScopedPolyOwner lhs(R, lower_child(0));
+        ScopedPolyOwner rhs(R, lower_child(1));
+        rhs.reset(poly_negate_owned(rhs.release(), R));
+        return poly_add_owned(lhs.release(), rhs.release(), R);
+    }
     if (is_ctor(value, "PMul", 2))
-        return p_Mult_q(lower_child(0), lower_child(1), R);
+    {
+        ScopedPolyOwner lhs(R, lower_child(0));
+        ScopedPolyOwner rhs(R, lower_child(1));
+        return p_Mult_q(lhs.release(), rhs.release(), R);
+    }
     if (is_ctor(value, "PPow", 2))
     {
         std::int64_t exponent = 0;

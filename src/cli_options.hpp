@@ -50,6 +50,8 @@ struct Options
     bool enable_all_false = true;
     bool enable_all_true = true;
     bool enable_mixed = true;
+    // User promise: each same-modulus P1 group handled by the product
+    // refutation generates a prime ideal in the concrete polynomial ring.
     bool all_false_assume_m_prime = false;
     bool enable_rewriting = true;
     bool preserve_eqmodp1_vars = false;
