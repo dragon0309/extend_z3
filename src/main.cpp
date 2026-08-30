@@ -5,6 +5,7 @@
 #include <limits>
 #include <gmp.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -16,9 +17,11 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -26,236 +29,79 @@
 #include <sstream>
 #include <functional>
 
+#include "cli_options.hpp"
+#include "cli_report.hpp"
+#include "eqmod_engine.hpp"
+#include "smt2_frontend.hpp"
+#include "solver_option_adapters.hpp"
+#include "util/auto_zero_lemmas.hpp"
+#include "util/eqmod_slots.hpp"
 #include "util/fmt_duration.hpp"
-#include "util/eq_experiment.hpp"
-#include "util/gb_preprocess.hpp"
+#include "util/bv_eq.hpp"
+#include "util/eq_callback.hpp"
+#include "util/implied_eq_partition_prepass.hpp"
+#include "util/implied_eq_partition_refiner.hpp"
+#include "util/live_global_eq_validator.hpp"
 #include "util/logger.hpp"
 #include "util/rewrite.hpp"
+#include "util/singular_dump.hpp"
+#include "util/singular_capacity.hpp"
+#include "util/singular_lift_prover.hpp"
+#include "util/singular_lowering.hpp"
+#include "util/singular_membership_prover.hpp"
+#include "util/singular_process_pool.hpp"
+#include "util/singular_runtime_stats.hpp"
 
 using namespace z3;
+using namespace util::singular::lowering;
+using util::singular::copy_poly_or_null;
+using util::singular::delete_poly_if_nonnull;
+using util::singular::num_from_si;
+using util::singular::poly_add_owned;
+using util::singular::poly_equal;
+using util::singular::poly_from_mpz;
+using util::singular::poly_from_si;
+using util::singular::poly_mul_clone;
+using util::singular::poly_negate_owned;
+using util::singular::poly_sub_product_clone;
+using util::singular::poly_to_string;
+using util::singular::ScopedPolyOwner;
+using util::singular::ScopedPolyVectorOwner;
 using clk = std::chrono::steady_clock;
 
 static bool SHOW_MODEL = true;
-static bool PRINT_RING_DETAIL = false;
-static bool PRINT_FIXED_ALL = true;
 static bool PRINT_PROPAGATE = true;
-static constexpr int64_t MAX_POW_EXPAND = 65536;
 static util::Logger g_log;
+static cli::Options g_cli;
 
-class TeeStreamBuf : public std::streambuf
+static bool eq_gb_generator_mode_enabled()
 {
-    std::streambuf *a_;
-    std::streambuf *b_;
+    return g_cli.enable_eq_gb_live;
+}
 
-public:
-    TeeStreamBuf(std::streambuf *a, std::streambuf *b) : a_(a), b_(b) {}
-
-protected:
-    int overflow(int ch) override
-    {
-        if (ch == EOF)
-            return !EOF;
-        const int ra = a_ ? a_->sputc((char)ch) : ch;
-        const int rb = b_ ? b_->sputc((char)ch) : ch;
-        return (ra == EOF || rb == EOF) ? EOF : ch;
-    }
-
-    int sync() override
-    {
-        const int sa = a_ ? a_->pubsync() : 0;
-        const int sb = b_ ? b_->pubsync() : 0;
-        return (sa == 0 && sb == 0) ? 0 : -1;
-    }
-};
-
-class ScopedStreamBuf
+static bool eq_gb_live_heuristic_enabled()
 {
-    std::ostream &stream_;
-    std::streambuf *old_;
+    // The pure partition-refinement mode deliberately disables every live
+    // candidate source and validator. The hybrid mode, and the original
+    // --enable-eq-gb-live mode by itself, retain the live heuristic.
+    return g_cli.enable_eq_gb_live &&
+           !g_cli.eq_gb_live_partition_refinement;
+}
 
-public:
-    ScopedStreamBuf(std::ostream &stream, std::streambuf *next)
-        : stream_(stream), old_(stream.rdbuf(next)) {}
-
-    ~ScopedStreamBuf()
-    {
-        stream_.rdbuf(old_);
-    }
-};
-
-static bool ENV = false;
-static bool ENABLE_ALL_FALSE = true;
-static bool ENABLE_ALL_TRUE = true;
-static bool ENABLE_MIXED = true;
-static bool ALL_FALSE_ASSUME_M_PRIME = false;
-static bool ENABLE_REWRITING = true;
-static bool PRESERVE_EQMODP1_VARS = false;
-static bool ENABLE_SUBEXPRESSION_RULES = false;
-static bool ENABLE_EXPRESSION_GROWTH_CHECK = false;
-static bool ENABLE_REWRITE_SINGULAR_NF = true;
-static bool ENABLE_MODULI_NORMALIZATION = false;
-static bool DISABLE_REWRITE_CACHE = false;
-static bool VERIFY_REWRITE_LOOKUPS = false;
-static bool ENABLE_AUTO_LEMMAS = false;
-static bool ENABLE_FINAL_FIXED_VALUE_CHECK = true;
-static bool ENABLE_EQMOD_TRUE_LEMMAS = false;
-static bool ENABLE_GB_PREPROCESS = false;
-static bool VERIFY_GB_PREPROCESS = false;
-static bool ENABLE_MINIMAL_FIXED_WATCH = false;
-static bool LOG_CONFLICT_ANTS = false;
-static bool USE_GROEBNER_RING_VAR_ORDER = true;
-static util::EqExperimentOptions g_eq_experiment_options;
-
-struct AccumulatedTiming
+static bool eq_gb_partition_refinement_enabled()
 {
-    std::size_t calls = 0;
-    std::chrono::nanoseconds elapsed{0};
+    return g_cli.eq_gb_live_hybrid ||
+           g_cli.eq_gb_live_partition_refinement;
+}
 
-    void reset()
-    {
-        calls = 0;
-        elapsed = std::chrono::nanoseconds{0};
-    }
+static bool rewrite_aware_coeff_views_enabled()
+{
+    return g_cli.enable_eq_gb_live;
+}
 
-    template <class Rep, class Period>
-    void add(std::chrono::duration<Rep, Period> d)
-    {
-        ++calls;
-        elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(d);
-    }
-};
-
-static AccumulatedTiming g_groebner_timing;
-static AccumulatedTiming g_final_fixed_value_check_timing;
+static cli::report::AccumulatedTiming g_groebner_timing;
+static cli::report::AccumulatedTiming g_final_fixed_value_check_timing;
 static std::optional<clk::time_point> g_final_fixed_value_check_span_start;
-
-class ScopedAccumulatedTiming
-{
-    AccumulatedTiming &timing_;
-    clk::time_point start_;
-
-public:
-    explicit ScopedAccumulatedTiming(AccumulatedTiming &timing)
-        : timing_(timing), start_(clk::now())
-    {
-        if (&timing_ == &g_final_fixed_value_check_timing &&
-            !g_final_fixed_value_check_span_start)
-        {
-            g_final_fixed_value_check_span_start = start_;
-        }
-    }
-
-    ~ScopedAccumulatedTiming()
-    {
-        timing_.add(clk::now() - start_);
-    }
-};
-
-struct CliSummary
-{
-    std::string input_file;
-    std::string options;
-    std::chrono::nanoseconds parse_time{0};
-    std::chrono::nanoseconds rewrite_time{0};
-    std::chrono::nanoseconds solve_time{0};
-    std::chrono::nanoseconds total_time{0};
-    std::size_t groebner_calls = 0;
-    std::chrono::nanoseconds groebner_time{0};
-    std::size_t final_fixed_value_check_calls = 0;
-    std::chrono::nanoseconds final_fixed_value_check_time{0};
-    check_result result = unknown;
-};
-
-static std::string fmt_cli_seconds(std::chrono::nanoseconds d)
-{
-    const double seconds = std::chrono::duration<double>(d).count();
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(4) << seconds << " seconds";
-    return oss.str();
-}
-
-static std::string check_result_name(check_result r)
-{
-    switch (r)
-    {
-    case sat:
-        return "sat";
-    case unsat:
-        return "unsat";
-    case unknown:
-        return "unknown";
-    }
-    return "unknown";
-}
-
-static void print_cli_value_row(std::ostream &os, const std::string &label, const std::string &value)
-{
-    os << std::left << std::setw(49) << label << value << "\n";
-}
-
-static void begin_cli_timed_row(std::ostream &os, const std::string &label)
-{
-    os << std::left << std::setw(49) << label;
-    os.flush();
-}
-
-static void finish_cli_timed_row(std::ostream &os,
-                                 const std::string &status,
-                                 std::chrono::nanoseconds elapsed,
-                                 std::optional<std::size_t> calls = std::nullopt)
-{
-    std::ostringstream state;
-    state << "[" << status << "]";
-    if (calls)
-        state << " " << *calls << " calls";
-
-    os << std::left << std::setw(28) << state.str()
-       << fmt_cli_seconds(elapsed) << "\n";
-    os.flush();
-}
-
-static void print_cli_input_section(std::ostream &os, const std::string &input_file, const std::string &options)
-{
-    os << "# Input\n\n";
-    print_cli_value_row(os, "Input file:", input_file);
-    print_cli_value_row(os, "Options:", options);
-    os << "\n# Procedure main\n\n";
-    os.flush();
-}
-
-static std::string join_options(int argc, char **argv)
-{
-    if (argc <= 2)
-        return "(none)";
-
-    std::ostringstream oss;
-    for (int i = 2; i < argc; ++i)
-    {
-        if (i > 2)
-            oss << ' ';
-        oss << argv[i];
-    }
-    return oss.str();
-}
-
-static void print_usage(std::ostream &os, const char *prog)
-{
-    os << "Usage: " << prog
-       << " <input.smt2> [--ring-detail] [--env] [--no-trace]"
-          " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
-          " [--m-prime] [--disable-auto-lemmas]"
-          " [--no-rewriting] [--no-singular-nf] [--enable-moduli-normalization]"
-          " [--preserve-eqmodp1-vars] [--enable-subexpression-rules]"
-          " [--enable-expression-growth-check]"
-          " [--disable-rewrite-cache] [--verify-rewrite-lookups]"
-          " [--disable-final-fixed-value-check] [--minimal-fixed-watch]"
-          " [--enable-eqmod-true-lemmas]"
-          " [--enable-gb-preprocess] [--verify-gb-preprocess]"
-       << util::eq_experiment_usage() <<
-          ""
-          " [--show-model]"
-          " [--rewrite-log] [--groebner-ring-order]\n";
-}
 
 static void init_singular()
 {
@@ -264,137 +110,12 @@ static void init_singular()
 
 static void dump_ring(const ring R)
 {
-    if (!PRINT_RING_DETAIL)
+    if (!g_cli.ring_detail)
         return;
 
     LOG_INFO(g_log, "singular", "Current ring:");
     rWrite(R);
     std::cout << "\n";
-}
-
-static void print_ideal(const char *label, ideal I, const ring R)
-{
-
-    std::ostringstream oss;
-    oss << label << " = {";
-    bool first = true;
-    for (int i = 0; i < I->ncols; ++i)
-    {
-        if (I->m[i] == nullptr)
-            continue;
-        if (!first)
-            oss << ", ";
-        char *s = p_String(I->m[i], R);
-        oss << s;
-        omFree(s);
-        first = false;
-    }
-    oss << "}";
-    LOG_INFO(g_log, "singular", oss.str());
-}
-
-static std::string poly_to_string(poly p, const ring R)
-{
-    if (p == nullptr)
-        return "0";
-    char *s = p_String(p, R);
-    std::string out = s ? std::string(s) : std::string("?");
-    if (s)
-        omFree(s);
-    return out;
-}
-
-// ---------------- SMT2 injection (Poly + eqP + eqmodP1) ----------------
-static const char *k_poly_prelude = R"PRE(
-(declare-datatype Poly
-  (par (T)
-    ((PConst (const_c T))
-     (PVar   (var_name String))
-     (PNeg   (neg_p (Poly T)))
-     (PAdd   (add_l (Poly T)) (add_r (Poly T)))
-     (PSub   (sub_l (Poly T)) (sub_r (Poly T)))
-     (PMul   (mul_l (Poly T)) (mul_r (Poly T)))
-     (PPow   (pow_base (Poly T)) (pow_k Int)))))
-
-(declare-fun eqP ((Poly Int) (Poly Int)) Bool)
-(declare-fun eqmodP1 ((Poly Int) (Poly Int) (Poly Int)) Bool)
-
-; kept for future
-(declare-fun eqmodP2 ((Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
-(declare-fun eqmodP3 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
-(declare-fun eqmodP4 ((Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int) (Poly Int)) Bool)
-)PRE";
-
-static std::string read_file_all(const char *filename)
-{
-    std::ifstream ifs(filename, std::ios::in | std::ios::binary);
-    if (!ifs)
-        throw std::runtime_error(std::string("cannot open file: ") + filename);
-    std::string s;
-    ifs.seekg(0, std::ios::end);
-    s.resize((size_t)ifs.tellg());
-    ifs.seekg(0, std::ios::beg);
-    if (!s.empty())
-        ifs.read(&s[0], (std::streamsize)s.size());
-    return s;
-}
-
-static bool contains_poly_decl(const std::string &s)
-{
-    if (s.find("(declare-datatype Poly") != std::string::npos)
-        return true;
-    if (s.find("(declare-datatypes") != std::string::npos && s.find("Poly") != std::string::npos)
-        return true;
-    return false;
-}
-
-static std::string inject_after_setlogic(const std::string &raw, const std::string &ins)
-{
-    size_t pos = raw.find("(set-logic");
-    if (pos == std::string::npos)
-        return ins + std::string("\n") + raw;
-
-    size_t line_end = raw.find('\n', pos);
-    if (line_end == std::string::npos)
-        return raw + std::string("\n") + ins;
-
-    std::string out;
-    out.reserve(raw.size() + ins.size() + 8);
-    out.append(raw, 0, line_end + 1);
-    out.append(ins);
-    out.push_back('\n');
-    out.append(raw, line_end + 1, std::string::npos);
-    return out;
-}
-
-static std::string inject_poly_eqP_eqmodP_if_missing(const std::string &raw)
-{
-    if (contains_poly_decl(raw))
-        return raw;
-    return inject_after_setlogic(raw, k_poly_prelude);
-}
-
-static std::vector<expr> parse_smt2_assertions(context &ctx, const std::string &smt2_script)
-{
-    Z3_context z3c = (Z3_context)ctx;
-    Z3_ast_vector v = Z3_parse_smtlib2_string(
-        z3c, smt2_script.c_str(),
-        0, nullptr, nullptr,
-        0, nullptr, nullptr);
-
-    Z3_error_code ec = Z3_get_error_code(z3c);
-    if (ec != Z3_OK)
-        throw z3::exception(Z3_get_error_msg(z3c, ec));
-
-    unsigned n = Z3_ast_vector_size(z3c, v);
-    std::vector<expr> out;
-    out.reserve(n);
-    for (unsigned i = 0; i < n; ++i)
-    {
-        Z3_ast a = Z3_ast_vector_get(z3c, v, i);
-        out.emplace_back(ctx, a);
-    }
-    return out;
 }
 
 // ---------------- helpers ----------------
@@ -444,58 +165,6 @@ static void print_model_filtered(const z3::model &m, std::ostream &os = std::cou
     }
 }
 
-static bool is_poly_sort(const sort &s)
-{
-    if (!s.is_datatype())
-        return false;
-    Z3_context c = (Z3_context)s.ctx();
-    Z3_symbol sym = Z3_get_sort_name(c, (Z3_sort)s);
-    const char *nm = Z3_get_symbol_string(c, sym);
-    return nm && std::string(nm) == "Poly";
-}
-
-static bool is_ctor(const expr &e, const char *name, unsigned arity)
-{
-    return e.is_app() && e.decl().name().str() == name && e.num_args() == arity;
-}
-
-static bool get_int64_numeral(const expr &e, int64_t &out)
-{
-    if (!(e.is_numeral() && e.get_sort().is_int()))
-        return false;
-    return Z3_get_numeral_int64((Z3_context)e.ctx(), (Z3_ast)e, &out);
-}
-
-static bool get_string_literal_smt(const expr &e, std::string &out)
-{
-    if (!Z3_is_string_sort((Z3_context)e.ctx(), (Z3_sort)e.get_sort()))
-        return false;
-
-    std::string s = e.to_string();
-    if (s.size() < 2 || s.front() != '"' || s.back() != '"')
-        return false;
-    s = s.substr(1, s.size() - 2);
-
-    std::string r;
-    r.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i)
-    {
-        if (s[i] == '\\' && i + 1 < s.size())
-        {
-            char n = s[i + 1];
-            if (n == '\\' || n == '"')
-            {
-                r.push_back(n);
-                ++i;
-                continue;
-            }
-        }
-        r.push_back(s[i]);
-    }
-    out = r;
-    return true;
-}
-
 static std::string sanitize_ring_var_base(const std::string &s)
 {
     std::string r;
@@ -543,9 +212,10 @@ static bool is_groebner_aux_var(const std::string &name)
 
 static std::vector<std::string> build_groebner_ring_var_order(
     const std::vector<std::string> &coeff_ring_names,
+    const std::vector<std::string> &poly_symbol_ring_names,
     const std::vector<std::string> &indet_ring_names,
     const std::vector<std::string> &qvar_names,
-    const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names)
+    const std::vector<std::vector<std::vector<std::string>>> &eqmodn_qvar_names)
 {
     std::vector<std::string> aux;
     std::vector<std::string> coeffs;
@@ -568,17 +238,22 @@ static std::vector<std::string> build_groebner_ring_var_order(
     descending(coeffs);
 
     std::vector<std::string> ring_vars;
-    ring_vars.reserve(coeff_ring_names.size() + indet_ring_names.size() +
-                      qvar_names.size() + 2 * eqmodp2_qvar_names.size());
+    ring_vars.reserve(coeff_ring_names.size() + poly_symbol_ring_names.size() + indet_ring_names.size() +
+                      qvar_names.size());
 
-    for (auto it = eqmodp2_qvar_names.rbegin(); it != eqmodp2_qvar_names.rend(); ++it)
+    // P4, P3, P2 in reverse atom order, followed by the specialized P1 slots.
+    for (unsigned arity = 4; arity >= 2; --arity)
     {
-        ring_vars.push_back(it->first);
-        ring_vars.push_back(it->second);
+        const auto &family = eqmodn_qvar_names.at(arity);
+        for (auto atom = family.rbegin(); atom != family.rend(); ++atom)
+            ring_vars.insert(ring_vars.end(), atom->begin(), atom->end());
     }
     for (auto it = qvar_names.rbegin(); it != qvar_names.rend(); ++it)
         ring_vars.push_back(*it);
 
+    // Opaque polynomial symbols precede every variable that can occur in
+    // their defining relation, so p^k - F is oriented by p^k in lp order.
+    ring_vars.insert(ring_vars.end(), poly_symbol_ring_names.begin(), poly_symbol_ring_names.end());
     ring_vars.insert(ring_vars.end(), aux.begin(), aux.end());
     ring_vars.insert(ring_vars.end(), coeffs.begin(), coeffs.end());
     ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
@@ -602,31 +277,6 @@ static std::vector<expr> dedup_and_drop_trivial_eqp(const std::vector<expr> &eqp
     return out;
 }
 
-static void collect_indets_rec(const expr &e, std::unordered_set<std::string> &S)
-{
-    if (is_ctor(e, "PVar", 1))
-    {
-        std::string nm;
-        if (get_string_literal_smt(e.arg(0), nm))
-            S.insert(nm);
-    }
-
-    if (!e.is_app())
-        return;
-    for (unsigned i = 0; i < e.num_args(); ++i)
-        collect_indets_rec(e.arg(i), S);
-}
-
-static std::vector<std::string> collect_all_indets(const std::vector<expr> &roots)
-{
-    std::unordered_set<std::string> S;
-    for (auto &r : roots)
-        collect_indets_rec(r, S);
-    std::vector<std::string> out(S.begin(), S.end());
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
 // ---------------- collectors (used after rewriting for Singular lowering) -------------
 static void collect_eqP_rec(const expr &e, std::vector<expr> &atoms)
 {
@@ -641,922 +291,31 @@ static void collect_eqP_rec(const expr &e, std::vector<expr> &atoms)
         collect_eqP_rec(e.arg(i), atoms);
 }
 
-static void collect_eqmodP1_rec(const expr &e, std::vector<expr> &atoms)
+static void collect_eqmod_rec(const expr &e,
+                              unsigned arity,
+                              std::vector<expr> &atoms,
+                              std::unordered_set<Z3_ast> &seen)
 {
     if (!e.is_app())
         return;
-    if (e.decl().name().str() == "eqmodP1" && e.num_args() == 3)
+    const std::string expected = "eqmodP" + std::to_string(arity);
+    if (e.decl().name().str() == expected && e.num_args() == arity + 2)
     {
-        atoms.push_back(e);
-        return;
-    }
-    for (unsigned i = 0; i < e.num_args(); ++i)
-        collect_eqmodP1_rec(e.arg(i), atoms);
-}
-
-static void collect_eqmodP2_rec(const expr &e, std::vector<expr> &atoms)
-{
-    if (!e.is_app())
-        return;
-    if (e.decl().name().str() == "eqmodP2" && e.num_args() == 4)
-    {
-        atoms.push_back(e);
+        if (seen.insert((Z3_ast)e).second)
+            atoms.push_back(e);
         return;
     }
     for (unsigned i = 0; i < e.num_args(); ++i)
-        collect_eqmodP2_rec(e.arg(i), atoms);
+        collect_eqmod_rec(e.arg(i), arity, atoms, seen);
 }
 
-// ---------------- BV->Int detector + coefficient-base collector ----------------
-static bool is_bv_to_int_app(const z3::expr &e)
+static void collect_eqmod_rec(const expr &e, unsigned arity, std::vector<expr> &atoms)
 {
-    if (!e.is_app())
-        return false;
-    if (!e.get_sort().is_int())
-        return false;
-    if (e.num_args() != 1)
-        return false;
-    if (!e.arg(0).get_sort().is_bv())
-        return false;
-
-#ifdef Z3_OP_BV2INT
-    if (e.decl().decl_kind() == Z3_OP_BV2INT)
-        return true;
-#endif
-
-    const std::string n = e.decl().name().str();
-    return (n == "ubv_to_int" || n == "sbv_to_int" || n == "bv2nat" || n == "bv2int");
-}
-
-static std::string coeff_base_pretty_name(const z3::expr &e)
-{
-    if (is_bv_to_int_app(e))
-    {
-        z3::expr bv = e.arg(0);
-        if (bv.is_const() && !bv.is_numeral())
-            return bv.decl().name().str();
-        return std::string("bv2int");
-    }
-
-    if (e.is_const() && !e.is_numeral())
-        return e.decl().name().str();
-
-    return e.to_string();
-}
-
-static void collect_coeff_bases_rec(const z3::expr &e, std::unordered_set<Z3_ast> &S)
-{
-    if (e.get_sort().is_int())
-    {
-        if (e.is_const() && !e.is_numeral())
-            S.insert((Z3_ast)e);
-        else if (is_bv_to_int_app(e))
-            S.insert((Z3_ast)e);
-    }
-
-    if (!e.is_app())
-        return;
-    for (unsigned i = 0; i < e.num_args(); ++i)
-        collect_coeff_bases_rec(e.arg(i), S);
-}
-
-// ---------------- Indet environment ----------------
-struct IndetEnv
-{
-    std::vector<std::string> names;
-    std::unordered_map<std::string, unsigned> idx;
-};
-
-// ---------------- Coeff var mapping ----------------
-struct CoeffVarMap
-{
-    std::vector<z3::expr> z3_bases;
-    std::vector<std::string> ring_names;
-    std::unordered_map<Z3_ast, unsigned> base_to_index;
-
-    // Singular variable indices (1..N); filled after RingEnv::build.
-    std::vector<int> coeff_ring_index;
-    std::vector<int> indet_ring_index;
-};
-
-// ---------------- Singular: number helpers ----------------
-static number num_from_z3_any(const expr &e, const coeffs cf)
-{
-    Z3_string zs = Z3_get_numeral_string((Z3_context)e.ctx(), (Z3_ast)e);
-    mpz_t v;
-    mpz_init(v);
-    if (mpz_set_str(v, zs, 10) != 0)
-    {
-        mpz_clear(v);
-        throw std::runtime_error(std::string("bad numeral: ") + zs);
-    }
-    number n = n_InitMPZ(v, cf);
-    mpz_clear(v);
-    return n;
-}
-
-static number num_from_si(long v, const coeffs cf)
-{
-    mpz_t z;
-    mpz_init_set_si(z, v);
-    number n = n_InitMPZ(z, cf);
-    mpz_clear(z);
-    return n;
-}
-
-static poly poly_from_mpz(const mpz_class &v, const ring R)
-{
-    mpz_t z;
-    mpz_init_set(z, v.get_mpz_t());
-    number n = n_InitMPZ(z, R->cf);
-    mpz_clear(z);
-    return p_NSet(n, R);
-}
-
-static poly poly_from_si(long v, const ring R)
-{
-    return p_NSet(num_from_si(v, R->cf), R);
-}
-
-static poly poly_mul_clone(poly a, poly b, const ring R)
-{
-    poly ac = p_Copy(a, R), bc = p_Copy(b, R);
-    return p_Mult_q(ac, bc, R);
-}
-
-static poly copy_poly_or_null(poly p, const ring R)
-{
-    return p ? p_Copy(p, R) : nullptr;
-}
-
-static void delete_poly_if_nonnull(poly &p, const ring R)
-{
-    if (p)
-        p_Delete(&p, R);
-    p = nullptr;
-}
-
-static poly poly_mul_clone_or_zero(poly a, poly b, const ring R)
-{
-    if (!a || !b)
-        return nullptr;
-    return poly_mul_clone(a, b, R);
-}
-
-static poly poly_negate_owned(poly p, const ring R)
-{
-    if (!p)
-        return nullptr;
-    number neg1 = num_from_si(-1, R->cf);
-    poly out = p_Mult_nn(p, neg1, R);
-    n_Delete(&neg1, R->cf);
-    return out;
-}
-
-static poly poly_add_owned(poly a, poly b, const ring R)
-{
-    if (!a)
-        return b;
-    if (!b)
-        return a;
-    return p_Add_q(a, b, R);
-}
-
-static poly poly_sub_product_clone(poly base, poly u, poly m, const ring R)
-{
-    poly out = copy_poly_or_null(base, R);
-    poly um = poly_mul_clone_or_zero(u, m, R);
-    poly neg_um = poly_negate_owned(um, R);
-    return poly_add_owned(out, neg_um, R);
-}
-
-static poly build_eqmodP2_true_gen(poly D, poly U1, poly M1, poly U2, poly M2, const ring R)
-{
-    poly tmp = poly_sub_product_clone(D, U1, M1, R);
-    poly out = poly_sub_product_clone(tmp, U2, M2, R);
-    delete_poly_if_nonnull(tmp, R);
-    return out;
-}
-
-static std::string number_to_decimal_string(number n, const ring R)
-{
-    number nc = n_Copy(n, R->cf);
-    poly p = p_NSet(nc, R);
-    char *s = p_String(p, R);
-    std::string out(s);
-    omFree(s);
-    if (p)
-        p_Delete(&p, R);
-    return out;
-}
-
-// ---------------- Ring environment ----------------
-struct RingEnv
-{
-    ring R = nullptr;
-
-    std::vector<char *> name_buf;
-    std::unordered_map<std::string, int> var_to_idx;
-
-    int ord_size = 0;
-    rRingOrder_t *ord_heap = nullptr;
-    int *block0_heap = nullptr;
-    int *block1_heap = nullptr;
-    int **wvhdl_heap = nullptr;
-
-    ~RingEnv()
-    {
-        if (R)
-        {
-            rDelete(R);
-            R = nullptr;
-        }
-
-        for (char *p : name_buf)
-            free(p);
-        name_buf.clear();
-
-        ord_heap = nullptr;
-        block0_heap = nullptr;
-        block1_heap = nullptr;
-        wvhdl_heap = nullptr;
-        ord_size = 0;
-    }
-
-    void build(coeffs cf,
-               const std::vector<std::string> &base_vars,
-               rRingOrder_t /*order_ignored*/ = ringorder_lp)
-    {
-        init_singular();
-
-        int N = (int)base_vars.size();
-        if (N == 0)
-            N = 1;
-
-        name_buf.clear();
-        name_buf.reserve(N);
-        var_to_idx.clear();
-
-        if (!base_vars.empty())
-        {
-            for (int i = 0; i < (int)base_vars.size(); ++i)
-            {
-                name_buf.push_back(strdup(base_vars[i].c_str()));
-                var_to_idx[base_vars[i]] = i + 1;
-            }
-        }
-        else
-        {
-            name_buf.push_back(strdup("k"));
-            var_to_idx["k"] = 1;
-        }
-
-        if (R)
-        {
-            rDelete(R);
-            R = nullptr;
-        }
-        ord_heap = nullptr;
-        block0_heap = nullptr;
-        block1_heap = nullptr;
-        wvhdl_heap = nullptr;
-        ord_size = 0;
-
-        ord_size = 3;
-        ord_heap = (rRingOrder_t *)omAlloc(ord_size * sizeof(rRingOrder_t));
-        block0_heap = (int *)omAlloc0(ord_size * sizeof(int));
-        block1_heap = (int *)omAlloc0(ord_size * sizeof(int));
-        wvhdl_heap = nullptr;
-
-        ord_heap[0] = ringorder_lp;
-        ord_heap[1] = ringorder_C;
-        ord_heap[2] = (rRingOrder_t)0;
-
-        block0_heap[0] = 1;
-        block1_heap[0] = N;
-
-        R = rDefault(cf, N, name_buf.data(), ord_size, ord_heap, block0_heap, block1_heap, wvhdl_heap);
-        if (!R)
-            throw std::runtime_error("rDefault returned null ring.");
-
-        rComplete(R);
-        rChangeCurrRing(R);
-        dump_ring(R);
-    }
-
-    int ensure_var_idx(const std::string &ring_name)
-    {
-        auto it = var_to_idx.find(ring_name);
-        if (it != var_to_idx.end())
-            return it->second;
-
-        throw std::runtime_error("RingEnv: unknown ring variable: " + ring_name);
-    }
-};
-
-static void cmap_bind_ring_indices(CoeffVarMap &cmap,
-                                   RingEnv &RE,
-                                   const std::vector<std::string> &indet_ring_names)
-{
-    cmap.coeff_ring_index.resize(cmap.ring_names.size());
-    for (size_t i = 0; i < cmap.ring_names.size(); ++i)
-        cmap.coeff_ring_index[i] = RE.ensure_var_idx(cmap.ring_names[i]);
-
-    cmap.indet_ring_index.resize(indet_ring_names.size());
-    for (size_t j = 0; j < indet_ring_names.size(); ++j)
-        cmap.indet_ring_index[j] = RE.ensure_var_idx(indet_ring_names[j]);
-}
-
-// ---------------- Z3 Int expr -> Singular poly ----------------
-static poly expr_to_poly_anyring(const expr &e, RingEnv &RE, const CoeffVarMap &cmap)
-{
-    ring R = RE.R;
-    if (!R)
-        throw std::runtime_error("expr_to_poly_anyring: ring is null");
-    rChangeCurrRing(R);
-
-    if (e.is_numeral())
-    {
-        number bn = num_from_z3_any(e, R->cf);
-        return p_NSet(bn, R);
-    }
-
-    if (is_bv_to_int_app(e))
-    {
-        auto it = cmap.base_to_index.find((Z3_ast)e);
-        if (it == cmap.base_to_index.end())
-            throw std::runtime_error("expr_to_poly_anyring: bv2int base missing from cmap: " + e.to_string());
-
-        std::string ringnm = cmap.ring_names[it->second];
-        int vi = RE.ensure_var_idx(ringnm);
-
-        poly p = p_NSet(num_from_si(1, R->cf), R);
-        p_SetExp(p, vi, 1, R);
-        p_Setm(p, R);
-        return p;
-    }
-
-    if (e.is_const())
-    {
-        if (!e.get_sort().is_int())
-            throw std::runtime_error("expr_to_poly_anyring: non-int const: " + e.to_string());
-
-        auto it = cmap.base_to_index.find((Z3_ast)e);
-        if (it == cmap.base_to_index.end())
-            throw std::runtime_error("expr_to_poly_anyring: Int symbol missing from cmap: " + e.to_string());
-
-        std::string ringnm = cmap.ring_names[it->second];
-        int vi = RE.ensure_var_idx(ringnm);
-
-        poly p = p_NSet(num_from_si(1, R->cf), R);
-        p_SetExp(p, vi, 1, R);
-        p_Setm(p, R);
-        return p;
-    }
-
-    if (!e.is_app())
-        throw std::runtime_error("expr_to_poly_anyring: unsupported expr: " + e.to_string());
-
-    switch (e.decl().decl_kind())
-    {
-    case Z3_OP_ADD:
-    {
-        poly res = nullptr;
-        for (unsigned i = 0; i < e.num_args(); ++i)
-        {
-            poly pi = expr_to_poly_anyring(e.arg(i), RE, cmap);
-            res = p_Add_q(res, pi, R);
-        }
-        return res;
-    }
-    case Z3_OP_SUB:
-    {
-        if (e.num_args() == 1)
-        {
-            poly p1 = expr_to_poly_anyring(e.arg(0), RE, cmap);
-            number m1 = num_from_si(-1, R->cf);
-            poly r = p_Mult_nn(p1, m1, R);
-            n_Delete(&m1, R->cf);
-            return r;
-        }
-        if (e.num_args() == 2)
-        {
-            poly p1 = expr_to_poly_anyring(e.arg(0), RE, cmap);
-            poly p2 = expr_to_poly_anyring(e.arg(1), RE, cmap);
-            number m1 = num_from_si(-1, R->cf);
-            poly p2n = p_Mult_nn(p2, m1, R);
-            n_Delete(&m1, R->cf);
-            return p_Add_q(p1, p2n, R);
-        }
-        throw std::runtime_error("expr_to_poly_anyring: SUB >2 args");
-    }
-    case Z3_OP_UMINUS:
-    {
-        poly p1 = expr_to_poly_anyring(e.arg(0), RE, cmap);
-        number m1 = num_from_si(-1, R->cf);
-        poly r = p_Mult_nn(p1, m1, R);
-        n_Delete(&m1, R->cf);
-        return r;
-    }
-    case Z3_OP_MUL:
-    {
-        if (e.num_args() == 0)
-            return poly_from_si(1, R);
-        poly res = expr_to_poly_anyring(e.arg(0), RE, cmap);
-        for (unsigned i = 1; i < e.num_args(); ++i)
-        {
-            poly pi = expr_to_poly_anyring(e.arg(i), RE, cmap);
-            res = p_Mult_q(res, pi, R);
-        }
-        return res;
-    }
-    case Z3_OP_POWER:
-    {
-        if (e.num_args() != 2)
-            throw std::runtime_error("expr_to_poly_anyring: POWER !=2");
-        if (!(e.arg(1).is_numeral() && e.arg(1).get_sort().is_int()))
-            throw std::runtime_error("expr_to_poly_anyring: POWER exponent must be Int numeral");
-
-        mpz_t exz;
-        mpz_init(exz);
-        {
-            Z3_string es = Z3_get_numeral_string((Z3_context)e.ctx(), (Z3_ast)e.arg(1));
-            if (mpz_set_str(exz, es, 10) != 0)
-            {
-                mpz_clear(exz);
-                throw std::runtime_error("expr_to_poly_anyring: bad exponent numeral");
-            }
-        }
-        if (mpz_sgn(exz) < 0)
-        {
-            mpz_clear(exz);
-            throw std::runtime_error("expr_to_poly_anyring: negative exponent");
-        }
-        if (!mpz_fits_ulong_p(exz))
-        {
-            mpz_clear(exz);
-            throw std::runtime_error("expr_to_poly_anyring: exponent too large");
-        }
-        unsigned long ex = mpz_get_ui(exz);
-        mpz_clear(exz);
-
-        if (ex == 0)
-            return poly_from_si(1, R);
-
-        poly base = expr_to_poly_anyring(e.arg(0), RE, cmap);
-        poly res = poly_from_si(1, R);
-        while (ex > 0)
-        {
-            if (ex & 1)
-            {
-                poly new_res = poly_mul_clone(res, base, R);
-                if (res)
-                    p_Delete(&res, R);
-                res = new_res;
-            }
-            ex >>= 1;
-            if (ex)
-            {
-                poly new_base = poly_mul_clone(base, base, R);
-                if (base)
-                    p_Delete(&base, R);
-                base = new_base;
-            }
-        }
-        if (base)
-            p_Delete(&base, R);
-        return res;
-    }
-    default:
-        throw std::runtime_error("expr_to_poly_anyring: unsupported op: " + e.decl().name().str());
-    }
-}
-
-// ---------------- Poly(Int) term -> Singular poly ----------------
-static poly polyterm_to_singular_poly(const expr &p,
-                                      const IndetEnv &env,
-                                      const std::vector<std::string> &indet_ring_names,
-                                      RingEnv &RE,
-                                      const CoeffVarMap &cmap,
-                                      int Nc,
-                                      const std::string &tag);
-
-static poly polyterm_to_singular_poly(const expr &p,
-                                      const IndetEnv &env,
-                                      const std::vector<std::string> &indet_ring_names,
-                                      RingEnv &RE,
-                                      const CoeffVarMap &cmap,
-                                      int Nc,
-                                      const std::string &tag)
-{
-    ring R = RE.R;
-    if (!R)
-        throw std::runtime_error("polyterm_to_singular_poly: ring is null");
-    rChangeCurrRing(R);
-
-    if (is_ctor(p, "PConst", 1))
-    {
-        if (!p.arg(0).get_sort().is_int())
-            throw std::runtime_error("PConst argument not Int: " + p.to_string());
-        return expr_to_poly_anyring(p.arg(0), RE, cmap);
-    }
-
-    if (is_ctor(p, "PVar", 1))
-    {
-        std::string raw;
-        if (!get_string_literal_smt(p.arg(0), raw))
-            throw std::runtime_error("PVar expects a String literal: " + p.to_string());
-        std::string id = raw;
-        auto it = env.idx.find(id);
-        if (it == env.idx.end())
-            throw std::runtime_error("Unknown indet: " + id);
-        std::string ringnm = indet_ring_names[it->second];
-        int vi = RE.ensure_var_idx(ringnm);
-
-        poly v = p_NSet(num_from_si(1, R->cf), R);
-        p_SetExp(v, vi, 1, R);
-        p_Setm(v, R);
-        return v;
-    }
-
-    if (p.is_const() && !p.is_numeral() && is_poly_sort(p.get_sort()))
-    {
-        throw std::runtime_error(
-            "Poly-sort constant is not allowed as an indeterminate: " + p.to_string() +
-            " (use (PVar \"x\") or expand it into constructors like PAdd/PMul/PConst)");
-    }
-
-    if (is_ctor(p, "PNeg", 1))
-    {
-        poly a = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
-        number m1 = num_from_si(-1, R->cf);
-        poly r = p_Mult_nn(a, m1, R);
-        n_Delete(&m1, R->cf);
-        return r;
-    }
-    if (is_ctor(p, "PAdd", 2))
-    {
-        poly a = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
-        poly b = polyterm_to_singular_poly(p.arg(1), env, indet_ring_names, RE, cmap, Nc, tag);
-        return p_Add_q(a, b, R);
-    }
-    if (is_ctor(p, "PSub", 2))
-    {
-        poly a = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
-        poly b = polyterm_to_singular_poly(p.arg(1), env, indet_ring_names, RE, cmap, Nc, tag);
-        number m1 = num_from_si(-1, R->cf);
-        poly bn = p_Mult_nn(b, m1, R);
-        n_Delete(&m1, R->cf);
-        return p_Add_q(a, bn, R);
-    }
-    if (is_ctor(p, "PMul", 2))
-    {
-        poly a = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
-        poly b = polyterm_to_singular_poly(p.arg(1), env, indet_ring_names, RE, cmap, Nc, tag);
-        return p_Mult_q(a, b, R);
-    }
-    if (is_ctor(p, "PPow", 2))
-    {
-        int64_t k = 0;
-        if (!get_int64_numeral(p.arg(1), k) || k < 0)
-            throw std::runtime_error("PPow exponent must be non-negative Int numeral: " + p.to_string());
-
-        if (k == 0)
-            return poly_from_si(1, R);
-
-        if (k > MAX_POW_EXPAND)
-        {
-            std::cerr << "[fatal] PPow exponent too large: k=" << k
-                      << " > MAX_POW_EXPAND=" << MAX_POW_EXPAND
-                      << " (refuse to expand; abort)\n";
-            std::exit(2);
-        }
-
-        poly base = polyterm_to_singular_poly(p.arg(0), env, indet_ring_names, RE, cmap, Nc, tag);
-
-        if (k == 1)
-            return base;
-
-        poly res = poly_from_si(1, R);
-        uint64_t e = (uint64_t)k;
-        poly base_cur = base;
-
-        while (e > 0)
-        {
-            if (e & 1)
-            {
-                poly new_res = poly_mul_clone(res, base_cur, R);
-                if (res)
-                    p_Delete(&res, R);
-                res = new_res;
-            }
-            e >>= 1;
-            if (e)
-            {
-                poly new_base = poly_mul_clone(base_cur, base_cur, R);
-                if (base_cur)
-                    p_Delete(&base_cur, R);
-                base_cur = new_base;
-            }
-        }
-
-        if (base_cur)
-            p_Delete(&base_cur, R);
-
-        return res;
-    }
-
-    throw std::runtime_error("Unsupported Poly term: " + p.to_string());
-}
-
-// ---------------- Ideal helpers ----------------
-static ideal ideal_from_polys(const std::vector<poly> &gens, RingEnv &RE)
-{
-    ring R = RE.R;
-    rChangeCurrRing(R);
-    ideal I = idInit((int)gens.size(), 1);
-    for (int i = 0; i < (int)gens.size(); ++i)
-        I->m[i] = gens[i];
-    return I;
-}
-
-static ideal groebner_std(ideal I, const ring R, const std::string &label = "")
-{
-    rChangeCurrRing(R);
-    auto t0 = clk::now();
-    intvec *w0 = NULL;
-    intvec **w = &w0;
-    ideal G = kStd(I, NULL, testHomog, w, NULL, 0, 0, NULL);
-    auto t1 = clk::now();
-    g_groebner_timing.add(t1 - t0);
-
-    std::ostringstream oss;
-    oss << "Groebner basis std";
-    if (!label.empty())
-        oss << " [" << label << "]";
-    oss << " finished in " << util::fmt_duration(t1 - t0);
-    LOG_INFO(g_log, "singular", oss.str());
-    return G;
-}
-
-static inline bool nf_is_zero(poly nf) { return nf == nullptr; }
-
-struct GroebnerBatchResult
-{
-    std::vector<bool> membership;
-    std::vector<std::string> nf_strings;
-    bool used_preprocess = false;
-};
-
-static std::vector<bool> run_raw_groebner_membership_batch(std::vector<poly> gens,
-                                                           const std::vector<poly> &targets,
-                                                           RingEnv &RE,
-                                                           const ring R,
-                                                           const std::string &gb_label,
-                                                           std::vector<std::string> *nf_out)
-{
-    rChangeCurrRing(R);
-    std::vector<bool> out(targets.size(), false);
-    if (nf_out)
-        nf_out->assign(targets.size(), "not-computed");
-
-    if (gens.empty())
-    {
-        for (std::size_t i = 0; i < targets.size(); ++i)
-        {
-            out[i] = (targets[i] == nullptr);
-            if (nf_out)
-                (*nf_out)[i] = poly_to_string(targets[i], R);
-        }
-        return out;
-    }
-
-    ideal I = ideal_from_polys(gens, RE);
-    ideal G = groebner_std(I, R, gb_label);
-    for (std::size_t i = 0; i < targets.size(); ++i)
-    {
-        if (targets[i] == nullptr)
-        {
-            out[i] = true;
-            if (nf_out)
-                (*nf_out)[i] = "0";
-            continue;
-        }
-        poly nf = kNF(G, NULL, p_Copy(targets[i], R), 0, 0);
-        out[i] = nf_is_zero(nf);
-        if (nf_out)
-            (*nf_out)[i] = poly_to_string(nf, R);
-        delete_poly_if_nonnull(nf, R);
-    }
-    if (G)
-        idDelete(&G);
-    if (I)
-        idDelete(&I);
-    return out;
-}
-
-static GroebnerBatchResult run_groebner_membership_batch(std::vector<poly> gens,
-                                                         const std::vector<poly> &targets_in,
-                                                         RingEnv &RE,
-                                                         const ring R,
-                                                         const std::string &gb_label)
-{
-    rChangeCurrRing(R);
-
-    GroebnerBatchResult result;
-    result.membership.assign(targets_in.size(), false);
-    result.nf_strings.assign(targets_in.size(), "not-computed");
-
-    std::vector<poly> raw_gens_for_verify;
-    std::vector<poly> raw_targets_for_verify;
-    if (VERIFY_GB_PREPROCESS)
-    {
-        for (poly g : gens)
-            raw_gens_for_verify.push_back(copy_poly_or_null(g, R));
-        for (poly t : targets_in)
-            raw_targets_for_verify.push_back(copy_poly_or_null(t, R));
-    }
-
-    std::vector<poly> targets;
-    targets.reserve(targets_in.size());
-    for (poly t : targets_in)
-        targets.push_back(copy_poly_or_null(t, R));
-
-    if (ENABLE_GB_PREPROCESS)
-    {
-        result.used_preprocess = true;
-        GbPreprocessStats stats;
-        preprocess_groebner_inputs(gens, targets, R, gb_label, stats, &g_log);
-    }
-
-    result.membership =
-        run_raw_groebner_membership_batch(std::move(gens), targets, RE, R, gb_label, &result.nf_strings);
-
-    if (VERIFY_GB_PREPROCESS)
-    {
-        std::vector<std::string> raw_nf;
-        std::vector<bool> raw_membership =
-            run_raw_groebner_membership_batch(std::move(raw_gens_for_verify), raw_targets_for_verify, RE, R,
-                                              gb_label + "-verify-raw", &raw_nf);
-        if (raw_membership != result.membership)
-        {
-            std::ostringstream oss;
-            oss << "GB preprocess verification failed [" << gb_label << "]";
-            for (std::size_t i = 0; i < raw_membership.size(); ++i)
-                oss << "\n  target#" << i
-                    << " raw=" << (raw_membership[i] ? "true" : "false")
-                    << " optimized=" << (result.membership[i] ? "true" : "false")
-                    << " raw_nf=" << raw_nf[i]
-                    << " opt_nf=" << result.nf_strings[i];
-            LOG_INFO(g_log, "singular", oss.str());
-            throw std::runtime_error(oss.str());
-        }
-        LOG_INFO(g_log, "singular", "[gb-preprocess] " + gb_label + ": verify membership OK");
-    }
-
-    for (poly &t : targets)
-        delete_poly_if_nonnull(t, R);
-    for (poly &t : raw_targets_for_verify)
-        delete_poly_if_nonnull(t, R);
-
-    return result;
-}
-
-static bool poly_equal(poly a, poly b, const ring R)
-{
-    rChangeCurrRing(R);
-
-    if (a == nullptr && b == nullptr)
-        return true;
-    if (a == nullptr || b == nullptr)
-        return false;
-
-    poly ac = p_Copy(a, R);
-    poly bc = p_Copy(b, R);
-
-    number m1 = num_from_si(-1, R->cf);
-    poly bneg = p_Mult_nn(bc, m1, R);
-    n_Delete(&m1, R->cf);
-
-    poly diff = p_Add_q(ac, bneg, R);
-    bool eq = (diff == nullptr);
-
-    if (diff)
-        p_Delete(&diff, R);
-
-    return eq;
-}
-
-// ---------------- Split D by indets ----------------
-struct IndetKey
-{
-    std::vector<int> e;
-    bool operator==(const IndetKey &o) const { return e == o.e; }
-};
-
-struct IndetKeyHash
-{
-    std::size_t operator()(const IndetKey &k) const noexcept
-    {
-        std::size_t h = 1469598103934665603ull;
-        for (int x : k.e)
-            h ^= (std::size_t)x + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-static std::unordered_map<IndetKey, poly, IndetKeyHash>
-split_by_indets(poly D, const CoeffVarMap &cmap, int Mi, RingEnv &RE)
-{
-    ring R = RE.R;
-    rChangeCurrRing(R);
-
-    const int Nc = (int)cmap.coeff_ring_index.size();
-    if (Nc != (int)cmap.ring_names.size())
-        throw std::runtime_error("split_by_indets: coeff_ring_index not bound");
-    if (Mi != (int)cmap.indet_ring_index.size())
-        throw std::runtime_error("split_by_indets: indet_ring_index size mismatch");
-
-    std::unordered_map<IndetKey, poly, IndetKeyHash> out;
-
-    for (poly t = D; t != nullptr; t = pNext(t))
-    {
-        IndetKey key;
-        key.e.assign((size_t)Mi, 0);
-        for (int j = 0; j < Mi; ++j)
-        {
-            int idx = cmap.indet_ring_index[(size_t)j];
-            key.e[(size_t)j] = p_GetExp(t, idx, R);
-        }
-
-        number a = p_GetCoeff(t, R);
-        number ac = n_Copy(a, R->cf);
-
-        poly ct = p_NSet(ac, R);
-        for (int i = 0; i < Nc; ++i)
-        {
-            int idx = cmap.coeff_ring_index[(size_t)i];
-            int e = p_GetExp(t, idx, R);
-            if (e != 0)
-                p_SetExp(ct, idx, e, R);
-        }
-        p_Setm(ct, R);
-
-        auto it = out.find(key);
-        if (it == out.end())
-            out.emplace(std::move(key), ct);
-        else
-            it->second = p_Add_q(it->second, ct, R);
-    }
-
-    return out;
-}
-
-// ---------------- Singular coeff poly -> Z3 Int expr ----------------
-static z3::expr z3_pow(z3::expr base, int exp)
-{
-    if (exp <= 0)
-        return base.ctx().int_val(1);
-    z3::expr res = base.ctx().int_val(1);
-    z3::expr b = base;
-    int e = exp;
-    while (e > 0)
-    {
-        if (e & 1)
-            res = res * b;
-        e >>= 1;
-        if (e)
-            b = b * b;
-    }
-    return res;
-}
-
-static z3::expr coeff_poly_to_z3_expr(z3::context &c, poly P, const ring R, const CoeffVarMap &cmap)
-{
-    if (P == nullptr)
-        return c.int_val(0);
-
-    const int Nc = (int)cmap.coeff_ring_index.size();
-    z3::expr acc = c.int_val(0);
-
-    for (poly t = P; t != nullptr; t = pNext(t))
-    {
-        number a = p_GetCoeff(t, R);
-        std::string astr = number_to_decimal_string(a, R);
-        z3::expr term = c.int_val(astr.c_str());
-
-        for (int i = 0; i < Nc; ++i)
-        {
-            int idx = cmap.coeff_ring_index[(size_t)i];
-            int e = p_GetExp(t, idx, R);
-            if (e == 0)
-                continue;
-            term = term * z3_pow(cmap.z3_bases[(size_t)i], e);
-        }
-        acc = acc + term;
-    }
-
-    return acc.simplify();
+    std::unordered_set<Z3_ast> seen;
+    seen.reserve(atoms.size() + 1);
+    for (const expr &atom : atoms)
+        seen.insert((Z3_ast)atom);
+    collect_eqmod_rec(e, arity, atoms, seen);
 }
 
 // ---------------- eqP compilation ----------------
@@ -1569,6 +328,7 @@ struct EqPCompiled
     std::vector<expr> coeff_ints;
     std::vector<expr> coeff_eqs;
     expr coeff_neq_disj;
+    bool relational = false;
     bool always_equal = false;
 
     poly D_full = nullptr; // owned
@@ -1586,7 +346,9 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
     ring R = RE.R;
     rChangeCurrRing(R);
 
-    EqPCompiled out{atom, A, B, {}, {}, zctx.bool_val(false), false, nullptr};
+    EqPCompiled out{atom, A, B, {}, {}, zctx.bool_val(false),
+                    contains_raw_poly_symbol(A) || contains_raw_poly_symbol(B),
+                    false, nullptr};
 
     poly pA = polyterm_to_singular_poly(A, env, indet_ring_names, RE, cmap, Nc, label + "/LHS");
     poly pB = polyterm_to_singular_poly(B, env, indet_ring_names, RE, cmap, Nc, label + "/RHS");
@@ -1608,6 +370,15 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
     }
 
     out.D_full = p_Copy(D, R);
+
+    if (out.relational)
+    {
+        // D=0 is retained as one algebraic relation.  Splitting by PVar
+        // monomials would incorrectly treat the opaque polynomial symbol as
+        // an expanded coefficient polynomial and can manufacture 1=0.
+        p_Delete(&D, R);
+        return out;
+    }
 
     auto groups = split_by_indets(D, cmap, Mi, RE);
     if (D)
@@ -1640,220 +411,32 @@ static EqPCompiled compile_eqP_singular(const expr &atom, const expr &A, const e
     return out;
 }
 
-// ---------------- eqmodP1 compilation ----------------
-struct EqModPCompiled
-{
-    expr atom;
-    expr A;
-    expr B;
-    expr Mterm;
-
-    bool modulus_ok = false;
-    bool modulus_is_const = false;
-    mpz_class m_const = 0;
-
-    poly M_poly = nullptr; // owned
-    poly D = nullptr;      // owned: D = A - B
-
-    std::string u_name;      // fresh quotient variable in ring
-    poly U_poly = nullptr;   // owned: monomial u_t
-    poly true_gen = nullptr; // owned: D - U_poly * M_poly
-    Z3_lbool propagated_truth = Z3_L_UNDEF;
-};
-
-static bool extract_modulus_from_polyconst(const expr &Mterm, mpz_class &m_out)
-{
-    if (!is_ctor(Mterm, "PConst", 1))
-        return false;
-    expr m = Mterm.arg(0);
-    if (!(m.is_numeral() && m.get_sort().is_int()))
-        return false;
-
-    Z3_string ms = Z3_get_numeral_string((Z3_context)m.ctx(), (Z3_ast)m);
-    mpz_class mv;
-    if (mv.set_str(ms, 10) != 0)
-        return false;
-    if (mv <= 0)
-        return false;
-
-    m_out = mv;
-    return true;
-}
-
-static poly make_var_poly(RingEnv &RE, const std::string &name)
-{
-    ring R = RE.R;
-    rChangeCurrRing(R);
-    int vi = RE.ensure_var_idx(name);
-
-    poly p = p_NSet(num_from_si(1, R->cf), R);
-    p_SetExp(p, vi, 1, R);
-    p_Setm(p, R);
-    return p;
-}
-
-static EqModPCompiled compile_eqmodP1_singular(const expr &atom, const expr &A, const expr &B, const expr &Mterm,
-                                               const std::string &label,
-                                               const IndetEnv &env,
-                                               const std::vector<std::string> &indet_ring_names,
-                                               RingEnv &RE,
-                                               const CoeffVarMap &cmap,
-                                               int Nc,
-                                               const std::string &u_name)
-{
-    ring R = RE.R;
-    rChangeCurrRing(R);
-
-    EqModPCompiled out{
-        atom,
-        A,
-        B,
-        Mterm,
-        false,
-        false,
-        0,
-        nullptr,
-        nullptr,
-        u_name,
-        nullptr,
-        nullptr};
-
-    poly pA = polyterm_to_singular_poly(A, env, indet_ring_names, RE, cmap, Nc, label + "/LHS");
-    poly pB = polyterm_to_singular_poly(B, env, indet_ring_names, RE, cmap, Nc, label + "/RHS");
-
-    number m1 = num_from_si(-1, R->cf);
-    poly pBn = p_Mult_nn(pB, m1, R);
-    n_Delete(&m1, R->cf);
-    out.D = p_Add_q(pA, pBn, R);
-
-    mpz_class mv;
-    if (extract_modulus_from_polyconst(Mterm, mv))
-    {
-        out.modulus_ok = true;
-        out.modulus_is_const = true;
-        out.m_const = mv;
-        out.M_poly = poly_from_mpz(mv, R);
-    }
-    else
-    {
-        out.M_poly = polyterm_to_singular_poly(Mterm, env, indet_ring_names, RE, cmap, Nc, label + "/MOD");
-        out.modulus_ok = (out.M_poly != nullptr);
-    }
-
-    if (out.modulus_ok)
-    {
-        out.U_poly = make_var_poly(RE, u_name);
-        poly um = poly_mul_clone(out.U_poly, out.M_poly, R);
-
-        number neg1 = num_from_si(-1, R->cf);
-        poly um_neg = p_Mult_nn(um, neg1, R);
-        n_Delete(&neg1, R->cf);
-
-        out.true_gen = p_Add_q(p_Copy(out.D, R), um_neg, R);
-    }
-
-    LOG_INFO(g_log, "singular", label + " D(poly) = " + poly_to_string(out.D, R));
-    if (out.M_poly)
-        LOG_INFO(g_log, "singular", label + " M(poly) = " + poly_to_string(out.M_poly, R));
-    if (out.true_gen)
-        LOG_INFO(g_log, "singular", label + " true_gen(poly) = " + poly_to_string(out.true_gen, R));
-
-    return out;
-}
-
-// ---------------- eqmodP2 compilation ----------------
-struct EqModP2Compiled
-{
-    expr atom;
-    expr A;
-    expr B;
-    expr M1term;
-    expr M2term;
-
-    poly D = nullptr;       // owned: D = A - B
-    poly M1_poly = nullptr; // owned
-    poly M2_poly = nullptr; // owned
-
-    std::string u1_name;     // fresh quotient variable in ring
-    std::string u2_name;     // fresh quotient variable in ring
-    poly U1_poly = nullptr;  // owned: monomial u1
-    poly U2_poly = nullptr;  // owned: monomial u2
-    poly true_gen = nullptr; // owned: D - U1_poly*M1_poly - U2_poly*M2_poly
-    Z3_lbool propagated_truth = Z3_L_UNDEF;
-};
-
-static EqModP2Compiled compile_eqmodP2_singular(const expr &atom,
-                                                const expr &A,
-                                                const expr &B,
-                                                const expr &M1term,
-                                                const expr &M2term,
-                                                const std::string &label,
-                                                const IndetEnv &env,
-                                                const std::vector<std::string> &indet_ring_names,
-                                                RingEnv &RE,
-                                                const CoeffVarMap &cmap,
-                                                int Nc,
-                                                const std::string &u1_name,
-                                                const std::string &u2_name)
-{
-    ring R = RE.R;
-    rChangeCurrRing(R);
-
-    EqModP2Compiled out{
-        atom,
-        A,
-        B,
-        M1term,
-        M2term,
-        nullptr,
-        nullptr,
-        nullptr,
-        u1_name,
-        u2_name,
-        nullptr,
-        nullptr,
-        nullptr};
-
-    poly pA = polyterm_to_singular_poly(A, env, indet_ring_names, RE, cmap, Nc, label + "/LHS");
-    poly pB = polyterm_to_singular_poly(B, env, indet_ring_names, RE, cmap, Nc, label + "/RHS");
-    out.D = poly_add_owned(pA, poly_negate_owned(pB, R), R);
-
-    out.M1_poly = polyterm_to_singular_poly(M1term, env, indet_ring_names, RE, cmap, Nc, label + "/MOD1");
-    out.M2_poly = polyterm_to_singular_poly(M2term, env, indet_ring_names, RE, cmap, Nc, label + "/MOD2");
-    out.U1_poly = make_var_poly(RE, u1_name);
-    out.U2_poly = make_var_poly(RE, u2_name);
-    out.true_gen = build_eqmodP2_true_gen(out.D, out.U1_poly, out.M1_poly, out.U2_poly, out.M2_poly, R);
-
-    LOG_INFO(g_log, "singular", label + " D(poly) = " + poly_to_string(out.D, R));
-    LOG_INFO(g_log, "singular", label + " M1(poly) = " + poly_to_string(out.M1_poly, R));
-    LOG_INFO(g_log, "singular", label + " M2(poly) = " + poly_to_string(out.M2_poly, R));
-    LOG_INFO(g_log, "singular", label + " true_gen(poly) = " + poly_to_string(out.true_gen, R));
-
-    return out;
-}
+using eqmod::make_var_poly;
 
 // -------------------------- Propagator --------------------------
 
-class PolyPropagator : public user_propagator_base
+class PolyPropagator : public user_propagator_base, protected eqmod::EqmodEngine
 {
+    struct EqFact
+    {
+        expr lhs;
+        expr rhs;
+        Z3_ast first_key = nullptr;
+        Z3_ast second_key = nullptr;
+        std::size_t generator_count = 0;
+        bool globally_proved = false;
+    };
+
     IndetEnv m_env;
     CoeffVarMap m_cmap;
 
     std::vector<std::string> m_indet_ring_names;
     std::vector<std::string> m_ring_vars;
-    std::vector<std::string> m_qvar_names;
-    std::vector<std::pair<std::string, std::string>> m_eqmodp2_qvar_names;
 
     int m_Nc = 0;
     int m_Mi = 0;
 
     std::vector<EqPCompiled> m_eqp;
-    std::vector<EqModPCompiled> m_eqmodp;
-    std::vector<EqModP2Compiled> m_eqmodp2;
-    std::unordered_set<Z3_ast> m_compiled_eqmodp2_atoms;
-
-    std::vector<poly> m_auto_zero_gens;
-    std::vector<std::string> m_auto_zero_labels;
 
     std::unordered_map<Z3_ast, Z3_lbool> m_bool_cache;
     std::unordered_map<Z3_ast, Z3_ast> m_fixed_ast_cache;
@@ -1862,14 +445,87 @@ class PolyPropagator : public user_propagator_base
 
     std::unordered_map<Z3_ast, std::string> m_label;
     std::unordered_set<Z3_ast> m_registered_terms;
-    util::EqExperimentOptions m_eq_experiment_options;
-    util::EqExperimentTracker m_eq_experiment;
+    util::EqCallbackOptions m_eq_callback_options;
+    util::EqCallbackTracker m_eq_callback_tracker;
+    std::vector<expr> m_all_bv_terms;
+    std::vector<RewrittenCoeffBase> m_eq_coeff_views;
+    std::vector<expr> m_online_bv_constraints;
+    std::vector<expr> m_online_bv_terms;
+    std::vector<std::pair<expr, expr>> m_partition_prepass_equalities;
+    std::vector<expr> m_partition_prepass_triggers;
+    bool m_partition_prepass_propagated = false;
+    std::size_t m_partition_prepass_propagation_requested = 0;
+    std::size_t m_partition_prepass_propagation_accepted = 0;
+    bool m_allow_live_validator = true;
+    // Declared before the threaded validator so reverse member destruction
+    // joins validator threads before stopping the Singular worker processes.
+    std::unique_ptr<util::singular::MembershipProcessPool> m_gb_process_pool;
+    std::unique_ptr<util::eqpartition::ImpliedEqualityPartitionRefiner>
+        m_eq_partition_refiner;
+    std::unique_ptr<util::eqgb::LiveGlobalEqValidator> m_live_eq_validator;
+    std::vector<expr> m_live_eq_terms;
+    std::unordered_map<Z3_ast, std::size_t> m_live_eq_term_indices;
+    std::unordered_set<std::uint64_t> m_live_eq_applied_keys;
+    // Main-side compact dedup keeps repeated scoped closure construction away
+    // from the validator mutex.  A direct observation may still promote a
+    // pair that was first seen through closure, so it has its own seen set.
+    std::unordered_set<std::uint64_t> m_live_eq_pair_attempted_keys;
+    std::unordered_set<std::uint64_t> m_live_eq_direct_attempted_keys;
+    std::size_t m_live_eq_applied = 0;
+    std::size_t m_live_eq_applied_during_search = 0;
+    std::size_t m_live_eq_applied_at_final = 0;
+    std::size_t m_live_eq_direct_seen = 0;
+    std::size_t m_live_eq_callback_submitted = 0;
+    std::size_t m_live_eq_closure_seen = 0;
+    std::size_t m_live_eq_closure_submitted = 0;
+    bool m_live_eq_in_final = false;
+    std::size_t m_live_eq_propagated = 0;
+    std::size_t m_conflict_generation = 0;
+    std::size_t m_live_eq_empty_drains_avoided = 0;
+    std::size_t m_live_eq_final_waits = 0;
+    std::size_t m_live_eq_final_waves = 0;
+    std::chrono::nanoseconds m_live_eq_final_wait_time{0};
+    struct LiveEqUnionUndo
+    {
+        std::size_t child = 0;
+        std::size_t parent = 0;
+        std::size_t old_parent_size = 0;
+        std::size_t old_parent_members = 0;
+    };
+    std::vector<std::size_t> m_live_eq_union_parent;
+    std::vector<std::size_t> m_live_eq_union_size;
+    std::vector<std::vector<std::size_t>> m_live_eq_union_members;
+    std::vector<LiveEqUnionUndo> m_live_eq_union_trail;
+    std::vector<std::pair<expr, expr>> m_proved_global_eq;
+    // Equality lemmas are useful to Z3 as soon as validation finishes, but
+    // inserting them into the Singular ideal one at a time invalidates every
+    // pending membership check.  Commit them to the GB forest in coarse
+    // batches while still propagating each proved equality immediately.
+    static constexpr std::size_t LIVE_EQ_GB_BATCH_SIZE = 128;
+    std::size_t m_live_eq_gb_committed = 0;
+    std::size_t m_live_eq_gb_flushes = 0;
+    std::size_t m_live_eq_gb_pending_high_water = 0;
+    bool m_eq_partition_results_applied = false;
+    std::vector<EqFact> m_eq_facts;
+    std::unordered_set<std::string> m_active_eq_keys;
+    std::unordered_map<Z3_ast, std::vector<std::size_t>> m_bv_to_eq_view_indices;
+    std::size_t m_eq_generator_count = 0;
+    struct EqUnionUndo
+    {
+        std::size_t child = 0;
+        std::size_t parent = 0;
+        std::size_t old_parent_size = 0;
+    };
+    std::vector<std::size_t> m_eq_union_parent;
+    std::vector<std::size_t> m_eq_union_size;
+    std::vector<EqUnionUndo> m_eq_union_trail;
+    // Version of the equality-derived generator set, not of every observed
+    // equality callback.  GB caches only depend on equalities that can
+    // actually be translated into the current Singular ring.
+    std::size_t m_eq_generator_epoch = 0;
 
     bool m_minimal_eval_watch_registered = false;
     std::unordered_set<Z3_ast> m_eval_watch_registered;
-    std::size_t m_last_eqmod_true_lemma_true_count = static_cast<std::size_t>(-1);
-    std::size_t m_last_eqmod_true_lemma_p1_count = static_cast<std::size_t>(-1);
-    std::size_t m_last_eqmod_true_lemma_p2_count = static_cast<std::size_t>(-1);
 
     struct BoolTrailEntry
     {
@@ -1889,13 +545,104 @@ class PolyPropagator : public user_propagator_base
     {
         size_t bool_size = 0;
         size_t fixed_ast_size = 0;
+        size_t eq_size = 0;
+        size_t eq_union_size = 0;
+        size_t live_eq_union_size = 0;
     };
 
     std::vector<BoolTrailEntry> m_bool_trail;
     std::vector<FixedAstTrailEntry> m_fixed_ast_trail;
     std::vector<TrailMark> m_trail_marks;
 
-    std::string label_of(const expr &e) const
+    // --- search progress tracking ---
+    using search_clk = std::chrono::steady_clock;
+    search_clk::time_point m_search_start = search_clk::now();
+    std::size_t m_search_push_count = 0;
+    std::size_t m_search_pop_count = 0;
+    std::size_t m_search_fixed_count = 0;
+    std::size_t m_search_fixed_bool_count = 0;
+    std::size_t m_search_eq_count = 0;
+    std::size_t m_search_created_count = 0;
+    std::size_t m_search_final_count = 0;
+    std::size_t m_search_max_depth = 0;
+    search_clk::time_point m_search_last_progress = search_clk::now();
+    static constexpr double SEARCH_PROGRESS_INTERVAL_SEC = 5.0;
+
+    bool enable_all_true() const override { return g_cli.enable_all_true; }
+    bool enable_all_false() const override { return g_cli.enable_all_false; }
+    bool enable_mixed() const override { return g_cli.enable_mixed; }
+    bool assume_p1_modulus_prime() const override
+    {
+        return g_cli.all_false_assume_m_prime;
+    }
+    bool reuse_base_basis() const override
+    {
+        return g_cli.eq_gb_reuse_base_basis;
+    }
+    bool preprocess_membership() const override
+    {
+        return g_cli.enable_gb_preprocess;
+    }
+    bool verify_membership_preprocess() const override
+    {
+        return g_cli.verify_gb_preprocess;
+    }
+    bool enable_ideal_rewrite() const override
+    {
+        return g_cli.enable_ideal_rewrite;
+    }
+    bool enable_true_lemmas() const override
+    {
+        return g_cli.enable_eqmod_true_lemmas;
+    }
+    bool enable_true_lemma_lift_antecedents() const override
+    {
+        return g_cli.enable_eqmod_true_lemma_lift_antecedents;
+    }
+    bool enable_true_lemma_cache() const override
+    {
+        return g_cli.enable_eq_gb_live;
+    }
+    std::size_t refutation_processes() const override
+    {
+        return g_cli.eq_gb_refutation_processes;
+    }
+    std::size_t true_lemma_processes() const override
+    {
+        return g_cli.eq_gb_true_lemma_processes;
+    }
+    util::Logger &engine_log() override { return g_log; }
+    ring engine_ring() const override { return m_RE.R; }
+    void accumulate_direct_membership_timing(
+        const util::singular::GroebnerTiming &timing) override
+    {
+        g_groebner_timing.calls += timing.calls;
+        g_groebner_timing.elapsed += timing.elapsed;
+    }
+
+    void search_progress_tick(const char *event)
+    {
+        auto now = search_clk::now();
+        double elapsed_since_last =
+            std::chrono::duration<double>(now - m_search_last_progress).count();
+        if (elapsed_since_last < SEARCH_PROGRESS_INTERVAL_SEC)
+            return;
+        m_search_last_progress = now;
+        LOG_INFO(g_log, "search",
+                 "[progress " + util::fmt_duration(now - m_search_start) + "] "
+                 "event=" + std::string(event) +
+                 " depth=" + std::to_string(m_trail_marks.size()) +
+                 " max_depth=" + std::to_string(m_search_max_depth) +
+                 " push=" + std::to_string(m_search_push_count) +
+                 " pop=" + std::to_string(m_search_pop_count) +
+                 " fixed=" + std::to_string(m_search_fixed_count) +
+                 " fixed_bool=" + std::to_string(m_search_fixed_bool_count) +
+                 " eq=" + std::to_string(m_search_eq_count) +
+                 " created=" + std::to_string(m_search_created_count) +
+                 " final=" + std::to_string(m_search_final_count));
+    }
+
+    std::string label_of(const expr &e) const override
     {
         auto it = m_label.find((Z3_ast)e);
         if (it != m_label.end())
@@ -1918,8 +665,669 @@ class PolyPropagator : public user_propagator_base
 
     void tracked_add(const expr &e)
     {
-        m_registered_terms.insert((Z3_ast)e);
+        if (!m_registered_terms.insert((Z3_ast)e).second)
+            return;
         this->add(e);
+    }
+
+    bool is_partition_prepass_trigger(const expr &term) const
+    {
+        return !m_partition_prepass_triggers.empty() &&
+               z3::eq(term, m_partition_prepass_triggers.front());
+    }
+
+    void propagate_partition_prepass_equalities(const expr &trigger,
+                                                const expr &value)
+    {
+        if (m_partition_prepass_propagated ||
+            m_partition_prepass_equalities.empty() ||
+            !is_partition_prepass_trigger(trigger))
+            return;
+
+        if (!value.is_true())
+            throw std::runtime_error(
+                "partition prepass propagation trigger was not fixed true");
+
+        // Mark the one-shot before enqueuing consequences.  Z3 may process
+        // callbacks triggered by these propagations before this callback has
+        // completely unwound.
+        m_partition_prepass_propagated = true;
+        expr_vector fixed_premises(ctx());
+        fixed_premises.push_back(trigger);
+        m_partition_prepass_propagation_requested =
+            m_partition_prepass_equalities.size();
+        for (const auto &[lhs, rhs] : m_partition_prepass_equalities)
+        {
+            if (this->propagate(fixed_premises, lhs == rhs))
+                ++m_partition_prepass_propagation_accepted;
+        }
+
+        LOG_INFO(g_log, "eqpartition",
+                 "partition prepass search-start propagation: requested=" +
+                     std::to_string(m_partition_prepass_propagation_requested) +
+                     " accepted=" +
+                     std::to_string(m_partition_prepass_propagation_accepted) +
+                     " fixed-callback=" +
+                     std::to_string(m_search_fixed_count) +
+                     " depth=" + std::to_string(m_trail_marks.size()));
+    }
+
+    bool eq_trace_enabled() const
+    {
+        return m_eq_callback_tracker.trace_enabled(m_eq_callback_options);
+    }
+
+    bool eq_fact_tracking_enabled() const
+    {
+        return eq_trace_enabled() || eq_gb_generator_mode_enabled();
+    }
+
+    static std::pair<Z3_ast, Z3_ast> canonical_eq_keys(const expr &x, const expr &y)
+    {
+        Z3_ast xa = (Z3_ast)x;
+        Z3_ast ya = (Z3_ast)y;
+        const unsigned xid = Z3_get_ast_id((Z3_context)x.ctx(), xa);
+        const unsigned yid = Z3_get_ast_id((Z3_context)y.ctx(), ya);
+        return xid <= yid ? std::make_pair(xa, ya) : std::make_pair(ya, xa);
+    }
+
+    std::string eq_key(Z3_ast first, Z3_ast second) const
+    {
+        std::ostringstream oss;
+        oss << first << ':' << second;
+        return oss.str();
+    }
+
+    bool compatible_eq_views(std::size_t lhs_idx, std::size_t rhs_idx) const
+    {
+        const expr &lhs_base = m_eq_coeff_views[lhs_idx].original_base;
+        const expr &rhs_base = m_eq_coeff_views[rhs_idx].original_base;
+        if (!is_bv_to_int_app(lhs_base) || !is_bv_to_int_app(rhs_base))
+            return false;
+        const expr lhs_bv = lhs_base.arg(0);
+        const expr rhs_bv = rhs_base.arg(0);
+        return lhs_bv.get_sort().bv_size() == rhs_bv.get_sort().bv_size() &&
+               Z3_is_eq_func_decl((Z3_context)lhs_base.ctx(),
+                                  (Z3_func_decl)lhs_base.decl(),
+                                  (Z3_func_decl)rhs_base.decl());
+    }
+
+    bool has_compatible_eq_views(const expr &x, const expr &y) const
+    {
+        auto xi = m_bv_to_eq_view_indices.find((Z3_ast)x);
+        auto yi = m_bv_to_eq_view_indices.find((Z3_ast)y);
+        if (xi == m_bv_to_eq_view_indices.end() || yi == m_bv_to_eq_view_indices.end())
+            return false;
+        for (std::size_t lhs_idx : xi->second)
+            for (std::size_t rhs_idx : yi->second)
+                if (lhs_idx != rhs_idx && compatible_eq_views(lhs_idx, rhs_idx))
+                    return true;
+        return false;
+    }
+
+    void initialize_live_eq_validator()
+    {
+        if (!g_cli.enable_eq_gb_live || !m_allow_live_validator)
+            return;
+
+        std::unordered_set<Z3_ast> seen;
+        for (const expr &term : m_online_bv_terms)
+            if (m_bv_to_eq_view_indices.count((Z3_ast)term) != 0 &&
+                seen.insert((Z3_ast)term).second)
+                m_live_eq_terms.push_back(term);
+        std::sort(m_live_eq_terms.begin(), m_live_eq_terms.end(),
+                  [](const expr &lhs, const expr &rhs) {
+                      return lhs.to_string() < rhs.to_string();
+                  });
+        for (std::size_t i = 0; i < m_live_eq_terms.size(); ++i)
+            m_live_eq_term_indices.emplace((Z3_ast)m_live_eq_terms[i], i);
+        m_live_eq_union_parent.resize(m_live_eq_terms.size());
+        std::iota(m_live_eq_union_parent.begin(), m_live_eq_union_parent.end(), 0);
+        m_live_eq_union_size.assign(m_live_eq_terms.size(), 1);
+        m_live_eq_union_members.resize(m_live_eq_terms.size());
+        for (std::size_t i = 0; i < m_live_eq_terms.size(); ++i)
+            m_live_eq_union_members[i].push_back(i);
+        m_live_eq_union_trail.clear();
+
+        const char *discovery_mode =
+            g_cli.eq_gb_live_partition_refinement
+                ? "partition-refinement-pure"
+                : (g_cli.eq_gb_live_hybrid ? "hybrid" : "live-heuristic");
+        LOG_INFO(g_log, "eqgb",
+                 std::string("equality discovery mode=") + discovery_mode +
+                     " terms=" + std::to_string(m_live_eq_terms.size()) +
+                     " live-validator=" +
+                     (eq_gb_live_heuristic_enabled() ? "on" : "off") +
+                     " complete-partition=" +
+                     (eq_gb_partition_refinement_enabled() ? "on" : "off"));
+
+        if (eq_gb_partition_refinement_enabled())
+        {
+            util::eqpartition::Options options;
+            options.timeout_ms = 0;
+            // The complete refiner is intentionally run at the final barrier.
+            // Running another full-formula solver concurrently with the Main
+            // Solver causes severe memory-bandwidth contention on large BV
+            // inputs and obscures the cost comparison.
+            options.start_async = false;
+            m_eq_partition_refiner = std::make_unique<
+                util::eqpartition::ImpliedEqualityPartitionRefiner>(
+                ctx(), m_online_bv_constraints, m_live_eq_terms,
+                options, &g_log);
+        }
+
+        if (eq_gb_live_heuristic_enabled())
+        {
+            util::eqgb::LiveValidatorOptions options;
+            options.workers = g_cli.eq_gb_live_workers;
+            options.seed_models = g_cli.eq_gb_live_seed_models;
+            options.unified_queue = g_cli.eq_gb_live_unified_queue;
+            m_live_eq_validator =
+                std::make_unique<util::eqgb::LiveGlobalEqValidator>(
+                    ctx(), m_online_bv_constraints, m_live_eq_terms,
+                    options, &g_log);
+        }
+    }
+
+    void initialize_gb_process_pool()
+    {
+        if (!m_allow_live_validator || m_RE.R == nullptr)
+            return;
+        const std::size_t workers = std::max(
+            g_cli.eq_gb_true_lemma_processes,
+            g_cli.eq_gb_refutation_processes);
+        if (workers == 0)
+            return;
+        // This runs before initialize_live_eq_validator(), hence before any
+        // application worker threads exist. Never fork lazily during search.
+        m_gb_process_pool =
+            std::make_unique<util::singular::MembershipProcessPool>(
+                m_RE.R, workers, &g_log);
+    }
+
+    util::singular::MembershipGroupBatchResult run_membership_groups(
+        const std::vector<poly> &base,
+        const std::vector<util::singular::MembershipGroup> &groups,
+        std::size_t processes,
+        bool return_normal_forms) override
+    {
+        ++m_eqmod_membership_batch_calls;
+        m_eqmod_membership_batch_groups += groups.size();
+        for (const auto &group : groups)
+            m_eqmod_membership_batch_targets += group.targets.size();
+        util::singular::MembershipGroupBatchOptions options;
+        options.membership.preprocess = g_cli.enable_gb_preprocess;
+        options.membership.verify_preprocess = g_cli.verify_gb_preprocess;
+        options.membership.ideal_rewrite =
+            g_cli.enable_ideal_rewrite;
+        options.reuse_base_basis = g_cli.eq_gb_reuse_base_basis;
+        options.return_normal_forms = return_normal_forms;
+        options.processes = processes;
+        if (processes != 0)
+        {
+            if (m_gb_process_pool)
+                return m_gb_process_pool->run(base, groups, options);
+            // Z3 may request a translated propagator after application
+            // threads exist. Never fork lazily there; preserve serial soundness.
+            options.processes = 0;
+        }
+        return util::singular::prove_membership_groups_serial(
+            base, groups, m_RE.R, options, &g_log);
+    }
+
+    void accumulate_membership_group_timing(
+        const util::singular::MembershipGroupBatchResult &batch) override
+    {
+        g_groebner_timing.calls += batch.base_groebner.calls;
+        g_groebner_timing.elapsed += batch.base_groebner.elapsed;
+        for (const auto &group : batch.groups)
+        {
+            g_groebner_timing.calls += group.groebner.calls;
+            g_groebner_timing.elapsed += group.groebner.elapsed;
+        }
+    }
+
+    bool live_eq_is_applied(const expr &lhs, const expr &rhs) const
+    {
+        auto lhs_index = m_live_eq_term_indices.find((Z3_ast)lhs);
+        auto rhs_index = m_live_eq_term_indices.find((Z3_ast)rhs);
+        if (lhs_index == m_live_eq_term_indices.end() ||
+            rhs_index == m_live_eq_term_indices.end())
+            return false;
+        return m_live_eq_applied_keys.count(
+                   live_eq_pair_key(lhs_index->second, rhs_index->second)) != 0;
+    }
+
+    std::size_t live_eq_union_root(std::size_t node) const
+    {
+        while (m_live_eq_union_parent[node] != node)
+            node = m_live_eq_union_parent[node];
+        return node;
+    }
+
+    void live_eq_union_components(std::size_t lhs, std::size_t rhs)
+    {
+        lhs = live_eq_union_root(lhs);
+        rhs = live_eq_union_root(rhs);
+        if (lhs == rhs)
+            return;
+        if (m_live_eq_union_size[lhs] < m_live_eq_union_size[rhs])
+            std::swap(lhs, rhs);
+        m_live_eq_union_trail.push_back(
+            {rhs, lhs, m_live_eq_union_size[lhs],
+             m_live_eq_union_members[lhs].size()});
+        m_live_eq_union_parent[rhs] = lhs;
+        m_live_eq_union_size[lhs] += m_live_eq_union_size[rhs];
+        m_live_eq_union_members[lhs].insert(
+            m_live_eq_union_members[lhs].end(),
+            m_live_eq_union_members[rhs].begin(),
+            m_live_eq_union_members[rhs].end());
+    }
+
+    void rollback_live_eq_union(std::size_t size)
+    {
+        while (m_live_eq_union_trail.size() > size)
+        {
+            const LiveEqUnionUndo undo = m_live_eq_union_trail.back();
+            m_live_eq_union_trail.pop_back();
+            m_live_eq_union_parent[undo.child] = undo.child;
+            m_live_eq_union_size[undo.parent] = undo.old_parent_size;
+            m_live_eq_union_members[undo.parent].resize(undo.old_parent_members);
+        }
+    }
+
+    bool submit_live_eq_pair(std::size_t lhs_index, std::size_t rhs_index,
+                             bool direct)
+    {
+        if (lhs_index == rhs_index || !m_live_eq_validator ||
+            lhs_index >= m_live_eq_terms.size() ||
+            rhs_index >= m_live_eq_terms.size())
+            return false;
+        const std::uint64_t key = live_eq_pair_key(lhs_index, rhs_index);
+        if (direct)
+        {
+            ++m_live_eq_direct_seen;
+            if (!m_live_eq_direct_attempted_keys.insert(key).second)
+            {
+                // Repeated direct observations carry useful ranking data even
+                // though the pair itself is already deduplicated.
+                m_live_eq_validator->submit_direct_candidate(
+                    lhs_index, rhs_index, m_trail_marks.size());
+                return false;
+            }
+            // Preserve one direct promotion attempt even if closure submitted
+            // this pair first.
+            m_live_eq_pair_attempted_keys.insert(key);
+        }
+        else
+        {
+            ++m_live_eq_closure_seen;
+            if (!m_live_eq_pair_attempted_keys.insert(key).second)
+                return false;
+        }
+        const expr &lhs = m_live_eq_terms[lhs_index];
+        const expr &rhs = m_live_eq_terms[rhs_index];
+        if (!has_compatible_eq_views(lhs, rhs))
+            return false;
+        const bool accepted = direct
+                                  ? m_live_eq_validator->submit_direct_candidate(
+                                        lhs_index, rhs_index,
+                                        m_trail_marks.size())
+                                  : m_live_eq_validator->submit_derived_candidate(
+                                        lhs_index, rhs_index,
+                                        m_trail_marks.size());
+        if (!accepted)
+            return false;
+        if (direct)
+            ++m_live_eq_callback_submitted;
+        else
+        {
+            ++m_live_eq_closure_submitted;
+        }
+        return true;
+    }
+
+    bool submit_live_eq_candidate(const expr &lhs, const expr &rhs)
+    {
+        if (!m_live_eq_validator)
+            return false;
+        auto lhs_index = m_live_eq_term_indices.find((Z3_ast)lhs);
+        auto rhs_index = m_live_eq_term_indices.find((Z3_ast)rhs);
+        if (lhs_index == m_live_eq_term_indices.end() ||
+            rhs_index == m_live_eq_term_indices.end())
+            return false;
+
+        const std::size_t lhs_root = live_eq_union_root(lhs_index->second);
+        const std::size_t rhs_root = live_eq_union_root(rhs_index->second);
+        const bool submitted =
+            submit_live_eq_pair(lhs_index->second, rhs_index->second, true);
+        if (lhs_root == rhs_root)
+            return submitted;
+        for (std::size_t left : m_live_eq_union_members[lhs_root])
+            for (std::size_t right : m_live_eq_union_members[rhs_root])
+                if (!((left == lhs_index->second && right == rhs_index->second) ||
+                      (left == rhs_index->second && right == lhs_index->second)))
+                    submit_live_eq_pair(left, right, false);
+        live_eq_union_components(lhs_root, rhs_root);
+        return submitted;
+    }
+
+    std::size_t drain_live_eq_results(bool wait_for_idle)
+    {
+        if (!m_live_eq_validator)
+            return 0;
+        if (wait_for_idle)
+            m_live_eq_validator->wait_until_idle();
+        else if (!m_live_eq_validator->has_results())
+        {
+            ++m_live_eq_empty_drains_avoided;
+            return 0;
+        }
+
+        expr_vector no_fixed(ctx());
+        for (const util::eqgb::ValidationResult &result :
+             m_live_eq_validator->drain_results())
+        {
+            if (result.status != util::eqgb::ValidationStatus::Proved ||
+                result.lhs >= m_live_eq_terms.size() ||
+                result.rhs >= m_live_eq_terms.size())
+                continue;
+            const expr &lhs = m_live_eq_terms[result.lhs];
+            const expr &rhs = m_live_eq_terms[result.rhs];
+            const std::uint64_t key = live_eq_pair_key(result.lhs, result.rhs);
+            if (!m_live_eq_applied_keys.insert(key).second)
+                continue;
+
+            m_proved_global_eq.emplace_back(lhs, rhs);
+            if (g_cli.eq_gb_live_propagate)
+            {
+                this->propagate(no_fixed, lhs == rhs);
+                ++m_live_eq_propagated;
+            }
+            ++m_live_eq_applied;
+            if (m_live_eq_in_final)
+                ++m_live_eq_applied_at_final;
+            else
+                ++m_live_eq_applied_during_search;
+            LOG_INFO(g_log, "eqgb",
+                     "live applied global equality: " +
+                         compact_log_text(lhs.to_string()) + " == " +
+                         compact_log_text(rhs.to_string()) +
+                         " source=" + (result.direct ? "direct" : "closure") +
+                         " phase=" +
+                         (m_live_eq_in_final ? "final" : "search") +
+                         " validation=" + util::fmt_duration(result.elapsed));
+        }
+        if (g_cli.eq_gb_live_generators)
+            m_live_eq_gb_pending_high_water = std::max(
+                m_live_eq_gb_pending_high_water,
+                m_proved_global_eq.size() - m_live_eq_gb_committed);
+        return flush_pending_live_eq_generators(false);
+    }
+
+    std::size_t flush_pending_live_eq_generators(bool force)
+    {
+        if (!g_cli.enable_eq_gb_live || !g_cli.eq_gb_live_generators ||
+            m_live_eq_gb_committed >= m_proved_global_eq.size())
+            return 0;
+
+        const std::size_t pending =
+            m_proved_global_eq.size() - m_live_eq_gb_committed;
+        if (!force && pending < LIVE_EQ_GB_BATCH_SIZE)
+            return 0;
+
+        const std::size_t begin = m_live_eq_gb_committed;
+        const std::size_t end = m_proved_global_eq.size();
+        std::size_t added = 0;
+        for (std::size_t i = begin; i < end; ++i)
+        {
+            const auto &[lhs, rhs] = m_proved_global_eq[i];
+            added += activate_equality_fact(lhs, rhs, true, false);
+        }
+        m_live_eq_gb_committed = end;
+        ++m_live_eq_gb_flushes;
+        if (added != 0)
+            ++m_eq_generator_epoch;
+
+        LOG_INFO(g_log, "eqgb",
+                 "live GB equality batch: committed=" +
+                     std::to_string(end - begin) +
+                     " generators=" + std::to_string(added) +
+                     " force=" + (force ? "true" : "false") +
+                     " total-committed=" + std::to_string(end) +
+                     " epoch=" + std::to_string(m_eq_generator_epoch));
+        return added;
+    }
+
+    std::size_t apply_partition_refinement_results()
+    {
+        if (!m_eq_partition_refiner || m_eq_partition_results_applied)
+            return 0;
+
+        const util::eqpartition::Result &result =
+            m_eq_partition_refiner->wait();
+        if (result.status != util::eqpartition::Status::Complete)
+        {
+            throw std::runtime_error(
+                "implied-equality partition refinement did not complete: " +
+                std::string(util::eqpartition::status_name(result.status)) +
+                (result.diagnostic.empty()
+                     ? std::string()
+                     : std::string(" (") + result.diagnostic + ")"));
+        }
+
+        for (const auto &block : result.classes)
+        {
+            if (block.size() < 2)
+                continue;
+            std::ostringstream members;
+            for (std::size_t i = 0; i < block.size(); ++i)
+            {
+                if (i != 0)
+                    members << ", ";
+                members << compact_log_text(
+                    m_live_eq_terms.at(block[i]).to_string());
+            }
+            LOG_INFO(g_log, "eqpartition",
+                     "complete equality class size=" +
+                         std::to_string(block.size()) + " terms={" +
+                         members.str() + "}");
+        }
+
+        expr_vector no_fixed(ctx());
+        std::size_t partition_propagated = 0;
+        for (const auto &[lhs_index, rhs_index] : result.proof_edges)
+        {
+            if (lhs_index >= m_live_eq_terms.size() ||
+                rhs_index >= m_live_eq_terms.size())
+                throw std::runtime_error(
+                    "partition refiner returned an invalid term index");
+            const std::uint64_t key =
+                live_eq_pair_key(lhs_index, rhs_index);
+            if (!m_live_eq_applied_keys.insert(key).second)
+                continue;
+            const expr &lhs = m_live_eq_terms[lhs_index];
+            const expr &rhs = m_live_eq_terms[rhs_index];
+            m_proved_global_eq.emplace_back(lhs, rhs);
+            if (!g_cli.eq_gb_live_partition_refinement &&
+                g_cli.eq_gb_live_propagate)
+            {
+                this->propagate(no_fixed, lhs == rhs);
+                ++m_live_eq_propagated;
+                ++partition_propagated;
+            }
+            ++m_live_eq_applied;
+            ++m_live_eq_applied_at_final;
+            LOG_INFO(g_log, "eqpartition",
+                     "partition applied global equality: " +
+                         compact_log_text(lhs.to_string()) + " == " +
+                         compact_log_text(rhs.to_string()));
+        }
+
+        m_eq_partition_results_applied = true;
+        m_live_eq_gb_pending_high_water = std::max(
+            m_live_eq_gb_pending_high_water,
+            m_proved_global_eq.size() - m_live_eq_gb_committed);
+
+        const auto &stats = result.statistics;
+        LOG_INFO(g_log, "eqpartition",
+                 "partition summary: status=complete terms=" +
+                     std::to_string(stats.terms) +
+                     " blocks=" + std::to_string(stats.initial_blocks) +
+                     "->" + std::to_string(stats.final_blocks) +
+                     " checks=" + std::to_string(stats.checks) +
+                     " sat=" + std::to_string(stats.sat_checks) +
+                     " unsat=" + std::to_string(stats.unsat_checks) +
+                     " refinements=" +
+                     std::to_string(stats.refinements) +
+                     " equality-classes=" +
+                     std::to_string(stats.equality_classes) +
+                     " proof-edges=" +
+                     std::to_string(stats.proof_edges) +
+                     " propagated=" +
+                     std::to_string(partition_propagated) +
+                     " implied-pairs=" +
+                     std::to_string(stats.implied_pairs) +
+                     " splitter-edges-total=" +
+                     std::to_string(stats.splitter_edges) +
+                     " splitter-edges-max=" +
+                     std::to_string(stats.max_splitter_edges) +
+                     " check-time=" +
+                     util::fmt_duration(stats.check_time) +
+                     " elapsed=" + util::fmt_duration(stats.elapsed));
+        return flush_pending_live_eq_generators(true);
+    }
+
+    static std::uint64_t live_eq_pair_key(std::size_t lhs, std::size_t rhs)
+    {
+        if (rhs < lhs)
+            std::swap(lhs, rhs);
+        if (lhs > UINT32_MAX || rhs > UINT32_MAX)
+            throw std::runtime_error("live equality term index exceeds 32 bits");
+        return (static_cast<std::uint64_t>(lhs) << 32) |
+               static_cast<std::uint64_t>(rhs);
+    }
+
+    std::size_t eq_union_root(std::size_t node) const
+    {
+        while (m_eq_union_parent[node] != node)
+            node = m_eq_union_parent[node];
+        return node;
+    }
+
+    bool eq_union(std::size_t lhs, std::size_t rhs)
+    {
+        lhs = eq_union_root(lhs);
+        rhs = eq_union_root(rhs);
+        if (lhs == rhs)
+            return false;
+        if (m_eq_union_size[lhs] < m_eq_union_size[rhs])
+            std::swap(lhs, rhs);
+        m_eq_union_trail.push_back({rhs, lhs, m_eq_union_size[lhs]});
+        m_eq_union_parent[rhs] = lhs;
+        m_eq_union_size[lhs] += m_eq_union_size[rhs];
+        return true;
+    }
+
+    std::size_t add_equality_to_generator_forest(const expr &x, const expr &y)
+    {
+        auto xi = m_bv_to_eq_view_indices.find((Z3_ast)x);
+        auto yi = m_bv_to_eq_view_indices.find((Z3_ast)y);
+        if (xi == m_bv_to_eq_view_indices.end() || yi == m_bv_to_eq_view_indices.end())
+            return 0;
+        std::size_t added = 0;
+        for (std::size_t lhs_idx : xi->second)
+            for (std::size_t rhs_idx : yi->second)
+                if (compatible_eq_views(lhs_idx, rhs_idx) && lhs_idx != rhs_idx &&
+                    eq_union(lhs_idx, rhs_idx))
+                    ++added;
+        return added;
+    }
+
+    std::size_t activate_equality_fact(const expr &x, const expr &y,
+                                       bool globally_proved = false,
+                                       bool update_epoch = true)
+    {
+        auto [first, second] = canonical_eq_keys(x, y);
+        const std::string key = eq_key(first, second);
+        if (!m_active_eq_keys.insert(key).second)
+            return 0;
+        const std::size_t generator_count = add_equality_to_generator_forest(x, y);
+        m_eq_facts.push_back(EqFact{x, y, first, second, generator_count,
+                                    globally_proved});
+        m_eq_generator_count += generator_count;
+        if (generator_count != 0 && update_epoch)
+            ++m_eq_generator_epoch;
+        return generator_count;
+    }
+
+    void rollback_eq_union_forest(std::size_t size)
+    {
+        while (m_eq_union_trail.size() > size)
+        {
+            const EqUnionUndo undo = m_eq_union_trail.back();
+            m_eq_union_trail.pop_back();
+            m_eq_union_parent[undo.child] = undo.child;
+            m_eq_union_size[undo.parent] = undo.old_parent_size;
+        }
+    }
+
+    void rebuild_active_eq_index()
+    {
+        m_active_eq_keys.clear();
+        m_eq_generator_count = 0;
+        for (const EqFact &fact : m_eq_facts)
+        {
+            m_active_eq_keys.insert(eq_key(fact.first_key, fact.second_key));
+            m_eq_generator_count += fact.generator_count;
+        }
+    }
+
+    void initialize_eq_coeff_index()
+    {
+        m_bv_to_eq_view_indices.clear();
+        for (std::size_t i = 0; i < m_eq_coeff_views.size(); ++i)
+        {
+            const expr &base = m_eq_coeff_views[i].original_base;
+            if (is_bv_to_int_app(base))
+                m_bv_to_eq_view_indices[(Z3_ast)base.arg(0)].push_back(i);
+        }
+        m_eq_union_parent.resize(m_eq_coeff_views.size());
+        std::iota(m_eq_union_parent.begin(), m_eq_union_parent.end(), 0);
+        m_eq_union_size.assign(m_eq_coeff_views.size(), 1);
+        m_eq_union_trail.clear();
+    }
+
+    void register_eq_terms(const std::vector<expr> &all_bv_terms)
+    {
+        const bool gb_requires_ring_bv = eq_gb_generator_mode_enabled();
+        if (m_eq_callback_options.registration == util::EqRegistrationMode::Existing &&
+            !gb_requires_ring_bv)
+            return;
+
+        std::size_t before = m_registered_terms.size();
+        if (m_eq_callback_options.registration != util::EqRegistrationMode::AllBv)
+        {
+            // Equality-derived GB generators are name-agnostic.  Register
+            // every BV that has a coefficient variable in the current ring;
+            // registering only terms mentioned by a hand-written eqP would
+            // defeat the purpose when those assertions are omitted.
+            for (const auto &entry : m_bv_to_eq_view_indices)
+                tracked_add(expr(ctx(), entry.first));
+        }
+        else
+        {
+            for (const expr &term : all_bv_terms)
+                tracked_add(term);
+        }
+        LOG_INFO(g_log, "eqcallback",
+                 "eq registration mode=" +
+                     std::string(gb_requires_ring_bv &&
+                                         m_eq_callback_options.registration == util::EqRegistrationMode::Existing
+                                     ? "ring-bv(eq-gb)"
+                                     : util::eq_registration_mode_name(m_eq_callback_options.registration)) +
+                     " added=" + std::to_string(m_registered_terms.size() - before) +
+                     " total=" + std::to_string(m_registered_terms.size()));
     }
 
     void log_fixed(const expr &t, const expr &v)
@@ -1930,7 +1338,7 @@ class PolyPropagator : public user_propagator_base
             return;
         if (is_bv_to_int_app(t))
             return;
-        if (!PRINT_FIXED_ALL)
+        if (!g_cli.print_fixed_all)
         {
             if (!t.is_app())
                 return;
@@ -1979,7 +1387,7 @@ class PolyPropagator : public user_propagator_base
         LOG_INFO(g_log, "conflict", oss.str());
     }
 
-    Z3_lbool lbool_of(const expr &a) const
+    Z3_lbool lbool_of(const expr &a) const override
     {
         auto it = m_bool_cache.find((Z3_ast)a);
         if (it == m_bool_cache.end())
@@ -2146,68 +1554,58 @@ class PolyPropagator : public user_propagator_base
         return false;
     }
 
-    bool try_eval_polyterm_with_fixed_values(const expr &p, mpz_class &out) const
+    std::string true_context_source_signature() const override
     {
-        if (is_ctor(p, "PConst", 1))
-            return try_eval_int_with_fixed_values(p.arg(0), out);
+        // The old guard used only the number of TRUE atoms.  That both loses
+        // the identity of the ideal and forces pop() to invalidate the guard
+        // unconditionally.  Record the exact algebraic sources instead so a
+        // previously computed membership result can be reused when search
+        // backtracks to the same ideal.
+        std::ostringstream signature;
+        for (std::size_t i = 0; i < m_eqp.size(); ++i)
+            if (m_eqp[i].D_full != nullptr &&
+                lbool_of(m_eqp[i].atom) == Z3_L_TRUE)
+                signature << "E" << i << ';';
+        for (std::size_t i = 0; i < m_eqmodp.size(); ++i)
+            if (m_eqmodp[i].true_gen != nullptr &&
+                lbool_of(m_eqmodp[i].atom) == Z3_L_TRUE)
+                signature << "P1" << i << ';';
+        for (std::size_t i = 0; i < m_eqmodp2.size(); ++i)
+            if (m_eqmodp2[i].true_gen != nullptr &&
+                lbool_of(m_eqmodp2[i].atom) == Z3_L_TRUE)
+                signature << "P2" << i << ';';
+        for (std::size_t i = 0; i < m_eqmodp3.size(); ++i)
+            if (m_eqmodp3[i].true_gen != nullptr &&
+                lbool_of(m_eqmodp3[i].atom) == Z3_L_TRUE)
+                signature << "P3" << i << ';';
+        for (std::size_t i = 0; i < m_eqmodp4.size(); ++i)
+            if (m_eqmodp4[i].true_gen != nullptr &&
+                lbool_of(m_eqmodp4[i].atom) == Z3_L_TRUE)
+                signature << "P4" << i << ';';
 
-        if (is_ctor(p, "PNeg", 1))
+        if (eq_gb_generator_mode_enabled())
         {
-            mpz_class a;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
-                return false;
-            out = -a;
-            return true;
+            std::vector<std::string> equality_sources;
+            equality_sources.reserve(m_eq_facts.size());
+            for (const EqFact &fact : m_eq_facts)
+            {
+                const unsigned lhs_id = Z3_get_ast_id(
+                    (Z3_context)fact.lhs.ctx(), (Z3_ast)fact.lhs);
+                const unsigned rhs_id = Z3_get_ast_id(
+                    (Z3_context)fact.rhs.ctx(), (Z3_ast)fact.rhs);
+                equality_sources.push_back(
+                    std::string(fact.globally_proved ? "G" : "L") +
+                    std::to_string(std::min(lhs_id, rhs_id)) + ':' +
+                    std::to_string(std::max(lhs_id, rhs_id)));
+            }
+            std::sort(equality_sources.begin(), equality_sources.end());
+            for (const std::string &source : equality_sources)
+                signature << source << ';';
         }
-        if (is_ctor(p, "PAdd", 2))
-        {
-            mpz_class a, b;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
-                return false;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
-                return false;
-            out = a + b;
-            return true;
-        }
-        if (is_ctor(p, "PSub", 2))
-        {
-            mpz_class a, b;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
-                return false;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
-                return false;
-            out = a - b;
-            return true;
-        }
-        if (is_ctor(p, "PMul", 2))
-        {
-            mpz_class a, b;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(0), a))
-                return false;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(1), b))
-                return false;
-            out = a * b;
-            return true;
-        }
-        if (is_ctor(p, "PPow", 2))
-        {
-            int64_t k = 0;
-            if (!get_int64_numeral(p.arg(1), k) || k < 0)
-                return false;
-            mpz_class base;
-            if (!try_eval_polyterm_with_fixed_values(p.arg(0), base))
-                return false;
-            mpz_class res = 1;
-            for (int64_t i = 0; i < k; ++i)
-                res *= base;
-            out = res;
-            return true;
-        }
-
-        return false;
+        return signature.str();
     }
 
-    std::size_t true_context_atom_count() const
+    std::size_t true_context_atom_count() const override
     {
         std::size_t n = 0;
         for (const auto &ep : m_eqp)
@@ -2219,10 +1617,21 @@ class PolyPropagator : public user_propagator_base
         for (const auto &cp : m_eqmodp2)
             if (lbool_of(cp.atom) == Z3_L_TRUE)
                 ++n;
+        for (const auto &cp : m_eqmodp3)
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ++n;
+        for (const auto &cp : m_eqmodp4)
+            if (lbool_of(cp.atom) == Z3_L_TRUE)
+                ++n;
         return n;
     }
 
-    bool all_eqp_fixed() const
+    std::size_t equality_generator_epoch() const override
+    {
+        return m_eq_generator_epoch;
+    }
+
+    bool all_eqp_fixed() const override
     {
         for (const auto &ep : m_eqp)
             if (lbool_of(ep.atom) == Z3_L_UNDEF)
@@ -2370,7 +1779,7 @@ class PolyPropagator : public user_propagator_base
         (void)A;
         (void)B;
         (void)M;
-        if (ENABLE_MINIMAL_FIXED_WATCH)
+        if (g_cli.enable_minimal_fixed_watch)
         {
             ensure_minimal_eval_watch_registered();
             return;
@@ -2385,26 +1794,23 @@ class PolyPropagator : public user_propagator_base
             tracked_add(t);
     }
 
-    void register_eval_terms_for_eqmod_atom(const expr &A, const expr &B, const expr &M1, const expr &M2)
+    void register_eval_terms_for_eqmod_atom(const expr &A,
+                                             const expr &B,
+                                             const std::vector<expr> &moduli)
     {
-        (void)A;
-        (void)B;
-        (void)M1;
-        (void)M2;
-        if (ENABLE_MINIMAL_FIXED_WATCH)
+        if (g_cli.enable_minimal_fixed_watch)
         {
             ensure_minimal_eval_watch_registered();
             return;
         }
-
         std::unordered_set<Z3_ast> seen;
         std::vector<expr> terms;
         collect_eval_terms_from_polyterm_rec(A, seen, terms);
         collect_eval_terms_from_polyterm_rec(B, seen, terms);
-        collect_eval_terms_from_polyterm_rec(M1, seen, terms);
-        collect_eval_terms_from_polyterm_rec(M2, seen, terms);
-        for (const auto &t : terms)
-            tracked_add(t);
+        for (const expr &modulus : moduli)
+            collect_eval_terms_from_polyterm_rec(modulus, seen, terms);
+        for (const expr &term : terms)
+            tracked_add(term);
     }
 
     void collect_fixed_ants_from_polyterm(const expr &p,
@@ -2413,7 +1819,7 @@ class PolyPropagator : public user_propagator_base
     {
         std::unordered_set<Z3_ast> eval_seen;
         std::vector<expr> eval_terms;
-        if (ENABLE_MINIMAL_FIXED_WATCH)
+        if (g_cli.enable_minimal_fixed_watch)
             collect_minimal_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
         else
             collect_eval_terms_from_polyterm_rec(p, eval_seen, eval_terms);
@@ -2434,180 +1840,76 @@ class PolyPropagator : public user_propagator_base
         }
     }
 
-    bool final_fixed_value_check_eqmodP1()
+    bool build_validation_assignments(
+        const expr &A,
+        const expr &B,
+        const std::vector<expr> &modulus_terms,
+        std::vector<poly> &assignments,
+        std::string &skip_reason) override
     {
-        if (m_eqmodp.empty())
-            return true;
+        std::unordered_set<Z3_ast> dependency_set;
+        collect_coeff_bases_rec(A, dependency_set);
+        collect_coeff_bases_rec(B, dependency_set);
+        for (const expr &term : modulus_terms)
+            collect_coeff_bases_rec(term, dependency_set);
+
+        std::vector<unsigned> dependency_indices;
+        dependency_indices.reserve(dependency_set.size());
+        for (Z3_ast dependency : dependency_set)
+        {
+            auto found = m_cmap.base_to_index.find(dependency);
+            if (found == m_cmap.base_to_index.end())
+            {
+                skip_reason = "coefficient-not-in-ring-map";
+                return false;
+            }
+            dependency_indices.push_back(found->second);
+        }
+        std::sort(dependency_indices.begin(), dependency_indices.end());
+        dependency_indices.erase(
+            std::unique(dependency_indices.begin(), dependency_indices.end()),
+            dependency_indices.end());
 
         ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        for (auto &cp : m_eqmodp)
+        ScopedPolyVectorOwner assignments_owner(R);
+        std::vector<poly> &owned = assignments_owner.values();
+        owned.reserve(dependency_indices.size());
+        for (unsigned index : dependency_indices)
         {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_UNDEF)
-                continue;
-
-            mpz_class a, b, m;
-            bool ok_a = try_eval_polyterm_with_fixed_values(cp.A, a);
-            bool ok_b = try_eval_polyterm_with_fixed_values(cp.B, b);
-            bool ok_m = try_eval_polyterm_with_fixed_values(cp.Mterm, m);
-            if (!(ok_a && ok_b && ok_m))
+            const expr &base = m_cmap.z3_bases[index];
+            mpz_class value;
+            if (!try_eval_int_with_fixed_values(base, value))
             {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP1] final fixed-value check conflict: " + label_of(cp.atom) +
-                             " ; reason=insufficient fixed values for A/B/M evaluation");
-                conflict_with({cp.atom});
+                skip_reason = "coefficient-without-fixed-value";
                 return false;
             }
-
-            bool semantic_truth = false;
-            mpz_class d = a - b;
-
-            if (m == 0)
-            {
-                semantic_truth = (a == b);
-            }
-            else
-            {
-                poly pM = poly_from_mpz(m, R);
-                poly pD = poly_from_mpz(d, R);
-
-                std::vector<poly> gens;
-                gens.push_back(pM);
-                ideal I = ideal_from_polys(gens, m_RE);
-                ideal G = groebner_std(I, R, "final-fixed-value-check");
-                poly nf = kNF(G, NULL, pD, 0, 0);
-
-                semantic_truth = nf_is_zero(nf);
-
-                if (nf)
-                    p_Delete(&nf, R);
-                if (pD)
-                    p_Delete(&pD, R);
-                if (G)
-                    idDelete(&G);
-                if (I)
-                    idDelete(&I);
-            }
-
-            bool assigned_truth = (bv == Z3_L_TRUE);
-            if (assigned_truth != semantic_truth)
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP1] final fixed-value check conflict: " + label_of(cp.atom) +
-                             " ; a=" + a.get_str() +
-                             " ; b=" + b.get_str() +
-                             " ; m=" + m.get_str() +
-                             " ; assigned=" + std::string(assigned_truth ? "true" : "false") +
-                             " ; semantic=" + std::string(semantic_truth ? "true" : "false"));
-
-                std::vector<expr> ants;
-                ants.push_back(cp.atom);
-
-                std::unordered_set<Z3_ast> seen;
-                seen.insert((Z3_ast)cp.atom);
-                collect_fixed_ants_from_polyterm(cp.A, seen, ants);
-                collect_fixed_ants_from_polyterm(cp.B, seen, ants);
-                collect_fixed_ants_from_polyterm(cp.Mterm, seen, ants);
-
-                conflict_with(ants);
-                return false;
-            }
+            ScopedPolyOwner variable(
+                R, make_var_poly(m_RE, m_cmap.ring_names[index]));
+            ScopedPolyOwner constant(R, poly_from_mpz(value, R));
+            constant.reset(poly_negate_owned(constant.release(), R));
+            owned.push_back(poly_add_owned(
+                variable.release(), constant.release(), R));
         }
-
+        assignments = assignments_owner.release();
         return true;
     }
 
-    bool final_fixed_value_check_eqmodP2()
+    ProofPremises validation_conflict_premises(
+        const expr &atom,
+        const expr &A,
+        const expr &B,
+        const std::vector<expr> &modulus_terms) const override
     {
-        if (m_eqmodp2.empty())
-            return true;
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        for (auto &cp : m_eqmodp2)
-        {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_UNDEF)
-                continue;
-
-            mpz_class a, b, m1, m2;
-            bool ok_a = try_eval_polyterm_with_fixed_values(cp.A, a);
-            bool ok_b = try_eval_polyterm_with_fixed_values(cp.B, b);
-            bool ok_m1 = try_eval_polyterm_with_fixed_values(cp.M1term, m1);
-            bool ok_m2 = try_eval_polyterm_with_fixed_values(cp.M2term, m2);
-            if (!(ok_a && ok_b && ok_m1 && ok_m2))
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP2] final fixed-value check skip: " + label_of(cp.atom) +
-                             " ; reason=insufficient fixed values for A/B/M1/M2 evaluation");
-                continue;
-            }
-
-            mpz_class d = a - b;
-            bool semantic_truth = false;
-            if (d == 0)
-            {
-                semantic_truth = true;
-            }
-            else if (m1 == 0 && m2 == 0)
-            {
-                semantic_truth = false;
-            }
-            else
-            {
-                std::vector<poly> gens;
-                if (m1 != 0)
-                    gens.push_back(poly_from_mpz(m1, R));
-                if (m2 != 0)
-                    gens.push_back(poly_from_mpz(m2, R));
-
-                poly pD = poly_from_mpz(d, R);
-                ideal I = ideal_from_polys(gens, m_RE);
-                ideal G = groebner_std(I, R, "final-fixed-value-check-eqmodP2");
-                poly nf = kNF(G, NULL, pD, 0, 0);
-
-                semantic_truth = nf_is_zero(nf);
-
-                delete_poly_if_nonnull(nf, R);
-                delete_poly_if_nonnull(pD, R);
-                if (G)
-                    idDelete(&G);
-                if (I)
-                    idDelete(&I);
-            }
-
-            bool assigned_truth = (bv == Z3_L_TRUE);
-            if (assigned_truth != semantic_truth)
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP2] final fixed-value check conflict: " + label_of(cp.atom) +
-                             " ; a=" + a.get_str() +
-                             " ; b=" + b.get_str() +
-                             " ; m1=" + m1.get_str() +
-                             " ; m2=" + m2.get_str() +
-                             " ; assigned=" + std::string(assigned_truth ? "true" : "false") +
-                             " ; semantic=" + std::string(semantic_truth ? "true" : "false"));
-
-                std::vector<expr> ants;
-                ants.push_back(cp.atom);
-
-                std::unordered_set<Z3_ast> seen;
-                seen.insert((Z3_ast)cp.atom);
-                collect_fixed_ants_from_polyterm(cp.A, seen, ants);
-                collect_fixed_ants_from_polyterm(cp.B, seen, ants);
-                collect_fixed_ants_from_polyterm(cp.M1term, seen, ants);
-                collect_fixed_ants_from_polyterm(cp.M2term, seen, ants);
-
-                conflict_with(ants);
-                return false;
-            }
-        }
-
-        return true;
+        ProofPremises premises;
+        premises.fixed.push_back(atom);
+        std::unordered_set<Z3_ast> seen{(Z3_ast)atom};
+        collect_fixed_ants_from_polyterm(A, seen, premises.fixed);
+        collect_fixed_ants_from_polyterm(B, seen, premises.fixed);
+        for (const expr &term : modulus_terms)
+            collect_fixed_ants_from_polyterm(term, seen, premises.fixed);
+        return premises;
     }
+
 
     void add_and_propagate_all(const expr &ante, const std::vector<expr> &cons)
     {
@@ -2632,235 +1934,219 @@ class PolyPropagator : public user_propagator_base
 
     void conflict_with(const std::vector<expr> &ants_vec)
     {
-        if (LOG_CONFLICT_ANTS)
+        if (g_cli.log_conflict_ants)
             log_conflict_ants(ants_vec);
         expr_vector ants(ctx());
         for (auto &a : ants_vec)
             ants.push_back(a);
+        ++m_conflict_generation;
         this->conflict(ants);
     }
 
-    bool propagate_true_lemma_or_conflict(const expr &atom,
-                                          Z3_lbool current_value,
-                                          std::vector<expr> ants_vec,
-                                          const std::string &reason)
+    void conflict_with(const ProofPremises &premises) override
     {
-        if (current_value == Z3_L_TRUE)
-            return false;
-
-        if (current_value == Z3_L_FALSE)
+        if (g_cli.log_conflict_ants)
         {
-            ants_vec.push_back(atom);
-            LOG_INFO(g_log, "singular", reason + "; conflicting with FALSE assignment");
-            conflict_with(ants_vec);
-            return true;
+            log_conflict_ants(premises.fixed);
+            for (const auto &eq : premises.equalities)
+                LOG_INFO(g_log, "propagator",
+                         "conflict equality antecedent: " +
+                             eq.first.to_string() + " == " +
+                             eq.second.to_string());
+        }
+        expr_vector fixed(ctx()), lhs(ctx()), rhs(ctx());
+        for (const expr &a : premises.fixed)
+            fixed.push_back(a);
+        for (const auto &eq : premises.equalities)
+        {
+            lhs.push_back(eq.first);
+            rhs.push_back(eq.second);
+        }
+        ++m_conflict_generation;
+        this->conflict(fixed, lhs, rhs);
+    }
+
+    static std::string compact_log_text(const std::string &text)
+    {
+        std::string out;
+        out.reserve(text.size());
+        bool pending_space = false;
+        for (unsigned char ch : text)
+        {
+            if (std::isspace(ch))
+            {
+                pending_space = !out.empty();
+                continue;
+            }
+            if (pending_space)
+                out.push_back(' ');
+            out.push_back(static_cast<char>(ch));
+            pending_space = false;
+        }
+        return out;
+    }
+
+    void propagate_true_atom(
+        const expr &atom, const ProofPremises &premises) override
+    {
+        expr_vector fixed(ctx()), lhs(ctx()), rhs(ctx());
+        for (const expr &a : premises.fixed)
+            fixed.push_back(a);
+        for (const auto &eq : premises.equalities)
+        {
+            lhs.push_back(eq.first);
+            rhs.push_back(eq.second);
+        }
+        tracked_add(atom);
+        this->propagate(fixed, lhs, rhs, atom);
+    }
+
+    void trace_true_lemma_gb(
+        bool begin,
+        const std::string &label,
+        std::size_t equality_generator_count,
+        std::size_t total_generator_count) override
+    {
+        m_eq_callback_tracker.on_gb(
+            eq_trace_enabled(), begin, label, m_eq_facts.size(),
+            equality_generator_count, total_generator_count);
+    }
+
+    void collect_active_eq_source_generators(std::vector<SourceGenerator> &gens_out)
+    {
+        if (!eq_gb_generator_mode_enabled())
+            return;
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
+
+        // Active equality sources can contain redundant paths through an
+        // equality class.  Its difference ideal only needs a spanning forest:
+        // for a=b, b=c, a=c, the third generator is redundant.  Build one
+        // forest across all sources, while compatible_eq_views keeps unsigned
+        // and signed BV-to-Int interpretations separate.
+        std::vector<std::size_t> parent(m_eq_coeff_views.size());
+        std::iota(parent.begin(), parent.end(), 0);
+        auto find_root = [&parent](std::size_t node)
+        {
+            std::size_t root = node;
+            while (parent[root] != root)
+                root = parent[root];
+            while (parent[node] != node)
+            {
+                const std::size_t next = parent[node];
+                parent[node] = root;
+                node = next;
+            }
+            return root;
+        };
+
+        for (const EqFact &fact : m_eq_facts)
+        {
+            auto lhs_it = m_bv_to_eq_view_indices.find((Z3_ast)fact.lhs);
+            auto rhs_it = m_bv_to_eq_view_indices.find((Z3_ast)fact.rhs);
+            if (lhs_it == m_bv_to_eq_view_indices.end() || rhs_it == m_bv_to_eq_view_indices.end())
+                continue;
+            for (std::size_t lhs_idx : lhs_it->second)
+            {
+                for (std::size_t rhs_idx : rhs_it->second)
+                {
+                    if (!compatible_eq_views(lhs_idx, rhs_idx) || lhs_idx == rhs_idx)
+                        continue;
+                    const std::size_t lhs_root = find_root(lhs_idx);
+                    const std::size_t rhs_root = find_root(rhs_idx);
+                    if (lhs_root == rhs_root)
+                        continue;
+                    parent[rhs_root] = lhs_root;
+                    poly lhs_poly = expr_to_poly_anyring(
+                        m_eq_coeff_views[lhs_idx].rewritten_int, m_RE, m_cmap);
+                    poly rhs_poly = expr_to_poly_anyring(
+                        m_eq_coeff_views[rhs_idx].rewritten_int, m_RE, m_cmap);
+                    poly difference = poly_add_owned(lhs_poly, poly_negate_owned(rhs_poly, R), R);
+                    add_source_generator(
+                        gens_out, difference, std::nullopt,
+                        fact.globally_proved
+                            ? std::optional<std::pair<expr, expr>>{}
+                            : std::make_optional(std::make_pair(fact.lhs, fact.rhs)));
+                }
+            }
         }
 
-        expr_vector ants(ctx());
-        for (auto &a : ants_vec)
-            ants.push_back(a);
-
-        tracked_add(atom);
-        LOG_INFO(g_log, "singular", reason + "; propagating TRUE lemma");
-        this->propagate(ants, atom);
-        return false;
     }
 
-    void reset_propagated_truth_flags()
+    void collect_true_context_source_generators(
+        std::vector<SourceGenerator> &gens_out) override
     {
-        for (auto &cp : m_eqmodp)
-            cp.propagated_truth = Z3_L_UNDEF;
-        for (auto &cp : m_eqmodp2)
-            cp.propagated_truth = Z3_L_UNDEF;
-        m_last_eqmod_true_lemma_true_count = static_cast<std::size_t>(-1);
-        m_last_eqmod_true_lemma_p1_count = static_cast<std::size_t>(-1);
-        m_last_eqmod_true_lemma_p2_count = static_cast<std::size_t>(-1);
-    }
+        ring R = m_RE.R;
+        rChangeCurrRing(R);
 
-    void collect_true_context_antecedents(std::vector<expr> &ants_out) const
-    {
         for (const auto &ep : m_eqp)
         {
             if (ep.D_full == nullptr)
                 continue;
-            if (lbool_of(ep.atom) == Z3_L_TRUE)
-                ants_out.push_back(ep.atom);
+            if (lbool_of(ep.atom) != Z3_L_TRUE)
+                continue;
+            add_source_generator(gens_out, p_Copy(ep.D_full, R), ep.atom);
         }
 
         for (const auto &cp : m_eqmodp)
         {
             if (cp.true_gen == nullptr)
                 continue;
-            if (lbool_of(cp.atom) == Z3_L_TRUE)
-                ants_out.push_back(cp.atom);
+            if (lbool_of(cp.atom) != Z3_L_TRUE)
+                continue;
+            add_source_generator(gens_out, p_Copy(cp.true_gen, R), cp.atom);
         }
 
         for (const auto &cp : m_eqmodp2)
         {
-            if (lbool_of(cp.atom) == Z3_L_TRUE)
-                ants_out.push_back(cp.atom);
-        }
-    }
-
-    bool same_modulus_across_eqmodp() const
-    {
-        if (m_eqmodp.empty())
-            return true;
-
-        ring R = m_RE.R;
-        if (R == nullptr)
-            return false;
-        rChangeCurrRing(R);
-
-        const auto &c0 = m_eqmodp[0];
-        if (!c0.modulus_ok || c0.M_poly == nullptr)
-        {
-            LOG_INFO(g_log, "singular",
-                     "same_modulus_across_eqmodp: eqmodP1#0 has invalid modulus");
-            return false;
-        }
-
-        LOG_INFO(g_log, "singular",
-                 "Reference modulus eqmodP1#0 M(poly) = " + poly_to_string(c0.M_poly, R));
-
-        for (size_t i = 1; i < m_eqmodp.size(); ++i)
-        {
-            const auto &ci = m_eqmodp[i];
-
-            if (!ci.modulus_ok || ci.M_poly == nullptr)
-            {
-                LOG_INFO(g_log, "singular",
-                         "same_modulus_across_eqmodp: eqmodP1#" + std::to_string(i) +
-                             " has invalid modulus");
-                return false;
-            }
-
-            bool same = poly_equal(ci.M_poly, c0.M_poly, R);
-
-            LOG_INFO(g_log, "singular",
-                     "Compare modulus eqmodP1#" + std::to_string(i) +
-                         " against eqmodP1#0 : " + std::string(same ? "SAME" : "DIFF"));
-
-            if (!same)
-            {
-                LOG_INFO(g_log, "singular",
-                         "  eqmodP1#0 M(poly) = " + poly_to_string(c0.M_poly, R));
-                LOG_INFO(g_log, "singular",
-                         "  eqmodP1#" + std::to_string(i) +
-                             " M(poly) = " + poly_to_string(ci.M_poly, R));
-                return false;
-            }
-        }
-
-        return true;
-    }
-    std::vector<poly> collect_true_context_generators(std::vector<expr> &ants_out)
-    {
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        std::vector<poly> gens;
-        ants_out.clear();
-
-        if (m_eqmodp.empty())
-            return gens;
-        if (!same_modulus_across_eqmodp())
-            return gens;
-
-        gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
-
-        for (auto &ep : m_eqp)
-        {
-            if (ep.D_full == nullptr)
-                continue;
-            if (lbool_of(ep.atom) != Z3_L_TRUE)
-                continue;
-
-            gens.push_back(p_Copy(ep.D_full, R));
-            ants_out.push_back(ep.atom);
-        }
-
-        for (auto &cp : m_eqmodp)
-        {
-            if (lbool_of(cp.atom) != Z3_L_TRUE)
-                continue;
-            if (cp.true_gen == nullptr)
-                continue;
-
-            gens.push_back(p_Copy(cp.true_gen, R));
-            ants_out.push_back(cp.atom);
-        }
-
-        for (auto &p : m_auto_zero_gens)
-            if (p)
-                gens.push_back(p_Copy(p, R));
-
-        return gens;
-    }
-
-    void collect_true_eqp_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
-    {
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        for (auto &ep : m_eqp)
-        {
-            if (ep.D_full == nullptr)
-                continue;
-            if (lbool_of(ep.atom) != Z3_L_TRUE)
-                continue;
-            gens_out.push_back(p_Copy(ep.D_full, R));
-            ants_out.push_back(ep.atom);
-        }
-        for (auto &p : m_auto_zero_gens)
-            if (p)
-                gens_out.push_back(p_Copy(p, R));
-    }
-
-    void collect_true_eqmod_true_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
-    {
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        for (auto &cp : m_eqmodp)
-        {
             if (cp.true_gen == nullptr)
                 continue;
             if (lbool_of(cp.atom) != Z3_L_TRUE)
                 continue;
-            gens_out.push_back(p_Copy(cp.true_gen, R));
-            ants_out.push_back(cp.atom);
+            add_source_generator(gens_out, p_Copy(cp.true_gen, R), cp.atom);
         }
-    }
-
-    void collect_true_eqmodp2_true_generators(std::vector<poly> &gens_out, std::vector<expr> &ants_out)
-    {
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        for (auto &cp : m_eqmodp2)
+        for (const auto &cp : m_eqmodp3)
         {
-            if (lbool_of(cp.atom) != Z3_L_TRUE)
-                continue;
-            if (cp.true_gen != nullptr)
-                gens_out.push_back(p_Copy(cp.true_gen, R));
-            ants_out.push_back(cp.atom);
+            if (cp.true_gen != nullptr && lbool_of(cp.atom) == Z3_L_TRUE)
+                add_source_generator(gens_out, p_Copy(cp.true_gen, R), cp.atom);
         }
-    }
+        for (const auto &cp : m_eqmodp4)
+        {
+            if (cp.true_gen != nullptr && lbool_of(cp.atom) == Z3_L_TRUE)
+                add_source_generator(gens_out, p_Copy(cp.true_gen, R), cp.atom);
+        }
 
-    bool query_membership_with_groebner(const std::vector<poly> &gens, poly target, std::string &nf_out,
-                                        const std::string &ideal_label, const std::string &gb_label)
-    {
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
+        collect_active_eq_source_generators(gens_out);
 
-        std::vector<poly> owned_gens;
-        owned_gens.reserve(gens.size());
-        for (poly g : gens)
-            owned_gens.push_back(copy_poly_or_null(g, R));
-        std::vector<poly> targets = {target};
-        LOG_INFO(g_log, "singular", "Computing Groebner membership " + gb_label + " from " + ideal_label + " ...");
-        GroebnerBatchResult result =
-            run_groebner_membership_batch(std::move(owned_gens), targets, m_RE, R, gb_label);
-        nf_out = result.nf_strings.empty() ? "not-computed" : result.nf_strings[0];
-        return !result.membership.empty() && result.membership[0];
+        for (const auto &[a, b] : g_cli.inject_ideal_eq)
+        {
+            int idx_a = -1, idx_b = -1;
+            for (size_t i = 0; i < m_cmap.z3_bases.size(); ++i)
+            {
+                std::string bname = coeff_base_pretty_name(m_cmap.z3_bases[i]);
+                if (bname == a)
+                    idx_a = (int)i;
+                if (bname == b)
+                    idx_b = (int)i;
+            }
+            if (idx_a < 0 || idx_b < 0)
+            {
+                LOG_INFO(g_log, "inject",
+                         "[inject-ideal-eq] skipped " + a + " - " + b +
+                             " (not found in cmap: a=" + std::to_string(idx_a) +
+                             " b=" + std::to_string(idx_b) + ")");
+                continue;
+            }
+            const std::string &rn_a = m_cmap.ring_names[idx_a];
+            const std::string &rn_b = m_cmap.ring_names[idx_b];
+            poly pa = make_var_poly(m_RE, rn_a);
+            poly pb = make_var_poly(m_RE, rn_b);
+            poly diff = poly_add_owned(pa, poly_negate_owned(pb, R), R);
+            add_source_generator(gens_out, diff, std::nullopt);
+            LOG_INFO(g_log, "inject",
+                     "[inject-ideal-eq] added " + rn_a + " - " + rn_b +
+                         " to ideal (from " + a + " - " + b + ")");
+        }
     }
 
     void on_fixed_eqP(const expr &atom, Z3_lbool bv)
@@ -2889,6 +2175,11 @@ class PolyPropagator : public user_propagator_base
 
             if (bv == Z3_L_FALSE)
             {
+                // For an opaque polynomial relation, D != 0 cannot be
+                // expressed as a disjunction of Z3 coefficient constraints.
+                // Keep this direction conservative (no propagation).
+                if (cp.relational && !cp.always_equal)
+                    return;
                 if (cp.coeff_neq_disj.is_false())
                 {
                     conflict_with({atom});
@@ -2900,586 +2191,11 @@ class PolyPropagator : public user_propagator_base
         }
     }
 
-    // ---------------- auto-lemma saturation ----------------
-    void clear_auto_zero_gens()
-    {
-        ring R = m_RE.R;
-        if (R)
-        {
-            rChangeCurrRing(R);
-            for (auto &p : m_auto_zero_gens)
-                if (p)
-                    p_Delete(&p, R);
-        }
-        m_auto_zero_gens.clear();
-        m_auto_zero_labels.clear();
-    }
-
-    void saturate_auto_lemmas()
-    {
-        clear_auto_zero_gens();
-        if (!ENABLE_AUTO_LEMMAS)
-            return;
-
-        ring R = m_RE.R;
-        if (R == nullptr)
-            return;
-        rChangeCurrRing(R);
-
-        std::vector<poly> base_gens;
-        for (auto &ep : m_eqp)
-        {
-            if (ep.D_full != nullptr && lbool_of(ep.atom) == Z3_L_TRUE)
-                base_gens.push_back(p_Copy(ep.D_full, R));
-        }
-        for (auto &cp : m_eqmodp)
-        {
-            if (cp.true_gen != nullptr && lbool_of(cp.atom) == Z3_L_TRUE)
-                base_gens.push_back(p_Copy(cp.true_gen, R));
-        }
-
-        if (base_gens.empty())
-            return;
-
-        std::map<unsigned, std::vector<size_t>> width_groups;
-        for (size_t i = 0; i < m_cmap.z3_bases.size(); ++i)
-        {
-            const z3::expr &base = m_cmap.z3_bases[i];
-            if (!is_bv_to_int_app(base))
-                continue;
-            unsigned w = base.arg(0).get_sort().bv_size();
-            if (w == 0 || w > 64)
-                continue;
-            width_groups[w].push_back(i);
-        }
-
-        if (width_groups.empty())
-        {
-            for (auto &g : base_gens)
-                if (g)
-                    p_Delete(&g, R);
-            return;
-        }
-
-        LOG_INFO(g_log, "singular", "=== auto-lemma saturation begin ===");
-
-        for (auto &kv : width_groups)
-        {
-            unsigned w = kv.first;
-            mpz_class m_bound = mpz_class(1) << w;
-
-            std::vector<poly> gens;
-            gens.reserve(1 + base_gens.size());
-            gens.push_back(poly_from_mpz(m_bound, R));
-            for (auto g : base_gens)
-                gens.push_back(p_Copy(g, R));
-
-            ideal I = ideal_from_polys(gens, m_RE);
-            ideal G = groebner_std(I, R);
-
-            for (size_t idx : kv.second)
-            {
-                poly v_poly = make_var_poly(m_RE, m_cmap.ring_names[idx]);
-                poly nf = kNF(G, NULL, p_Copy(v_poly, R), 0, 0);
-                bool is_zero = nf_is_zero(nf);
-                if (nf)
-                    p_Delete(&nf, R);
-
-                if (is_zero)
-                {
-                    m_auto_zero_gens.push_back(p_Copy(v_poly, R));
-                    m_auto_zero_labels.push_back(m_cmap.ring_names[idx]);
-                    LOG_INFO(g_log, "singular",
-                             "[auto-lemma] implied zero: " + m_cmap.ring_names[idx] +
-                                 " (bv width=" + std::to_string(w) + ")");
-                }
-                p_Delete(&v_poly, R);
-            }
-
-            if (G)
-                idDelete(&G);
-            if (I)
-                idDelete(&I);
-        }
-
-        for (auto &g : base_gens)
-            if (g)
-                p_Delete(&g, R);
-
-        LOG_INFO(g_log, "singular",
-                 "=== auto-lemma saturation end (count=" +
-                     std::to_string(m_auto_zero_gens.size()) + ") ===");
-    }
-
-    // ---------------- eqmodP1: all-false ----------------
-    void check_eqmodP1_all_false_refutation()
-    {
-        if (!ENABLE_ALL_FALSE)
-            return;
-        if (m_eqmodp.empty())
-            return;
-
-        for (auto &cp : m_eqmodp)
-        {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_UNDEF)
-                return;
-            if (bv != Z3_L_FALSE)
-                return;
-            if (!cp.modulus_ok)
-                return;
-        }
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        bool same_modulus = same_modulus_across_eqmodp();
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation begin ===");
-        std::vector<expr> true_eqp_atoms;
-        for (auto &ep : m_eqp)
-        {
-            if (lbool_of(ep.atom) != Z3_L_TRUE)
-                continue;
-            true_eqp_atoms.push_back(ep.atom);
-        }
-
-        if (same_modulus)
-        {
-            std::vector<poly> gens;
-            gens.reserve(1 + m_eqp.size() + m_auto_zero_gens.size());
-            gens.push_back(p_Copy(m_eqmodp[0].M_poly, R));
-            for (auto &ep : m_eqp)
-            {
-                if (ep.D_full == nullptr)
-                    continue;
-                if (lbool_of(ep.atom) != Z3_L_TRUE)
-                    continue;
-                gens.push_back(p_Copy(ep.D_full, R));
-            }
-            for (auto &p : m_auto_zero_gens)
-                if (p)
-                    gens.push_back(p_Copy(p, R));
-
-            LOG_INFO(g_log, "singular", "Using " + std::to_string((int)true_eqp_atoms.size()) + " TRUE eqP equation(s) in ideal.");
-
-            ideal I = ideal_from_polys(gens, m_RE);
-            print_ideal("I", I, R);
-
-            LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(I) ...");
-            ideal G = groebner_std(I, R, "G_all_false");
-
-            print_ideal("G", G, R);
-
-            if (ALL_FALSE_ASSUME_M_PRIME)
-            {
-                // Product refutation under the assumption that R/<m> is an integral domain
-                // (e.g., m is prime / irreducible polynomial).
-                poly prod = nullptr;
-                for (auto &cp : m_eqmodp)
-                {
-                    if (!prod)
-                    {
-                        prod = p_Copy(cp.D, R);
-                    }
-                    else
-                    {
-                        poly next = poly_mul_clone(prod, cp.D, R);
-                        p_Delete(&prod, R);
-                        prod = next;
-                    }
-                }
-
-                poly nf = kNF(G, NULL, p_Copy(prod, R), 0, 0);
-                bool in = nf_is_zero(nf);
-
-                LOG_INFO(g_log, "singular",
-                         "Product query: P=" + poly_to_string(prod, R) +
-                             " ; NF_G(P)=" + poly_to_string(nf, R) +
-                             " ; P ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-                if (in)
-                {
-                    LOG_INFO(g_log, "singular",
-                             "[eqmodP1] all-false product refute: P in <M, {TRUE eqP}>; all-false assignment is impossible");
-                    std::vector<expr> ants;
-                    ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
-                    for (auto &cp : m_eqmodp)
-                        ants.push_back(cp.atom);
-                    for (auto &a : true_eqp_atoms)
-                        ants.push_back(a);
-                    conflict_with(ants);
-                }
-
-                if (nf)
-                    p_Delete(&nf, R);
-                if (prod)
-                    p_Delete(&prod, R);
-                if (G)
-                    idDelete(&G);
-                if (I)
-                    idDelete(&I);
-
-                LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
-                return;
-            }
-
-            bool hit = false;
-            expr hit_atom = ctx().bool_val(false);
-
-            for (auto &cp : m_eqmodp)
-            {
-                poly d = p_Copy(cp.D, R);
-                poly nf = kNF(G, NULL, d, 0, 0);
-                bool in = nf_is_zero(nf);
-
-                LOG_INFO(g_log, "singular",
-                         "Query instance: " + label_of(cp.atom) +
-                             " ; D=" + poly_to_string(cp.D, R) +
-                             " ; NF_G(D)=" + poly_to_string(nf, R) +
-                             " ; D ∈ <M, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-                if (nf)
-                    p_Delete(&nf, R);
-                if (d)
-                    p_Delete(&d, R);
-
-                if (in)
-                {
-                    LOG_INFO(g_log, "singular",
-                             "[eqmodP1] all-false refute: " + label_of(cp.atom) +
-                                 " has D in <M, {TRUE eqP}>; cannot be FALSE");
-                    hit = true;
-                    hit_atom = cp.atom;
-                    break;
-                }
-            }
-
-            if (hit)
-            {
-                std::vector<expr> ants;
-                ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
-                for (auto &cp : m_eqmodp)
-                    ants.push_back(cp.atom);
-                for (auto &a : true_eqp_atoms)
-                    ants.push_back(a);
-                if (!hit_atom.is_false())
-                    ants.push_back(hit_atom);
-                conflict_with(ants);
-            }
-
-            if (G)
-                idDelete(&G);
-            if (I)
-                idDelete(&I);
-
-            LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
-            return;
-        }
-
-        LOG_INFO(g_log, "singular", "all-false uses different moduli; running per-instance checks");
-        bool hit = false;
-        expr hit_atom = ctx().bool_val(false);
-        for (auto &cp : m_eqmodp)
-        {
-            std::vector<expr> eqp_ants;
-            std::vector<poly> gens;
-            gens.reserve(1 + m_eqp.size());
-            gens.push_back(p_Copy(cp.M_poly, R));
-            collect_true_eqp_generators(gens, eqp_ants);
-
-            std::string nf_s;
-            std::string idx = label_of(cp.atom);
-            std::string i_label = "I_all_false_diff_" + idx;
-            std::string g_label = "G_all_false_diff_" + idx;
-            bool in = query_membership_with_groebner(gens, cp.D, nf_s, i_label, g_label);
-            LOG_INFO(g_log, "singular",
-                     "Different-moduli query instance: " + label_of(cp.atom) +
-                         " ; D=" + poly_to_string(cp.D, R) +
-                         " ; NF_<mf,TRUE_eqP>(D)=" + nf_s +
-                         " ; D ∈ <m_f, {TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-            if (in)
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP1] all-false(different-moduli) refute: " + label_of(cp.atom) +
-                             " has D in <m_f, {TRUE eqP}>; cannot be FALSE");
-                hit = true;
-                hit_atom = cp.atom;
-                break;
-            }
-        }
-
-        if (hit)
-        {
-            std::vector<expr> ants;
-            ants.reserve(m_eqmodp.size() + true_eqp_atoms.size());
-            for (auto &cp : m_eqmodp)
-                ants.push_back(cp.atom);
-            for (auto &a : true_eqp_atoms)
-                ants.push_back(a);
-            if (!hit_atom.is_false())
-                ants.push_back(hit_atom);
-            conflict_with(ants);
-        }
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(all-false) refutation end ===");
-    }
-
-    // ---------------- eqmodP1: all-true ----------------
-    void check_eqmodP1_all_true_refutation()
-    {
-        if (!ENABLE_ALL_TRUE)
-            return;
-        if (m_eqmodp.empty())
-            return;
-
-        for (auto &cp : m_eqmodp)
-        {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_UNDEF)
-                return;
-            if (bv != Z3_L_TRUE)
-                return;
-            if (!cp.modulus_ok)
-                return;
-        }
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        bool same_modulus = same_modulus_across_eqmodp();
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(all-true) refutation begin ===");
-        std::vector<expr> ants;
-        std::vector<poly> gens;
-        if (same_modulus)
-        {
-            gens = collect_true_context_generators(ants);
-            if (gens.empty())
-                return;
-            LOG_INFO(g_log, "singular", "all-true uses same modulus context");
-        }
-        else
-        {
-            collect_true_eqmod_true_generators(gens, ants);
-            if (gens.empty())
-                return;
-            LOG_INFO(g_log, "singular", "all-true uses different moduli context: J=<p_t-u_t*m_t>");
-        }
-
-        ideal J = ideal_from_polys(gens, m_RE);
-        print_ideal(same_modulus ? "J_all_true" : "J_all_true_diffmod", J, R);
-
-        LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-        ideal G = groebner_std(J, R, same_modulus ? "G_all_true" : "G_all_true_diffmod");
-
-        print_ideal(same_modulus ? "G_all_true" : "G_all_true_diffmod", G, R);
-
-        poly one = poly_from_si(1, R);
-        poly nf = kNF(G, NULL, one, 0, 0);
-        bool unsat = nf_is_zero(nf);
-
-        LOG_INFO(g_log, "singular",
-                 "ALL-TRUE check: NF_G(1)=" + poly_to_string(nf, R) +
-                     " ; 1 ∈ J ? " + std::string(unsat ? "YES" : "NO"));
-
-        if (nf)
-            p_Delete(&nf, R);
-        if (G)
-            idDelete(&G);
-        if (J)
-            idDelete(&J);
-
-        if (unsat)
-        {
-            LOG_INFO(g_log, "singular",
-                     same_modulus ? "[eqmodP1] all-true refute: 1 ∈ J"
-                                  : "[eqmodP1] all-true(different-moduli) refute: 1 ∈ J");
-            conflict_with(ants);
-        }
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(all-true) refutation end ===");
-    }
-
-    // ---------------- eqmodP1: mixed ----------------
-    void check_eqmodP1_mixed_refutation()
-    {
-        if (!ENABLE_MIXED)
-            return;
-        if (m_eqmodp.empty())
-            return;
-
-        bool has_true = false;
-        bool has_false = false;
-
-        for (auto &cp : m_eqmodp)
-        {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_UNDEF)
-                return;
-            if (!cp.modulus_ok)
-                return;
-
-            if (bv == Z3_L_TRUE)
-                has_true = true;
-            else if (bv == Z3_L_FALSE)
-                has_false = true;
-        }
-
-        if (!(has_true && has_false))
-            return;
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-        bool same_modulus = same_modulus_across_eqmodp();
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation begin ===");
-        if (same_modulus)
-        {
-            std::vector<expr> true_context_ants;
-            std::vector<poly> gens = collect_true_context_generators(true_context_ants);
-            if (gens.empty())
-                return;
-
-            ideal J = ideal_from_polys(gens, m_RE);
-            print_ideal("J_mixed", J, R);
-
-            LOG_INFO(g_log, "singular", "Computing Groebner basis G = std(J) ...");
-            ideal G = groebner_std(J, R, "G_mixed");
-
-            print_ideal("G_mixed", G, R);
-
-            bool hit = false;
-            expr hit_atom = ctx().bool_val(false);
-
-            for (auto &cp : m_eqmodp)
-            {
-                if (lbool_of(cp.atom) != Z3_L_FALSE)
-                    continue;
-
-                poly d = p_Copy(cp.D, R);
-                poly nf = kNF(G, NULL, d, 0, 0);
-                bool in = nf_is_zero(nf);
-
-                LOG_INFO(g_log, "singular",
-                         "MIXED query instance: " + label_of(cp.atom) +
-                             " ; D=" + poly_to_string(cp.D, R) +
-                             " ; NF_G(D)=" + poly_to_string(nf, R) +
-                             " ; D ∈ J ? " + std::string(in ? "YES" : "NO"));
-
-                if (nf)
-                    p_Delete(&nf, R);
-                if (d)
-                    p_Delete(&d, R);
-
-                if (in)
-                {
-                    LOG_INFO(g_log, "singular",
-                             "[eqmodP1] mixed refute: " + label_of(cp.atom) +
-                                 " has D in J; cannot be FALSE");
-                    hit = true;
-                    hit_atom = cp.atom;
-                    break;
-                }
-            }
-
-            if (G)
-                idDelete(&G);
-            if (J)
-                idDelete(&J);
-
-            if (hit)
-            {
-                std::vector<expr> ants = true_context_ants;
-                ants.push_back(hit_atom);
-                conflict_with(ants);
-            }
-
-            LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation end ===");
-            return;
-        }
-
-        LOG_INFO(g_log, "singular", "mixed uses different moduli context");
-
-        std::vector<expr> true_eqp_atoms;
-        std::vector<poly> true_eqp_gens;
-        collect_true_eqp_generators(true_eqp_gens, true_eqp_atoms);
-
-        std::vector<expr> true_eqmod_atoms;
-        std::vector<poly> true_eqmod_gens;
-        collect_true_eqmod_true_generators(true_eqmod_gens, true_eqmod_atoms);
-
-        std::vector<poly> base_gens;
-        base_gens.reserve(true_eqp_gens.size() + true_eqmod_gens.size());
-        for (auto p : true_eqp_gens)
-            base_gens.push_back(p_Copy(p, R));
-        for (auto p : true_eqmod_gens)
-            base_gens.push_back(p_Copy(p, R));
-        for (auto &p : true_eqp_gens)
-            if (p)
-                p_Delete(&p, R);
-        for (auto &p : true_eqmod_gens)
-            if (p)
-                p_Delete(&p, R);
-
-        bool hit = false;
-        expr hit_atom = ctx().bool_val(false);
-        for (auto &cp : m_eqmodp)
-        {
-            if (lbool_of(cp.atom) != Z3_L_FALSE)
-                continue;
-
-            std::vector<poly> gens;
-            gens.reserve(base_gens.size() + 1);
-            for (auto p : base_gens)
-                gens.push_back(p_Copy(p, R));
-            gens.push_back(p_Copy(cp.M_poly, R));
-
-            std::string nf_s;
-            std::string idx = label_of(cp.atom);
-            std::string i_label = "I_mixed_diff_" + idx;
-            std::string g_label = "G_mixed_diff_" + idx;
-            bool in = query_membership_with_groebner(gens, cp.D, nf_s, i_label, g_label);
-            LOG_INFO(g_log, "singular",
-                     "MIXED different-moduli query: " + label_of(cp.atom) +
-                         " ; D=" + poly_to_string(cp.D, R) +
-                         " ; NF_<m_f,J>(D)=" + nf_s +
-                         " ; D ∈ <m_f, J>? " + std::string(in ? "YES" : "NO"));
-            if (in)
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP1] mixed(different-moduli) refute: " + label_of(cp.atom) +
-                             " has D in <m_f, J>; cannot be FALSE");
-                hit = true;
-                hit_atom = cp.atom;
-                break;
-            }
-        }
-
-        if (hit)
-        {
-            std::vector<expr> ants;
-            ants.reserve(true_eqp_atoms.size() + true_eqmod_atoms.size() + 1);
-            for (auto &a : true_eqp_atoms)
-                ants.push_back(a);
-            for (auto &a : true_eqmod_atoms)
-                ants.push_back(a);
-            ants.push_back(hit_atom);
-            conflict_with(ants);
-        }
-        for (auto &p : base_gens)
-            if (p)
-                p_Delete(&p, R);
-
-        LOG_INFO(g_log, "singular", "=== eqmodP1(mixed) refutation end ===");
-    }
-
     void check_eqmodP1_conflicts()
     {
-        if (conflict_on_propagated_eqmodP1_true_false())
+        if (conflict_on_propagated_p1_truth())
             return;
-        saturate_auto_lemmas();
-        check_eqmodP1_all_false_refutation();
-        check_eqmodP1_all_true_refutation();
-        check_eqmodP1_mixed_refutation();
+        check_cross_family_eqmod_refutations();
     }
 
     bool all_eqp_eqmodp_fixed() const
@@ -3501,7 +2217,7 @@ class PolyPropagator : public user_propagator_base
     {
         if (m_eqmodp.empty())
             return;
-        if (conflict_on_propagated_eqmodP1_true_false())
+        if (conflict_on_propagated_p1_truth())
             return;
         if (!all_eqp_eqmodp_fixed())
             return;
@@ -3523,624 +2239,29 @@ class PolyPropagator : public user_propagator_base
         return true;
     }
 
-    void check_eqmodP2_all_false_refutation()
-    {
-        if (!ENABLE_ALL_FALSE)
-            return;
-        if (m_eqmodp2.empty())
-            return;
-        if (!all_eqp_eqmodp2_fixed())
-            return;
-
-        for (auto &cp : m_eqmodp2)
-        {
-            if (lbool_of(cp.atom) != Z3_L_FALSE)
-                return;
-        }
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(all-false) refutation begin ===");
-
-        struct ModPairGroup
-        {
-            size_t rep = 0;
-            std::vector<size_t> members;
-        };
-
-        std::vector<ModPairGroup> groups;
-        for (size_t i = 0; i < m_eqmodp2.size(); ++i)
-        {
-            auto &cp = m_eqmodp2[i];
-            bool grouped = false;
-            for (auto &g : groups)
-            {
-                auto &rep = m_eqmodp2[g.rep];
-                if (poly_equal(cp.M1_poly, rep.M1_poly, R) &&
-                    poly_equal(cp.M2_poly, rep.M2_poly, R))
-                {
-                    g.members.push_back(i);
-                    grouped = true;
-                    break;
-                }
-            }
-            if (!grouped)
-            {
-                groups.push_back(ModPairGroup{i, {i}});
-            }
-        }
-
-        std::vector<expr> eqp_ants;
-        for (auto &ep : m_eqp)
-        {
-            if (lbool_of(ep.atom) == Z3_L_TRUE)
-                eqp_ants.push_back(ep.atom);
-        }
-
-        for (const auto &group : groups)
-        {
-            auto &rep = m_eqmodp2[group.rep];
-            std::vector<poly> gens;
-
-            if (rep.M1_poly)
-                gens.push_back(copy_poly_or_null(rep.M1_poly, R));
-            if (rep.M2_poly)
-                gens.push_back(copy_poly_or_null(rep.M2_poly, R));
-
-            for (auto &ep : m_eqp)
-            {
-                if (lbool_of(ep.atom) != Z3_L_TRUE)
-                    continue;
-                if (ep.D_full == nullptr)
-                    continue;
-                gens.push_back(copy_poly_or_null(ep.D_full, R));
-            }
-
-            LOG_INFO(g_log, "singular",
-                     "eqmodP2 all-false group: representative=" + label_of(rep.atom) +
-                         " ; members=" + std::to_string(group.members.size()) +
-                         " ; M1=" + poly_to_string(rep.M1_poly, R) +
-                         " ; M2=" + poly_to_string(rep.M2_poly, R));
-
-            if (gens.empty())
-            {
-                for (size_t idx : group.members)
-                {
-                    auto &cp = m_eqmodp2[idx];
-                    bool in = cp.D == nullptr;
-                    std::string nf_s = in ? "0" : poly_to_string(cp.D, R);
-
-                    LOG_INFO(g_log, "singular",
-                             "eqmodP2 all-false query: " + label_of(cp.atom) +
-                                 " ; D=" + poly_to_string(cp.D, R) +
-                                 " ; NF(D)=" + nf_s +
-                                 " ; D ∈ <M1,M2,{TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-                    if (in)
-                    {
-                        LOG_INFO(g_log, "singular",
-                                 "[eqmodP2] all-false refute: " + label_of(cp.atom) +
-                                     " has D in <M1,M2,{TRUE eqP}>; cannot be FALSE");
-                        std::vector<expr> ants;
-                        ants.reserve(1 + eqp_ants.size());
-                        ants.push_back(cp.atom);
-                        for (auto &a : eqp_ants)
-                            ants.push_back(a);
-                        conflict_with(ants);
-                        LOG_INFO(g_log, "singular", "=== eqmodP2(all-false) refutation end ===");
-                        return;
-                    }
-                }
-                continue;
-            }
-
-            ideal I = ideal_from_polys(gens, m_RE);
-            print_ideal("I_eqmodP2_all_false", I, R);
-
-            LOG_INFO(g_log, "singular", "Computing Groebner basis G_eqmodP2_all_false = std(I_eqmodP2_all_false) ...");
-            ideal G = groebner_std(I, R, "G_eqmodP2_all_false");
-            print_ideal("G_eqmodP2_all_false", G, R);
-
-            for (size_t idx : group.members)
-            {
-                auto &cp = m_eqmodp2[idx];
-                bool in = false;
-                std::string nf_s = "not-computed";
-
-                if (cp.D == nullptr)
-                {
-                    in = true;
-                    nf_s = "0";
-                }
-                else
-                {
-                    poly target = copy_poly_or_null(cp.D, R);
-                    poly nf = kNF(G, NULL, target, 0, 0);
-                    in = nf_is_zero(nf);
-                    nf_s = poly_to_string(nf, R);
-
-                    delete_poly_if_nonnull(nf, R);
-                    delete_poly_if_nonnull(target, R);
-                }
-
-                LOG_INFO(g_log, "singular",
-                         "eqmodP2 all-false query: " + label_of(cp.atom) +
-                             " ; D=" + poly_to_string(cp.D, R) +
-                             " ; NF(D)=" + nf_s +
-                             " ; D ∈ <M1,M2,{TRUE eqP}>? " + std::string(in ? "YES" : "NO"));
-
-                if (in)
-                {
-                    LOG_INFO(g_log, "singular",
-                             "[eqmodP2] all-false refute: " + label_of(cp.atom) +
-                                 " has D in <M1,M2,{TRUE eqP}>; cannot be FALSE");
-                    std::vector<expr> ants;
-                    ants.reserve(1 + eqp_ants.size());
-                    ants.push_back(cp.atom);
-                    for (auto &a : eqp_ants)
-                        ants.push_back(a);
-                    conflict_with(ants);
-                    if (G)
-                        idDelete(&G);
-                    if (I)
-                        idDelete(&I);
-                    LOG_INFO(g_log, "singular", "=== eqmodP2(all-false) refutation end ===");
-                    return;
-                }
-            }
-
-            if (G)
-                idDelete(&G);
-            if (I)
-                idDelete(&I);
-        }
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(all-false) refutation end ===");
-    }
-
-    void check_eqmodP2_all_true_refutation()
-    {
-        if (!ENABLE_ALL_TRUE)
-            return;
-        if (m_eqmodp2.empty())
-            return;
-        if (!all_eqp_eqmodp2_fixed())
-            return;
-
-        for (auto &cp : m_eqmodp2)
-        {
-            if (lbool_of(cp.atom) != Z3_L_TRUE)
-                return;
-        }
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(all-true) refutation begin ===");
-
-        std::vector<expr> ants;
-        std::vector<poly> gens;
-        collect_true_eqp_generators(gens, ants);
-        collect_true_eqmod_true_generators(gens, ants);
-        collect_true_eqmodp2_true_generators(gens, ants);
-
-        if (gens.empty())
-        {
-            LOG_INFO(g_log, "singular", "eqmodP2 all-true context is empty; 1 is not in the zero ideal");
-            LOG_INFO(g_log, "singular", "=== eqmodP2(all-true) refutation end ===");
-            return;
-        }
-
-        ideal J = ideal_from_polys(gens, m_RE);
-        print_ideal("J_eqmodP2_all_true", J, R);
-
-        LOG_INFO(g_log, "singular", "Computing Groebner basis G_eqmodP2_all_true = std(J_eqmodP2_all_true) ...");
-        ideal G = groebner_std(J, R, "G_eqmodP2_all_true");
-        print_ideal("G_eqmodP2_all_true", G, R);
-
-        poly one = poly_from_si(1, R);
-        poly nf = kNF(G, NULL, one, 0, 0);
-        bool unsat = nf_is_zero(nf);
-
-        LOG_INFO(g_log, "singular",
-                 "eqmodP2 ALL-TRUE check: NF_G(1)=" + poly_to_string(nf, R) +
-                     " ; 1 ∈ J ? " + std::string(unsat ? "YES" : "NO"));
-
-        if (nf)
-            p_Delete(&nf, R);
-        if (G)
-            idDelete(&G);
-        if (J)
-            idDelete(&J);
-
-        if (unsat)
-        {
-            LOG_INFO(g_log, "singular",
-                     "[eqmodP2] all-true refute: 1 ∈ <TRUE eqP, TRUE eqmodP1 true_gen, TRUE eqmodP2 true_gen, auto-zero>");
-            conflict_with(ants);
-        }
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(all-true) refutation end ===");
-    }
-
-    void check_eqmodP2_mixed_refutation()
-    {
-        if (!ENABLE_MIXED)
-            return;
-        if (m_eqmodp2.empty())
-            return;
-        if (!all_eqp_eqmodp2_fixed())
-            return;
-
-        bool has_true = false;
-        bool has_false = false;
-        for (auto &cp : m_eqmodp2)
-        {
-            Z3_lbool bv = lbool_of(cp.atom);
-            if (bv == Z3_L_TRUE)
-                has_true = true;
-            else if (bv == Z3_L_FALSE)
-                has_false = true;
-            else
-                return;
-        }
-
-        if (!(has_true && has_false))
-            return;
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(mixed) refutation begin ===");
-
-        std::vector<expr> true_ants;
-        std::vector<poly> base_gens;
-        collect_true_eqmod_true_generators(base_gens, true_ants);
-        collect_true_eqmodp2_true_generators(base_gens, true_ants);
-        collect_true_eqp_generators(base_gens, true_ants);
-
-        bool hit = false;
-        expr hit_atom = ctx().bool_val(false);
-
-        for (auto &cp : m_eqmodp2)
-        {
-            if (lbool_of(cp.atom) != Z3_L_FALSE)
-                continue;
-
-            std::vector<poly> gens;
-            gens.reserve(base_gens.size() + 2);
-            if (cp.M1_poly)
-                gens.push_back(p_Copy(cp.M1_poly, R));
-            if (cp.M2_poly)
-                gens.push_back(p_Copy(cp.M2_poly, R));
-            for (auto p : base_gens)
-                gens.push_back(p_Copy(p, R));
-
-            bool in = false;
-            std::string nf_s;
-
-            if (cp.D == nullptr)
-            {
-                in = true;
-                nf_s = "0";
-                if (!gens.empty())
-                {
-                    ideal I = ideal_from_polys(gens, m_RE);
-                    if (I)
-                        idDelete(&I);
-                }
-            }
-            else if (gens.empty())
-            {
-                in = false;
-                nf_s = poly_to_string(cp.D, R);
-            }
-            else
-            {
-                std::string idx = label_of(cp.atom);
-                std::string i_label = "I_eqmodP2_mixed_" + idx;
-                std::string g_label = "G_eqmodP2_mixed_" + idx;
-                in = query_membership_with_groebner(gens, cp.D, nf_s, i_label, g_label);
-            }
-
-            LOG_INFO(g_log, "singular",
-                     "eqmodP2 MIXED query: " + label_of(cp.atom) +
-                         " ; D=" + poly_to_string(cp.D, R) +
-                         " ; NF_<M1_f,M2_f,J>(D)=" + nf_s +
-                         " ; D ∈ <M1_f,M2_f,J>? " + std::string(in ? "YES" : "NO"));
-
-            if (in)
-            {
-                LOG_INFO(g_log, "singular",
-                         "[eqmodP2] mixed refute: " + label_of(cp.atom) +
-                             " has D in <M1_f,M2_f,J>; cannot be FALSE");
-                hit = true;
-                hit_atom = cp.atom;
-                break;
-            }
-        }
-
-        for (auto &p : base_gens)
-            if (p)
-                p_Delete(&p, R);
-
-        if (hit)
-        {
-            std::vector<expr> ants = true_ants;
-            ants.push_back(hit_atom);
-            conflict_with(ants);
-        }
-
-        LOG_INFO(g_log, "singular", "=== eqmodP2(mixed) refutation end ===");
-    }
-
-    bool conflict_on_propagated_eqmodP1_true_false()
-    {
-        if (!ENABLE_EQMOD_TRUE_LEMMAS)
-            return false;
-
-        for (auto &cp : m_eqmodp)
-        {
-            if (cp.propagated_truth != Z3_L_TRUE)
-                continue;
-            if (lbool_of(cp.atom) != Z3_L_FALSE)
-                continue;
-
-            std::vector<expr> ants;
-            collect_true_context_antecedents(ants);
-            ants.push_back(cp.atom);
-            LOG_INFO(g_log, "singular",
-                     "[eqmodP1] propagated TRUE refute: " + label_of(cp.atom) +
-                         " was already implied TRUE; conflicting with FALSE assignment without mixed GB");
-            conflict_with(ants);
-            return true;
-        }
-        return false;
-    }
-
-    bool conflict_on_propagated_eqmodP2_true_false()
-    {
-        if (!ENABLE_EQMOD_TRUE_LEMMAS)
-            return false;
-
-        for (auto &cp : m_eqmodp2)
-        {
-            if (cp.propagated_truth != Z3_L_TRUE)
-                continue;
-            if (lbool_of(cp.atom) != Z3_L_FALSE)
-                continue;
-
-            std::vector<expr> ants;
-            collect_true_context_antecedents(ants);
-            ants.push_back(cp.atom);
-            LOG_INFO(g_log, "singular",
-                     "[eqmodP2] propagated TRUE refute: " + label_of(cp.atom) +
-                         " was already implied TRUE; conflicting with FALSE assignment without mixed GB");
-            conflict_with(ants);
-            return true;
-        }
-        return false;
-    }
-
-    template <typename CompiledAtom, typename SameModuli, typename AppendModulusGens, typename ConflictCheck>
-    void propagate_true_lemmas_from_context_impl(std::vector<CompiledAtom> &atoms,
-                                                 const std::string &kind,
-                                                 const std::string &gb_label,
-                                                 SameModuli same_moduli,
-                                                 AppendModulusGens append_modulus_gens,
-                                                 ConflictCheck conflict_check)
-    {
-        if (atoms.empty())
-            return;
-
-        ring R = m_RE.R;
-        rChangeCurrRing(R);
-
-        std::vector<expr> true_ants;
-        std::vector<poly> base_gens;
-        collect_true_eqp_generators(base_gens, true_ants);
-        collect_true_eqmod_true_generators(base_gens, true_ants);
-        collect_true_eqmodp2_true_generators(base_gens, true_ants);
-
-        struct BvFixedGroup
-        {
-            size_t rep = 0;
-            std::vector<size_t> members;
-        };
-
-        std::vector<BvFixedGroup> groups;
-        for (size_t idx = 0; idx < atoms.size(); ++idx)
-        {
-            auto &cp = atoms[idx];
-            Z3_lbool current_value = lbool_of(cp.atom);
-            if (current_value == Z3_L_TRUE || cp.propagated_truth == Z3_L_TRUE)
-                continue;
-
-            bool placed = false;
-            for (auto &group : groups)
-            {
-                auto &rep = atoms[group.rep];
-                if (same_moduli(cp, rep))
-                {
-                    group.members.push_back(idx);
-                    placed = true;
-                    break;
-                }
-            }
-            if (!placed)
-                groups.push_back({idx, {idx}});
-        }
-
-        for (auto &group : groups)
-        {
-            auto &rep = atoms[group.rep];
-            std::vector<poly> gens;
-            gens.reserve(base_gens.size() + 2);
-            append_modulus_gens(rep, gens);
-            for (auto p : base_gens)
-                if (p)
-                    gens.push_back(p_Copy(p, R));
-
-            std::vector<poly> targets;
-            targets.reserve(group.members.size());
-            for (size_t idx : group.members)
-            {
-                auto &cp = atoms[idx];
-                targets.push_back(cp.D);
-            }
-
-            GroebnerBatchResult batch =
-                run_groebner_membership_batch(std::move(gens), targets, m_RE, R, gb_label);
-
-            bool hit_conflict = false;
-            for (std::size_t pos = 0; pos < group.members.size(); ++pos)
-            {
-                size_t idx = group.members[pos];
-                auto &cp = atoms[idx];
-                bool in = pos < batch.membership.size() && batch.membership[pos];
-
-                if (in)
-                {
-                    cp.propagated_truth = Z3_L_TRUE;
-                    if (propagate_true_lemma_or_conflict(
-                            cp.atom,
-                            lbool_of(cp.atom),
-                            true_ants,
-                            "[" + kind + "] eqmod true/context lemma: " + label_of(cp.atom) + " is implied TRUE"))
-                    {
-                        hit_conflict = true;
-                        break;
-                    }
-                }
-            }
-
-            if (hit_conflict || conflict_check())
-            {
-                for (auto &p : base_gens)
-                    delete_poly_if_nonnull(p, R);
-                return;
-            }
-        }
-
-        for (auto &p : base_gens)
-            delete_poly_if_nonnull(p, R);
-    }
-
-    static bool same_optional_poly(poly a, poly b, const ring R)
-    {
-        if (a == nullptr || b == nullptr)
-            return a == b;
-        return poly_equal(a, b, R);
-    }
-
-    void propagate_eqmodP1_true_lemmas_from_context_impl()
-    {
-        ring R = m_RE.R;
-        propagate_true_lemmas_from_context_impl(
-            m_eqmodp,
-            "eqmodP1",
-            "eqmodP1-true-lemma",
-            [R](const EqModPCompiled &a, const EqModPCompiled &b)
-            {
-                return same_optional_poly(a.M_poly, b.M_poly, R);
-            },
-            [R](const EqModPCompiled &cp, std::vector<poly> &gens)
-            {
-                if (cp.M_poly)
-                    gens.push_back(p_Copy(cp.M_poly, R));
-            },
-            [this]()
-            {
-                return conflict_on_propagated_eqmodP1_true_false();
-            });
-    }
-
-    void propagate_eqmodP2_true_lemmas_from_context_impl()
-    {
-        ring R = m_RE.R;
-        propagate_true_lemmas_from_context_impl(
-            m_eqmodp2,
-            "eqmodP2",
-            "eqmodP2-true-lemma",
-            [R](const EqModP2Compiled &a, const EqModP2Compiled &b)
-            {
-                return same_optional_poly(a.M1_poly, b.M1_poly, R) &&
-                       same_optional_poly(a.M2_poly, b.M2_poly, R);
-            },
-            [R](const EqModP2Compiled &cp, std::vector<poly> &gens)
-            {
-                if (cp.M1_poly)
-                    gens.push_back(p_Copy(cp.M1_poly, R));
-                if (cp.M2_poly)
-                    gens.push_back(p_Copy(cp.M2_poly, R));
-            },
-            [this]()
-            {
-                return conflict_on_propagated_eqmodP2_true_false();
-            });
-    }
-
-    void propagate_eqmod_true_lemmas_from_context()
-    {
-        if (!ENABLE_EQMOD_TRUE_LEMMAS)
-            return;
-        if (m_eqmodp.empty() && m_eqmodp2.empty())
-            return;
-
-        ring R = m_RE.R;
-        if (R == nullptr)
-            return;
-        rChangeCurrRing(R);
-
-        if (!all_eqp_fixed())
-            return;
-
-        std::size_t true_count = true_context_atom_count();
-        std::size_t p1_count = m_eqmodp.size();
-        std::size_t p2_count = m_eqmodp2.size();
-        if (true_count == m_last_eqmod_true_lemma_true_count &&
-            p1_count == m_last_eqmod_true_lemma_p1_count &&
-            p2_count == m_last_eqmod_true_lemma_p2_count)
-            return;
-        m_last_eqmod_true_lemma_true_count = true_count;
-        m_last_eqmod_true_lemma_p1_count = p1_count;
-        m_last_eqmod_true_lemma_p2_count = p2_count;
-
-        if (!m_eqmodp.empty())
-            propagate_eqmodP1_true_lemmas_from_context_impl();
-        if (conflict_on_propagated_eqmodP1_true_false())
-            return;
-        if (!m_eqmodp2.empty())
-            propagate_eqmodP2_true_lemmas_from_context_impl();
-    }
-
     void check_eqmodP2_conflicts()
     {
-        if (conflict_on_propagated_eqmodP2_true_false())
+        if (conflict_on_propagated_p2_truth())
             return;
-        saturate_auto_lemmas();
-        check_eqmodP2_all_false_refutation();
-        check_eqmodP2_all_true_refutation();
-        check_eqmodP2_mixed_refutation();
+        check_cross_family_eqmod_refutations();
     }
 
     void check_eqmodP2_conflicts_when_ready()
     {
         if (m_eqmodp2.empty())
             return;
-        if (conflict_on_propagated_eqmodP2_true_false())
+        if (conflict_on_propagated_p2_truth())
             return;
         if (!all_eqp_eqmodp2_fixed())
             return;
         check_eqmodP2_conflicts();
     }
 
-    void check_eqmodP2_all_false_refutation_when_ready()
+    void check_eqmodN_conflicts_when_ready()
     {
-        if (m_eqmodp2.empty())
+        if (conflict_on_propagated_n_truth())
             return;
-        check_eqmodP2_all_false_refutation();
+        check_cross_family_eqmod_refutations();
     }
 
 public:
@@ -4149,19 +2270,33 @@ public:
                    const std::vector<expr> &lhs,
                    const std::vector<expr> &rhs,
                    const std::vector<expr> &eqmodsP1,
-                   const std::vector<expr> &eqmodsP2,
+                   const std::vector<std::vector<expr>> &eqmodn_atoms,
                    const IndetEnv &env,
                    const CoeffVarMap &cmap,
                    const std::vector<std::string> &indet_ring_names,
                    const std::vector<std::string> &ring_vars,
                    const std::vector<std::string> &qvar_names,
-                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names,
-                   const util::EqExperimentOptions &eq_experiment_options)
-        : user_propagator_base(s), m_env(env), m_cmap(cmap),
-          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names),
-          m_eqmodp2_qvar_names(eqmodp2_qvar_names),
-          m_eq_experiment_options(eq_experiment_options),
-          m_eq_experiment(g_log, true)
+                   const std::vector<std::vector<std::vector<std::string>>> &eqmodn_qvar_names,
+                   const util::EqCallbackOptions &eq_callback_options,
+                   const std::vector<expr> &all_bv_terms,
+                   const std::vector<RewrittenCoeffBase> &eq_coeff_views,
+                   const std::vector<expr> &online_bv_constraints,
+                   const std::vector<expr> &online_bv_terms,
+                   const std::vector<std::pair<expr, expr>> &partition_prepass_equalities,
+                   const std::vector<expr> &partition_prepass_triggers)
+        : user_propagator_base(s),
+          eqmod::EqmodEngine(qvar_names, eqmodn_qvar_names,
+                             eqmodsP1, eqmodn_atoms),
+          m_env(env), m_cmap(cmap),
+          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars),
+          m_eq_callback_options(eq_callback_options),
+          m_eq_callback_tracker(g_log, true),
+          m_all_bv_terms(all_bv_terms),
+          m_eq_coeff_views(eq_coeff_views),
+          m_online_bv_constraints(online_bv_constraints),
+          m_online_bv_terms(online_bv_terms),
+          m_partition_prepass_equalities(partition_prepass_equalities),
+          m_partition_prepass_triggers(partition_prepass_triggers)
     {
         init_singular();
 
@@ -4170,21 +2305,35 @@ public:
         register_final();
         register_created();
 
+        for (const expr &trigger : m_partition_prepass_triggers)
+            tracked_add(trigger);
+
         m_Nc = (int)m_cmap.z3_bases.size();
-        m_Mi = (int)m_env.names.size();
+        m_Mi = (int)m_env.split_indet_count;
+        m_eqmod_collected_atoms[1] = eqmodsP1.size();
+        for (unsigned arity = 2; arity <= 4; ++arity)
+            if (eqmodn_atoms.size() > arity)
+                m_eqmod_collected_atoms[arity] = eqmodn_atoms[arity].size();
 
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
         m_RE.build(cfZ, m_ring_vars, ringorder_lp);
-        cmap_bind_ring_indices(m_cmap, m_RE, m_indet_ring_names);
+        bind_ring(m_RE.R);
+        dump_ring(m_RE.R);
+        bind_ring_indices(
+            m_cmap, m_RE, m_indet_ring_names, m_env.split_indet_count);
+        initialize_eq_coeff_index();
+        initialize_gb_process_pool();
+        initialize_live_eq_validator();
+        register_eq_terms(all_bv_terms);
 
-        if (ENABLE_MINIMAL_FIXED_WATCH)
+        if (g_cli.enable_minimal_fixed_watch)
             ensure_minimal_eval_watch_registered();
 
         for (size_t i = 0; i < eqps.size(); ++i)
         {
             tracked_add(eqps[i]);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 tracked_add(lhs[i]);
                 tracked_add(rhs[i]);
@@ -4201,7 +2350,7 @@ public:
             for (auto &e : cp.coeff_eqs)
                 tracked_add(e);
             tracked_add(cp.coeff_neq_disj);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 for (auto &ci : cp.coeff_ints)
                     tracked_add(ci);
@@ -4210,14 +2359,16 @@ public:
             m_eqp.push_back(std::move(cp));
         }
 
-        if (m_qvar_names.size() < eqmodsP1.size())
-            throw std::runtime_error("qvar_names size is smaller than eqmodsP1 size");
+        util::eqmod::require_preallocated_qvar_slots(
+            eqmodsP1.size(), m_qvar_names, m_eqmodn_atoms,
+            m_eqmodn_qvar_names);
 
         for (size_t i = 0; i < eqmodsP1.size(); ++i)
         {
             auto &em = eqmodsP1[i];
+            register_slot(em, 1, i);
             tracked_add(em);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 for (unsigned j = 0; j < 3; ++j)
                     tracked_add(em.arg(j));
@@ -4227,47 +2378,32 @@ public:
             std::string label = "eqmodP1#" + std::to_string(i);
             m_label[(Z3_ast)em] = label;
 
-            EqModPCompiled cp = compile_eqmodP1_singular(em, em.arg(0), em.arg(1), em.arg(2),
-                                                         label,
-                                                         m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                         m_Nc,
-                                                         m_qvar_names[i]);
-            m_eqmodp.push_back(std::move(cp));
+            lower_atom(em, 1, label, m_env, m_indet_ring_names, m_RE,
+                       m_cmap, m_Nc, g_log);
         }
 
-        if (m_eqmodp2_qvar_names.size() < eqmodsP2.size())
-            throw std::runtime_error("eqmodp2_qvar_names size is smaller than eqmodsP2 size");
-
-        for (size_t i = 0; i < eqmodsP2.size(); ++i)
+        for (unsigned arity = 2; arity <= 4; ++arity)
         {
-            auto &em = eqmodsP2[i];
-            tracked_add(em);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            for (size_t i = 0; i < m_eqmodn_atoms[arity].size(); ++i)
             {
-                for (unsigned j = 0; j < 4; ++j)
-                    tracked_add(em.arg(j));
+                expr em = m_eqmodn_atoms[arity][i];
+                register_slot(em, arity, i);
+                tracked_add(em);
+                if (!g_cli.enable_minimal_fixed_watch)
+                    for (unsigned j = 0; j < em.num_args(); ++j)
+                        tracked_add(em.arg(j));
+                std::vector<expr> moduli;
+                for (unsigned j = 2; j < em.num_args(); ++j)
+                    moduli.push_back(em.arg(j));
+                register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), moduli);
+
+                std::string label = "eqmodP" + std::to_string(arity) + "#" + std::to_string(i);
+                m_label[(Z3_ast)em] = label;
+                lower_atom(em, arity, label, m_env, m_indet_ring_names, m_RE,
+                           m_cmap, m_Nc, g_log);
             }
-            register_eval_terms_for_eqmod_atom(em.arg(0), em.arg(1), em.arg(2), em.arg(3));
-
-            std::string label = "eqmodP2#" + std::to_string(i);
-            m_label[(Z3_ast)em] = label;
-
-            const auto &qnames = m_eqmodp2_qvar_names[i];
-            EqModP2Compiled cp = compile_eqmodP2_singular(em, em.arg(0), em.arg(1), em.arg(2), em.arg(3),
-                                                          label,
-                                                          m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                          m_Nc,
-                                                          qnames.first,
-                                                          qnames.second);
-            m_compiled_eqmodp2_atoms.insert((Z3_ast)em);
-            m_eqmodp2.push_back(std::move(cp));
         }
 
-        m_eq_experiment.register_configured_terms(ctx(), eqps, m_eq_experiment_options,
-                                                  [this](const expr &t)
-                                                  {
-                                                      tracked_add(t);
-                                                  });
     }
 
     PolyPropagator(context &c,
@@ -4276,14 +2412,78 @@ public:
                    const std::vector<std::string> &indet_ring_names,
                    const std::vector<std::string> &ring_vars,
                    const std::vector<std::string> &qvar_names,
-                   const std::vector<std::pair<std::string, std::string>> &eqmodp2_qvar_names,
-                   const util::EqExperimentOptions &eq_experiment_options)
-        : user_propagator_base(c), m_env(env), m_cmap(cmap),
-          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars), m_qvar_names(qvar_names),
-          m_eqmodp2_qvar_names(eqmodp2_qvar_names),
-          m_eq_experiment_options(eq_experiment_options),
-          m_eq_experiment(g_log, false)
+                   const std::vector<std::vector<std::vector<std::string>>> &eqmodn_qvar_names,
+                   const std::vector<expr> &eqmodp1_atoms,
+                   const std::vector<std::vector<expr>> &eqmodn_atoms,
+                   const util::EqCallbackOptions &eq_callback_options,
+                   const std::vector<expr> &all_bv_terms,
+                   const std::vector<RewrittenCoeffBase> &eq_coeff_views,
+                   const std::vector<expr> &online_bv_constraints,
+                   const std::vector<expr> &online_bv_terms,
+                   const std::vector<std::pair<expr, expr>> &partition_prepass_equalities,
+                   const std::vector<expr> &partition_prepass_triggers)
+        : user_propagator_base(c),
+          eqmod::EqmodEngine(qvar_names, eqmodn_qvar_names),
+          m_env(env), m_cmap(cmap),
+          m_indet_ring_names(indet_ring_names), m_ring_vars(ring_vars),
+          m_eq_callback_options(eq_callback_options),
+          m_eq_callback_tracker(g_log, false),
+          m_allow_live_validator(false)
     {
+        util::eqmod::translate_atom_slots(
+            c, eqmodp1_atoms, eqmodn_atoms, m_eqmodp1_atoms,
+            m_eqmodp1_slots, m_eqmodn_atoms, m_eqmodn_slots);
+        util::eqmod::require_preallocated_qvar_slots(
+            m_eqmodp1_atoms.size(), m_qvar_names, m_eqmodn_atoms,
+            m_eqmodn_qvar_names);
+        m_eqmod_collected_atoms[1] = m_eqmodp1_atoms.size();
+        for (unsigned arity = 2; arity <= 4; ++arity)
+            m_eqmod_collected_atoms[arity] = m_eqmodn_atoms[arity].size();
+        m_cmap.base_to_index.clear();
+        for (std::size_t i = 0; i < m_cmap.z3_bases.size(); ++i)
+        {
+            const expr &old_base = m_cmap.z3_bases[i];
+            m_cmap.z3_bases[i] = expr(c, Z3_translate((Z3_context)old_base.ctx(),
+                                                      (Z3_ast)old_base, (Z3_context)c));
+            m_cmap.base_to_index[(Z3_ast)m_cmap.z3_bases[i]] = static_cast<unsigned>(i);
+        }
+        m_all_bv_terms.reserve(all_bv_terms.size());
+        for (const expr &term : all_bv_terms)
+            m_all_bv_terms.emplace_back(c, Z3_translate((Z3_context)term.ctx(),
+                                                        (Z3_ast)term, (Z3_context)c));
+        m_eq_coeff_views.reserve(eq_coeff_views.size());
+        for (const RewrittenCoeffBase &view : eq_coeff_views)
+        {
+            expr original(c, Z3_translate((Z3_context)view.original_base.ctx(),
+                                          (Z3_ast)view.original_base, (Z3_context)c));
+            expr rewritten(c, Z3_translate((Z3_context)view.rewritten_int.ctx(),
+                                           (Z3_ast)view.rewritten_int, (Z3_context)c));
+            m_eq_coeff_views.emplace_back(original, rewritten);
+        }
+        m_online_bv_constraints.reserve(online_bv_constraints.size());
+        for (const expr &constraint : online_bv_constraints)
+            m_online_bv_constraints.emplace_back(
+                c, Z3_translate((Z3_context)constraint.ctx(), (Z3_ast)constraint,
+                                (Z3_context)c));
+        m_online_bv_terms.reserve(online_bv_terms.size());
+        for (const expr &term : online_bv_terms)
+            m_online_bv_terms.emplace_back(
+                c, Z3_translate((Z3_context)term.ctx(), (Z3_ast)term,
+                                (Z3_context)c));
+        m_partition_prepass_equalities.reserve(
+            partition_prepass_equalities.size());
+        for (const auto &[lhs, rhs] : partition_prepass_equalities)
+            m_partition_prepass_equalities.emplace_back(
+                expr(c, Z3_translate((Z3_context)lhs.ctx(), (Z3_ast)lhs,
+                                     (Z3_context)c)),
+                expr(c, Z3_translate((Z3_context)rhs.ctx(), (Z3_ast)rhs,
+                                     (Z3_context)c)));
+        m_partition_prepass_triggers.reserve(partition_prepass_triggers.size());
+        for (const expr &trigger : partition_prepass_triggers)
+            m_partition_prepass_triggers.emplace_back(
+                c, Z3_translate((Z3_context)trigger.ctx(), (Z3_ast)trigger,
+                                (Z3_context)c));
+
         init_singular();
         register_fixed();
         register_eq();
@@ -4291,12 +2491,19 @@ public:
         register_created();
 
         m_Nc = (int)m_cmap.z3_bases.size();
-        m_Mi = (int)m_env.names.size();
+        m_Mi = (int)m_env.split_indet_count;
 
         coeffs cfZ = nCopyCoeff(singular_shared_coeffs_Z());
 
         m_RE.build(cfZ, m_ring_vars, ringorder_lp);
-        cmap_bind_ring_indices(m_cmap, m_RE, m_indet_ring_names);
+        bind_ring(m_RE.R);
+        dump_ring(m_RE.R);
+        bind_ring_indices(
+            m_cmap, m_RE, m_indet_ring_names, m_env.split_indet_count);
+        initialize_eq_coeff_index();
+        initialize_gb_process_pool();
+        initialize_live_eq_validator();
+        register_eq_terms(m_all_bv_terms);
     }
 
     ~PolyPropagator() override
@@ -4318,34 +2525,7 @@ public:
         {
             rChangeCurrRing(R);
 
-            for (auto &cp : m_eqmodp)
-            {
-                if (cp.D)
-                    p_Delete(&cp.D, R);
-                cp.D = nullptr;
-
-                if (cp.M_poly)
-                    p_Delete(&cp.M_poly, R);
-                cp.M_poly = nullptr;
-
-                if (cp.U_poly)
-                    p_Delete(&cp.U_poly, R);
-                cp.U_poly = nullptr;
-
-                if (cp.true_gen)
-                    p_Delete(&cp.true_gen, R);
-                cp.true_gen = nullptr;
-            }
-
-            for (auto &cp : m_eqmodp2)
-            {
-                delete_poly_if_nonnull(cp.D, R);
-                delete_poly_if_nonnull(cp.M1_poly, R);
-                delete_poly_if_nonnull(cp.M2_poly, R);
-                delete_poly_if_nonnull(cp.U1_poly, R);
-                delete_poly_if_nonnull(cp.U2_poly, R);
-                delete_poly_if_nonnull(cp.true_gen, R);
-            }
+            release();
 
             for (auto &ep : m_eqp)
             {
@@ -4354,21 +2534,27 @@ public:
                 ep.D_full = nullptr;
             }
 
-            for (auto &p : m_auto_zero_gens)
-                if (p)
-                    p_Delete(&p, R);
-            m_auto_zero_gens.clear();
-            m_auto_zero_labels.clear();
         }
     }
 
     void push() override
     {
-        m_trail_marks.push_back({m_bool_trail.size(), m_fixed_ast_trail.size()});
+        m_trail_marks.push_back({m_bool_trail.size(), m_fixed_ast_trail.size(),
+                                 m_eq_facts.size(), m_eq_union_trail.size(),
+                                 m_live_eq_union_trail.size()});
+        m_eq_callback_tracker.on_push(eq_trace_enabled(), m_eq_facts.size());
+        ++m_search_push_count;
+        if (m_trail_marks.size() > m_search_max_depth)
+            m_search_max_depth = m_trail_marks.size();
+        search_progress_tick("push");
     }
 
     void pop(unsigned n) override
     {
+        const unsigned requested_n = n;
+        const std::size_t old_scope_depth = m_trail_marks.size();
+        const std::size_t old_active_eq = m_eq_facts.size();
+        const std::size_t old_eq_generators = m_eq_generator_count;
         while (n-- > 0 && !m_trail_marks.empty())
         {
             TrailMark mark = m_trail_marks.back();
@@ -4391,12 +2577,61 @@ public:
                 restore_fixed_ast_entry(entry);
             }
 
-            reset_propagated_truth_flags();
+            // Live GB facts enter this forest only after their equality has
+            // been proved global.  They are premise-free facts of the whole
+            // problem, not facts of the current Z3 search scope, so a pop
+            // must not remove them or roll back their union-forest edges.
+            // Non-live equality tracking remains scoped as before.
+            if (!g_cli.enable_eq_gb_live && m_eq_facts.size() > mark.eq_size)
+            {
+                const std::size_t old_generator_count = m_eq_generator_count;
+                m_eq_facts.erase(
+                    m_eq_facts.begin() + static_cast<std::ptrdiff_t>(mark.eq_size),
+                    m_eq_facts.end());
+                rollback_eq_union_forest(mark.eq_union_size);
+                rebuild_active_eq_index();
+                if (m_eq_generator_count != old_generator_count)
+                    ++m_eq_generator_epoch;
+            }
+
+            rollback_live_eq_union(mark.live_eq_union_size);
+
+            reset_after_pop(g_cli.enable_eq_gb_live);
         }
+        m_eq_callback_tracker.on_pop(eq_trace_enabled(), requested_n, m_eq_facts.size());
+        ++m_search_pop_count;
+        search_progress_tick("pop");
+        if (m_eq_generator_count != old_eq_generators)
+            LOG_INFO(g_log, "eqgb",
+                     "pop count=" + std::to_string(requested_n) +
+                         " scope=" + std::to_string(old_scope_depth) +
+                         "->" + std::to_string(m_trail_marks.size()) +
+                         " active_eq=" + std::to_string(old_active_eq) +
+                         "->" + std::to_string(m_eq_facts.size()) +
+                         " eq_gens=" + std::to_string(old_eq_generators) +
+                         "->" + std::to_string(m_eq_generator_count) +
+                         " epoch=" + std::to_string(m_eq_generator_epoch));
     }
     void eq(const expr &x, const expr &y) override
     {
-        m_eq_experiment.on_eq(x, y,
+        ++m_search_eq_count;
+        search_progress_tick("eq");
+        if (eq_gb_live_heuristic_enabled())
+            drain_live_eq_results(false);
+        if (eq_gb_live_heuristic_enabled())
+            submit_live_eq_candidate(x, y);
+        const bool track_fact = eq_fact_tracking_enabled();
+        bool globally_valid = !eq_gb_generator_mode_enabled();
+        if (g_cli.enable_eq_gb_live)
+            globally_valid = live_eq_is_applied(x, y);
+        // Live global equalities are committed to the GB forest only by
+        // flush_pending_live_eq_generators().  Re-activating one from the
+        // Main Solver callback would bypass batching and recreate the
+        // membership-recomputation storm this path is designed to avoid.
+        if (track_fact && globally_valid && !g_cli.enable_eq_gb_live)
+            activate_equality_fact(x, y, eq_gb_generator_mode_enabled());
+
+        m_eq_callback_tracker.on_eq(x, y,
                               [this](const expr &e)
                               {
                                   return is_registered_term(e);
@@ -4404,11 +2639,15 @@ public:
                               [this](const expr &e)
                               {
                                   return format_fixed_value_for_log(e);
-                              });
+                              },
+                              eq_trace_enabled(), m_eq_facts.size(), m_eq_generator_count);
+
     }
 
     void created(const expr &t) override
     {
+        ++m_search_created_count;
+        search_progress_tick("created");
         if (!t.is_app())
             return;
 
@@ -4416,7 +2655,7 @@ public:
         {
             expr A = t.arg(0), B = t.arg(1);
             tracked_add(t);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 tracked_add(A);
                 tracked_add(B);
@@ -4433,7 +2672,7 @@ public:
             for (auto &e : cp.coeff_eqs)
                 tracked_add(e);
             tracked_add(cp.coeff_neq_disj);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 for (auto &ci : cp.coeff_ints)
                     tracked_add(ci);
@@ -4448,9 +2687,11 @@ public:
 
         if (t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
         {
+            if (is_compiled(t))
+                return;
             expr A = t.arg(0), B = t.arg(1), M = t.arg(2);
             tracked_add(t);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
+            if (!g_cli.enable_minimal_fixed_watch)
             {
                 tracked_add(A);
                 tracked_add(B);
@@ -4458,19 +2699,13 @@ public:
             }
             register_eval_terms_for_eqmod_atom(A, B, M);
 
-            size_t idx = m_eqmodp.size();
-            if (idx >= m_qvar_names.size())
-                throw std::runtime_error("created(eqmodP1): no preallocated qvar name; ensure all eqmodP1 are present in input SMT2");
+            size_t idx = require_slot(t, 1, "created");
 
             std::string label = "eqmodP1#" + std::to_string((int)idx);
             m_label[(Z3_ast)t] = label;
 
-            EqModPCompiled cp = compile_eqmodP1_singular(t, A, B, M,
-                                                         label,
-                                                         m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                         m_Nc,
-                                                         m_qvar_names[idx]);
-            m_eqmodp.push_back(std::move(cp));
+            lower_atom(t, 1, label, m_env, m_indet_ring_names, m_RE,
+                       m_cmap, m_Nc, g_log);
 
             propagate_eqmod_true_lemmas_from_context();
             check_eqmodP1_conflicts_when_ready();
@@ -4478,58 +2713,63 @@ public:
             return;
         }
 
-        if (t.decl().name().str() == "eqmodP2" && t.num_args() == 4)
+        const std::string eqmod_name = t.decl().name().str();
+        if ((eqmod_name == "eqmodP2" || eqmod_name == "eqmodP3" ||
+             eqmod_name == "eqmodP4") &&
+            t.num_args() >= 4 && t.num_args() <= 6)
         {
-            if (m_compiled_eqmodp2_atoms.count((Z3_ast)t))
+            if (is_compiled(t))
                 return;
 
-            expr A = t.arg(0), B = t.arg(1), M1 = t.arg(2), M2 = t.arg(3);
+            const unsigned arity = t.num_args() - 2;
+            if (eqmod_name != "eqmodP" + std::to_string(arity))
+                return;
+            expr A = t.arg(0), B = t.arg(1);
             tracked_add(t);
-            if (!ENABLE_MINIMAL_FIXED_WATCH)
-            {
-                tracked_add(A);
-                tracked_add(B);
-                tracked_add(M1);
-                tracked_add(M2);
-            }
-            register_eval_terms_for_eqmod_atom(A, B, M1, M2);
+            if (!g_cli.enable_minimal_fixed_watch)
+                for (unsigned i = 0; i < t.num_args(); ++i)
+                    tracked_add(t.arg(i));
+            std::vector<expr> moduli;
+            for (unsigned i = 2; i < t.num_args(); ++i)
+                moduli.push_back(t.arg(i));
+            register_eval_terms_for_eqmod_atom(A, B, moduli);
 
-            size_t idx = m_eqmodp2.size();
-            if (idx >= m_eqmodp2_qvar_names.size())
-                throw std::runtime_error("created(eqmodP2): no preallocated qvar names; ensure all eqmodP2 are present in input SMT2");
+            size_t idx = require_slot(t, arity, "created");
 
-            std::string label = "eqmodP2#" + std::to_string((int)idx);
+            std::string label = eqmod_name + "#" + std::to_string(idx);
             m_label[(Z3_ast)t] = label;
 
-            const auto &qnames = m_eqmodp2_qvar_names[idx];
-            EqModP2Compiled cp = compile_eqmodP2_singular(t, A, B, M1, M2,
-                                                          label,
-                                                          m_env, m_indet_ring_names, m_RE, m_cmap,
-                                                          m_Nc,
-                                                          qnames.first,
-                                                          qnames.second);
-            m_compiled_eqmodp2_atoms.insert((Z3_ast)t);
-            m_eqmodp2.push_back(std::move(cp));
+            lower_atom(t, arity, label, m_env, m_indet_ring_names, m_RE,
+                       m_cmap, m_Nc, g_log);
 
             propagate_eqmod_true_lemmas_from_context();
-            check_eqmodP2_conflicts_when_ready();
+            check_eqmodN_conflicts_when_ready();
             return;
         }
     }
 
     void fixed(const expr &t, const expr &v) override
     {
-        if (ENABLE_MINIMAL_FIXED_WATCH && !t.is_bool())
+        ++m_search_fixed_count;
+        propagate_partition_prepass_equalities(t, v);
+        if (eq_gb_live_heuristic_enabled())
+            (void)drain_live_eq_results(false);
+        if (g_cli.enable_minimal_fixed_watch && !t.is_bool())
         {
             cache_fixed_expr(t, v);
-            m_eq_experiment.on_fixed(t, v);
+            m_eq_callback_tracker.on_fixed(t, v, eq_trace_enabled());
+            search_progress_tick("fixed");
             return;
         }
 
-        ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
+        ++m_search_fixed_bool_count;
+        search_progress_tick("fixed");
+        cli::report::ScopedAccumulatedTiming timing(
+            g_final_fixed_value_check_timing,
+            &g_final_fixed_value_check_span_start);
         log_fixed(t, v);
         cache_fixed_expr(t, v);
-        m_eq_experiment.on_fixed(t, v);
+        m_eq_callback_tracker.on_fixed(t, v, eq_trace_enabled());
 
         if (t.is_numeral())
             return;
@@ -4545,6 +2785,7 @@ public:
                 propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP1_conflicts_when_ready();
                 check_eqmodP2_conflicts_when_ready();
+                check_eqmodN_conflicts_when_ready();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP1" && t.num_args() == 3)
@@ -4552,44 +2793,309 @@ public:
                 propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP1_conflicts_when_ready();
                 check_eqmodP2_conflicts_when_ready();
+                check_eqmodN_conflicts_when_ready();
             }
 
             if (t.is_app() && t.decl().name().str() == "eqmodP2" && t.num_args() == 4)
             {
                 propagate_eqmod_true_lemmas_from_context();
                 check_eqmodP2_conflicts_when_ready();
+                check_eqmodN_conflicts_when_ready();
+            }
+
+            if (t.is_app() &&
+                (t.decl().name().str() == "eqmodP3" ||
+                 t.decl().name().str() == "eqmodP4") &&
+                t.num_args() >= 5 && t.num_args() <= 6)
+            {
+                propagate_eqmod_true_lemmas_from_context();
+                check_eqmodN_conflicts_when_ready();
             }
         }
     }
 
     void final() override
     {
-        // check_eqmodP1_conflicts_when_ready();
-        if (ENABLE_FINAL_FIXED_VALUE_CHECK)
+        ++m_search_final_count;
         {
-            ScopedAccumulatedTiming timing(g_final_fixed_value_check_timing);
-            if (final_fixed_value_check_eqmodP1())
-                final_fixed_value_check_eqmodP2();
+            auto now = search_clk::now();
+            LOG_INFO(g_log, "search",
+                     "[final #" + std::to_string(m_search_final_count) +
+                     " " + util::fmt_duration(now - m_search_start) + "] "
+                     "depth=" + std::to_string(m_trail_marks.size()) +
+                     " max_depth=" + std::to_string(m_search_max_depth) +
+                     " push=" + std::to_string(m_search_push_count) +
+                     " pop=" + std::to_string(m_search_pop_count) +
+                     " fixed=" + std::to_string(m_search_fixed_count) +
+                     " fixed_bool=" + std::to_string(m_search_fixed_bool_count) +
+                     " eq=" + std::to_string(m_search_eq_count) +
+                     " created=" + std::to_string(m_search_created_count));
         }
-        m_eq_experiment.print_summary(std::cout);
+        bool handled_live_true_lemmas = false;
+        if (g_cli.enable_eq_gb_live)
+        {
+            m_live_eq_in_final = true;
+            handled_live_true_lemmas = true;
+            if (eq_gb_live_heuristic_enabled())
+            {
+                m_live_eq_validator->release();
+                while (true)
+                {
+                    ++m_live_eq_final_waves;
+                    const std::size_t conflict_before = m_conflict_generation;
+
+                    std::size_t wave_generators = drain_live_eq_results(false);
+                    const std::size_t gb_pending =
+                        m_proved_global_eq.size() - m_live_eq_gb_committed;
+                    const bool validator_idle = m_live_eq_validator->idle();
+                    if (validator_idle || gb_pending >= LIVE_EQ_GB_BATCH_SIZE)
+                        wave_generators += flush_pending_live_eq_generators(true);
+                    else
+                        wave_generators += flush_pending_live_eq_generators(false);
+                    if (wave_generators != 0)
+                        LOG_INFO(g_log, "eqgb",
+                                 "activated " + std::to_string(wave_generators) +
+                                     " globally proved GB generator(s) in final wave");
+
+                    propagate_eqmod_true_lemmas_from_context(true);
+                    if (wave_generators != 0)
+                        check_cross_family_eqmod_refutations(true);
+
+                    // A propagation does not guarantee that Z3 will invoke
+                    // final() again when the consequence is already consistent.
+                    // Keep the completeness barrier until all callback candidates
+                    // are terminal; a conflict is the only safe early return.
+                    if (m_conflict_generation != conflict_before || validator_idle)
+                        break;
+
+                    const auto wait_started = search_clk::now();
+                    ++m_live_eq_final_waits;
+                    m_live_eq_validator->wait_for_results_or_idle();
+                    m_live_eq_final_wait_time +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            search_clk::now() - wait_started);
+                }
+            }
+
+            if (eq_gb_partition_refinement_enabled())
+            {
+                const std::size_t complete_generators =
+                    apply_partition_refinement_results();
+                if (complete_generators != 0)
+                    LOG_INFO(g_log, "eqpartition",
+                             "activated " +
+                                 std::to_string(complete_generators) +
+                                 " complete-partition GB generator(s)");
+                propagate_eqmod_true_lemmas_from_context(true);
+                if (complete_generators != 0)
+                    check_cross_family_eqmod_refutations(true);
+            }
+            m_live_eq_in_final = false;
+        }
+        if (!handled_live_true_lemmas)
+            propagate_eqmod_true_lemmas_from_context(true);
+        check_cross_family_eqmod_refutations(true);
+        if (g_cli.enable_final_fixed_value_check)
+        {
+            cli::report::ScopedAccumulatedTiming timing(
+                g_final_fixed_value_check_timing,
+                &g_final_fixed_value_check_span_start);
+            final_fixed_value_check_all_eqmods();
+        }
+        if (eq_trace_enabled())
+        {
+            m_eq_callback_tracker.print_summary(std::cout);
+            LOG_INFO(g_log, "eqstats",
+                     "registered=" + std::to_string(m_registered_terms.size()) +
+                         " fixed=" + std::to_string(m_eq_callback_tracker.fixed_event_count()) +
+                         " eq=" + std::to_string(m_eq_callback_tracker.eq_event_count()) +
+                         " active_eq=" + std::to_string(m_eq_facts.size()) +
+                         " eq_generators=" + std::to_string(m_eq_generator_count));
+        }
+        if (g_cli.enable_eqmod_true_lemmas && g_cli.enable_eq_gb_live)
+            LOG_INFO(g_log, "singular",
+                     "eqmod TRUE-lemma membership cache: signatures=" +
+                         std::to_string(m_eqmod_true_lemma_membership_cache.size()) +
+                         " hits=" +
+                         std::to_string(m_eqmod_true_lemma_cache_hits) +
+                         " misses=" +
+                         std::to_string(m_eqmod_true_lemma_cache_misses) +
+                         " deferred=" +
+                         std::to_string(m_deferred_eqmod_true_lemma_checks) +
+                         " pending-source-updates=" +
+                         std::to_string(m_pending_eqmod_true_lemma_source_updates));
+        if (g_cli.enable_eq_gb_live && m_live_eq_validator)
+        {
+            const util::eqgb::LiveValidatorStatistics stats =
+                m_live_eq_validator->statistics();
+            const std::size_t gb_pending =
+                g_cli.eq_gb_live_generators
+                    ? m_proved_global_eq.size() - m_live_eq_gb_committed
+                    : 0;
+            LOG_INFO(g_log, "eqgb",
+                     "live validator summary: propagation=" +
+                         std::string(g_cli.eq_gb_live_propagate ? "on" : "off") +
+                         " generators=" +
+                         std::string(g_cli.eq_gb_live_generators ? "on" : "off") +
+                         " seed-models=" +
+                         std::string(g_cli.eq_gb_live_seed_models ? "on" : "off") +
+                         " queue-policy=" +
+                         std::string(g_cli.eq_gb_live_unified_queue
+                                         ? "unified"
+                                         : "split-direct-derived") +
+                         " survivor-policy=origin-64" +
+                         " callback_seen=" +
+                         std::to_string(stats.callback_candidates) +
+                         " validator-direct=" +
+                         std::to_string(stats.direct_candidates) +
+                         " validator-derived=" +
+                         std::to_string(stats.derived_candidates) +
+                         " duplicates=" +
+                         std::to_string(stats.duplicate_candidates) +
+                         " promoted=" +
+                         std::to_string(stats.promoted_candidates) +
+                         " direct_seen=" +
+                         std::to_string(m_live_eq_direct_seen) +
+                         " direct_submitted=" +
+                         std::to_string(m_live_eq_callback_submitted) +
+                         " closure_seen=" +
+                         std::to_string(m_live_eq_closure_seen) +
+                         " closure_submitted=" +
+                         std::to_string(m_live_eq_closure_submitted) +
+                         " submitted=" + std::to_string(stats.submitted) +
+                         " validator-direct-submitted=" +
+                         std::to_string(stats.direct_submitted) +
+                         " validator-derived-submitted=" +
+                         std::to_string(stats.derived_submitted) +
+                         " queue-high-water=" +
+                         std::to_string(stats.queue_high_water) +
+                         " queue-wait-total=" +
+                         util::fmt_duration(stats.queue_wait) +
+                         " queue-wait-max=" +
+                         util::fmt_duration(stats.max_queue_wait) +
+                         " seed-checks=" +
+                         std::to_string(stats.seed_checks) +
+                         " seed-time=" +
+                         util::fmt_duration(stats.seed_time) +
+                         " seed-model-count=" +
+                         std::to_string(stats.seed_models) +
+                         " seed-initial-pruned=" +
+                         std::to_string(stats.seed_initial_pruned) +
+                         " seed-late-pruned=" +
+                         std::to_string(stats.seed_late_pruned) +
+                         " validation-model-pruned=" +
+                         std::to_string(stats.validation_model_pruned) +
+                         " prefinal-batches=" +
+                         std::to_string(stats.prefinal_batches) +
+                         " final-batches=" +
+                         std::to_string(stats.final_batches) +
+                         " partial-batches=" +
+                         std::to_string(stats.partial_batches) +
+                         " regular-batches=" +
+                         std::to_string(stats.regular_batches) +
+                         " checks=" + std::to_string(stats.checks) +
+                         " proved=" + std::to_string(stats.proved) +
+                         " refuted=" + std::to_string(stats.refuted) +
+                         " unknown=" + std::to_string(stats.unknown) +
+                         " model-pruned=" + std::to_string(stats.model_pruned) +
+                         " models=" +
+                         std::to_string(stats.counterexample_models) +
+                         " pending=" + std::to_string(stats.pending) +
+                         " applied=" + std::to_string(m_live_eq_applied) +
+                         " propagated=" +
+                         std::to_string(m_live_eq_propagated) +
+                         " applied-search=" +
+                         std::to_string(m_live_eq_applied_during_search) +
+                         " applied-final=" +
+                         std::to_string(m_live_eq_applied_at_final) +
+                         " gb-committed=" +
+                         std::to_string(m_live_eq_gb_committed) +
+                         " gb-pending=" +
+                         std::to_string(gb_pending) +
+                         " gb-flushes=" +
+                         std::to_string(m_live_eq_gb_flushes) +
+                         " gb-pending-high-water=" +
+                         std::to_string(m_live_eq_gb_pending_high_water) +
+                         " empty-drains-avoided=" +
+                         std::to_string(m_live_eq_empty_drains_avoided) +
+                         " final-waves=" +
+                         std::to_string(m_live_eq_final_waves) +
+                         " final-waits=" +
+                         std::to_string(m_live_eq_final_waits) +
+                         " final-wait-time=" +
+                         util::fmt_duration(m_live_eq_final_wait_time) +
+                         " check-time=" + util::fmt_duration(stats.check_time));
+        }
+        LOG_INFO(g_log, "singular", "eqmod summary: " +
+                                         terminal_eqmod_summary());
+        LOG_INFO(g_log, "singular",
+                 "eqmod paths: all-false-conflicts=" +
+                     std::to_string(m_eqmod_all_false_conflicts) +
+                     " unit-conflicts=" +
+                     std::to_string(m_eqmod_unit_conflicts) +
+                     " mixed-conflicts=" +
+                     std::to_string(m_eqmod_mixed_conflicts) +
+                     " true-lemma-propagations=" +
+                     std::to_string(m_eqmod_true_lemma_propagations) +
+                     " true-lemma-conflicts=" +
+                     std::to_string(m_eqmod_true_lemma_conflicts) +
+                     " propagated-assignment-conflicts=" +
+                     std::to_string(m_eqmod_propagated_assignment_conflicts) +
+                     " membership-batches=" +
+                     std::to_string(m_eqmod_membership_batch_calls) +
+                     " batch-groups=" +
+                     std::to_string(m_eqmod_membership_batch_groups) +
+                     " batch-targets=" +
+                     std::to_string(m_eqmod_membership_batch_targets) +
+                     " deferred-refutation-checks=" +
+                     std::to_string(m_deferred_eqmod_refutation_checks) +
+                     " true-lemma-cache-hits=" +
+                     std::to_string(m_eqmod_true_lemma_cache_hits) +
+                     " true-lemma-cache-misses=" +
+                     std::to_string(m_eqmod_true_lemma_cache_misses) +
+                     " p1-prime-product-queries=" +
+                     std::to_string(m_eqmod_p1_product_queries) +
+                     " p1-prime-product-members=" +
+                     std::to_string(m_eqmod_p1_product_members) +
+                     " p1-prime-product-nonmembers=" +
+                     std::to_string(m_eqmod_p1_product_nonmembers) +
+                     " p1-prime-product-cache-hits=" +
+                     std::to_string(m_eqmod_p1_product_cache_hits) +
+                     " p1-prime-product-conflicts=" +
+                     std::to_string(m_eqmod_p1_product_conflicts));
+        for (unsigned family = 1; family <= 4; ++family)
+            for (const auto &[reason, count] :
+                 m_eqmod_validation_skip_reasons[family])
+                LOG_INFO(g_log, "singular",
+                         "eqmod validation skip: P" +
+                             std::to_string(family) + " reason=" + reason +
+                             " count=" + std::to_string(count));
         std::cout << "===== [final] =====\n";
     }
 
     user_propagator_base *fresh(context &nctx) override
     {
         return new PolyPropagator(nctx, m_env, m_cmap, m_indet_ring_names, m_ring_vars,
-                                  m_qvar_names, m_eqmodp2_qvar_names, m_eq_experiment_options);
+                                  m_qvar_names, m_eqmodn_qvar_names,
+                                  m_eqmodp1_atoms, m_eqmodn_atoms,
+                                  m_eq_callback_options,
+                                  m_all_bv_terms, m_eq_coeff_views, m_online_bv_constraints,
+                                  m_online_bv_terms,
+                                  m_partition_prepass_equalities,
+                                  m_partition_prepass_triggers);
+    }
+
+    std::string terminal_eqmod_summary() const
+    {
+        return render_summary(g_cli.enable_final_fixed_value_check);
     }
 };
 
 int main(int argc, char **argv)
 {
-    // Self-test mode: bypass the file pipeline entirely.
-    for (int i = 1; i < argc; ++i)
-    {
-        if (std::string(argv[i]) == "--selftest")
-            return run_rewrite_selftests();
-    }
+    cli::ParseResult parsed = cli::parse_options(argc, argv);
+    if (parsed.selftest)
+        return run_rewrite_selftests();
 
     std::ofstream runlog("run.log", std::ios::out | std::ios::trunc);
     if (!runlog.is_open())
@@ -4599,143 +3105,236 @@ int main(int argc, char **argv)
     }
 
     std::ostream terminal_out(std::cout.rdbuf());
-    bool show_model_on_terminal = false;
-    bool rewrite_log_requested = false;
 
     try
     {
-        if (argc < 2)
+        if (!parsed.ok)
         {
-            print_usage(std::cerr, argv[0]);
-            runlog << "Usage requested: missing input file\n";
+            if (!parsed.missing_input && !parsed.error.empty())
+                std::cerr << parsed.error << "\n";
+            if (parsed.show_usage)
+                cli::print_usage(std::cerr, argv[0]);
+
+            if (parsed.missing_input)
+                runlog << "Usage requested: missing input file\n";
+            else if (parsed.log_error)
+                runlog << parsed.error << "\n";
             return 1;
         }
 
-        for (int i = 2; i < argc; ++i)
-        {
-            std::string a = argv[i];
-            if (a == "--ring-detail")
-                PRINT_RING_DETAIL = true;
-            else if (a == "--env")
-                ENV = true;
-            else if (a == "--no-trace")
-                g_log.set_global(util::LogLevel::Debug);
-            else if (a == "--disable-all-false")
-                ENABLE_ALL_FALSE = false;
-            else if (a == "--disable-all-true")
-                ENABLE_ALL_TRUE = false;
-            else if (a == "--disable-mixed")
-                ENABLE_MIXED = false;
-            else if (a == "--m-prime")
-                ALL_FALSE_ASSUME_M_PRIME = true;
-            else if (a == "--no-rewriting")
-                ENABLE_REWRITING = false;
-            else if (a == "--no-singular-nf")
-                ENABLE_REWRITE_SINGULAR_NF = false;
-            else if (a == "--enable-moduli-normalization")
-                ENABLE_MODULI_NORMALIZATION = true;
-            else if (a == "--preserve-eqmodp1-vars")
-                PRESERVE_EQMODP1_VARS = true;
-            else if (a == "--enable-subexpression-rules")
-                ENABLE_SUBEXPRESSION_RULES = true;
-            else if (a == "--enable-expression-growth-check")
-                ENABLE_EXPRESSION_GROWTH_CHECK = true;
-            else if (a == "--disable-rewrite-cache")
-                DISABLE_REWRITE_CACHE = true;
-            else if (a == "--verify-rewrite-lookups")
-                VERIFY_REWRITE_LOOKUPS = true;
-            else if (a == "--disable-auto-lemmas")
-                ENABLE_AUTO_LEMMAS = false;
-            else if (a == "--disable-final-fixed-value-check")
-                ENABLE_FINAL_FIXED_VALUE_CHECK = false;
-            else if (a == "--minimal-fixed-watch")
-                ENABLE_MINIMAL_FIXED_WATCH = true;
-            else if (a == "--enable-eqmod-true-lemmas")
-                ENABLE_EQMOD_TRUE_LEMMAS = true;
-            else if (a == "--enable-gb-preprocess")
-                ENABLE_GB_PREPROCESS = true;
-            else if (a == "--verify-gb-preprocess")
-            {
-                ENABLE_GB_PREPROCESS = true;
-                VERIFY_GB_PREPROCESS = true;
-            }
-            else if (a == "--show-model")
-                show_model_on_terminal = true;
-            else if (a == "--rewrite-log")
-                rewrite_log_requested = true;
-            else if (a == "--log-conflict-ants")
-                LOG_CONFLICT_ANTS = true;
-            else if (a == "--disable-groebner-ring-order")
-                USE_GROEBNER_RING_VAR_ORDER = false;
-            else if (a == "--disable-fix-log")
-                PRINT_FIXED_ALL = false;
-            else
-            {
-                std::string eqexp_error;
-                int opt_index = i;
-                if (util::parse_eq_experiment_option(a, opt_index, argc, argv,
-                                                     g_eq_experiment_options, eqexp_error))
-                {
-                    i = opt_index;
-                }
-                else
-                {
-                    std::cerr << "Unknown option: " << a << "\n";
-                    if (!eqexp_error.empty())
-                        std::cerr << eqexp_error << "\n";
-                    print_usage(std::cerr, argv[0]);
-                    runlog << "Unknown option: " << a << "\n";
-                    if (!eqexp_error.empty())
-                        runlog << eqexp_error << "\n";
-                    return 1;
-                }
-            }
-        }
+        g_cli = std::move(parsed.options);
+        if (g_cli.no_trace)
+            g_log.set_global(util::LogLevel::Debug);
+        util::singular::configure_dump({g_cli.dump_singular, "logs/singular", &g_log});
 
-        CliSummary summary;
-        summary.input_file = argv[1];
-        summary.options = join_options(argc, argv);
+        cli::report::Summary summary;
+        summary.input_file = g_cli.input_file;
+        summary.options = g_cli.option_summary;
         std::string terminal_model;
 
         g_groebner_timing.reset();
         g_final_fixed_value_check_timing.reset();
         g_final_fixed_value_check_span_start.reset();
+        util::singular::reset_runtime_statistics();
 
         const auto total_t0 = clk::now();
-        print_cli_input_section(terminal_out, summary.input_file, summary.options);
+        cli::report::print_input_section(
+            terminal_out, summary.input_file, summary.options);
 
         {
-            ScopedStreamBuf redirect_cout(std::cout, runlog.rdbuf());
-            ScopedStreamBuf redirect_cerr(std::cerr, runlog.rdbuf());
+            cli::report::ScopedStreamRedirect redirect_cout(
+                std::cout, runlog.rdbuf());
+            cli::report::ScopedStreamRedirect redirect_cerr(
+                std::cerr, runlog.rdbuf());
 
-            LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
-            LOG_INFO(g_log, "parse", "Reading SMT2 file: " + std::string(argv[1]));
+            LOG_TRACE(g_log, "parse", "Reading SMT2 file: " + g_cli.input_file);
+            LOG_INFO(g_log, "parse", "Reading SMT2 file: " + g_cli.input_file);
 
             context c;
 
-            begin_cli_timed_row(terminal_out, "Parsing SMT2 file:");
+            cli::report::begin_timed_row(terminal_out, "Parsing SMT2 file:");
             auto parse_t0 = clk::now();
-            std::string raw = read_file_all(argv[1]);
-            std::string smt = inject_poly_eqP_eqmodP_if_missing(raw);
-            std::vector<expr> asserts = parse_smt2_assertions(c, smt);
+            std::vector<expr> asserts =
+                smt2::load_assertions(c, g_cli.input_file);
             auto parse_t1 = clk::now();
             summary.parse_time = std::chrono::duration_cast<std::chrono::nanoseconds>(parse_t1 - parse_t0);
-            finish_cli_timed_row(terminal_out, "OK", summary.parse_time);
+            cli::report::finish_timed_row(
+                terminal_out, "OK", summary.parse_time);
 
             LOG_TRACE(g_log, "parse", "Loaded " + std::to_string(asserts.size()) + " assertions.");
 
+            util::autozero::Result auto_zero_lemma_result;
+            if (g_cli.enable_auto_zero_lemmas ||
+                g_cli.enable_auto_zero_lemmas_bv1_callback)
+            {
+                cli::report::begin_timed_row(
+                    terminal_out, "Auto-zero-lemma discovery:");
+                const auto auto_zero_lemma_t0 = clk::now();
+                auto_zero_lemma_result =
+                    util::autozero::discover_implied_zeros(
+                        c, asserts,
+                        g_cli.enable_auto_zero_lemmas_bv1_callback
+                            ? util::autozero::DiscoveryMode::Callback
+                            : util::autozero::DiscoveryMode::GroupedZeroAnchor,
+                        g_log);
+                cli::report::finish_timed_row(
+                    terminal_out, "OK",
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        clk::now() - auto_zero_lemma_t0));
+            }
+
+            if (!g_cli.inject_ideal_eq.empty())
+            {
+                for (const auto &[a, b] : g_cli.inject_ideal_eq)
+                    LOG_INFO(g_log, "inject",
+                             "[inject-ideal-eq] will inject " + a + " - " + b +
+                                 " into ideal during GB");
+            }
+
+            // Live mode is intentionally independent from the seeded BV
+            // equality prepass. Candidates come only from Main Solver equality
+            // callbacks. Workers start during search once a full batch exists;
+            // final() releases every partial tail batch.
+            const bool enable_bv_eq_prepass = g_cli.enable_eq_gb_z3;
+            util::bveq::Result bv_eq_result;
+            if (enable_bv_eq_prepass)
+            {
+                cli::report::begin_timed_row(
+                    terminal_out, "BV equality prover:");
+                auto bveq_t0 = clk::now();
+                util::bveq::Options bv_eq_options;
+                bv_eq_options.parallel_candidates = g_cli.enable_eq_gb_z3_parallel_candidates;
+                bv_eq_options.all_bv_constants = g_cli.enable_eq_gb_z3_all_bv_constants;
+                bv_eq_options.enable_fallback = g_cli.enable_bv_eq_fallback;
+                bv_eq_options.validation_batch_size = g_cli.eq_gb_z3_validation_batch_size;
+                bv_eq_options.seeded_candidate_solvers = g_cli.eq_gb_z3_seeded_candidate_solvers;
+                bv_eq_result = util::bveq::prove(c, asserts, bv_eq_options, g_log);
+                LOG_INFO(g_log, "eqgb",
+                         "stored " +
+                             std::to_string(bv_eq_result.equalities.size()) +
+                             " globally proved BV equality fact(s)");
+                auto bveq_t1 = clk::now();
+                auto bveq_time = std::chrono::duration_cast<std::chrono::nanoseconds>(bveq_t1 - bveq_t0);
+                cli::report::finish_timed_row(
+                    terminal_out, "OK", bveq_time);
+            }
+
+            if (g_cli.enable_eq_gb_z3)
+            {
+                std::vector<expr> injected_eqps =
+                    util::bveq::inject_as_eqp(c, asserts, bv_eq_result, g_log);
+                asserts.insert(asserts.end(), injected_eqps.begin(), injected_eqps.end());
+            }
+
+            util::eqpartition::PrepassResult partition_prepass;
+            if (g_cli.enable_eq_gb_partition_prepass)
+            {
+                cli::report::begin_timed_row(
+                    terminal_out, "Partition equality prepass:");
+                const auto partition_prepass_t0 = clk::now();
+                const auto prepass_options =
+                    solver_options::make_partition_prepass_options(g_cli);
+                if (!prepass_options)
+                    partition_prepass = util::eqpartition::run_eqp_prepass(
+                        c, asserts, &g_log);
+                else
+                    partition_prepass = util::eqpartition::run_eqp_prepass(
+                        c, asserts, *prepass_options, &g_log);
+                if (partition_prepass.status ==
+                    util::eqpartition::Status::Complete)
+                    asserts.insert(
+                        asserts.end(),
+                        partition_prepass.assertions.begin(),
+                        partition_prepass.assertions.end());
+                cli::report::finish_timed_row(
+                    terminal_out,
+                    partition_prepass.status ==
+                            util::eqpartition::Status::Complete
+                        ? "OK"
+                        : "INCOMPLETE",
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        clk::now() - partition_prepass_t0));
+                if (g_cli.eq_gb_partition_prepass_bv1_zero_only)
+                {
+                    terminal_out
+                        << "BV1 zero-only result: candidates="
+                        << partition_prepass.bv1_zero_candidates
+                        << " checks=" << partition_prepass.bv1_zero_checks
+                        << " proved=" << partition_prepass.bv1_zero_proved
+                        << " refuted=" << partition_prepass.bv1_zero_refuted
+                        << " unknown=" << partition_prepass.bv1_zero_unknown
+                        << " time="
+                        << util::fmt_duration(
+                               partition_prepass.bv1_zero_elapsed)
+                        << "\n";
+                    terminal_out.flush();
+                    runlog.flush();
+                    return 0;
+                }
+            }
+
+            if (g_cli.enable_auto_zero_lemmas ||
+                g_cli.enable_auto_zero_lemmas_bv1_callback)
+            {
+                std::vector<expr> auto_zero_eqps =
+                    util::autozero::inject_as_eqp(
+                        c, asserts, auto_zero_lemma_result, g_log);
+                asserts.insert(asserts.end(), auto_zero_eqps.begin(),
+                               auto_zero_eqps.end());
+            }
+
+            std::vector<expr> online_bv_constraints;
+            std::vector<expr> online_bv_terms;
+            if (eq_gb_generator_mode_enabled())
+            {
+                for (const expr &assertion : asserts)
+                    if (!util::bveq::assertion_contains_poly(assertion))
+                        online_bv_constraints.push_back(assertion);
+                std::unordered_set<Z3_ast> online_base_set;
+                for (const expr &assertion : asserts)
+                    collect_coeff_bases_rec(assertion, online_base_set);
+                std::unordered_set<Z3_ast> online_term_set;
+                for (Z3_ast ast : online_base_set)
+                {
+                    expr base(c, ast);
+                    if (!is_bv_to_int_app(base))
+                        continue;
+                    expr term = base.arg(0);
+                    if (term.is_const() && !term.is_numeral() &&
+                        online_term_set.insert((Z3_ast)term).second)
+                        online_bv_terms.push_back(term);
+                }
+            }
+
+            std::vector<expr> pre_rewrite_coeff_bases;
+            if (rewrite_aware_coeff_views_enabled())
+            {
+                std::unordered_set<Z3_ast> pre_base_set;
+                for (const expr &f : asserts)
+                    collect_coeff_bases_rec(f, pre_base_set);
+                pre_rewrite_coeff_bases.reserve(pre_base_set.size());
+                for (Z3_ast ast : pre_base_set)
+                {
+                    expr base(c, ast);
+                    if (eq_gb_generator_mode_enabled())
+                        pre_rewrite_coeff_bases.push_back(base);
+                }
+                std::sort(pre_rewrite_coeff_bases.begin(), pre_rewrite_coeff_bases.end(),
+                          [](const expr &x, const expr &y) { return x.to_string() < y.to_string(); });
+            }
             RewriteOptions rwopt;
-            rwopt.enable_rewriting = ENABLE_REWRITING;
-            rwopt.use_singular_normalization = ENABLE_REWRITE_SINGULAR_NF;
-            rwopt.enable_moduli_normalization = ENABLE_MODULI_NORMALIZATION;
-            rwopt.use_subexpression_rules = ENABLE_SUBEXPRESSION_RULES;
-            rwopt.preserve_eqmodp1_vars = PRESERVE_EQMODP1_VARS;
-            rwopt.enable_expression_growth_check = ENABLE_EXPRESSION_GROWTH_CHECK;
-            rwopt.disable_rewrite_cache = DISABLE_REWRITE_CACHE;
-            rwopt.verify_rewrite_lookups = VERIFY_REWRITE_LOOKUPS;
+            rwopt.enable_rewriting = g_cli.enable_rewriting;
+            rwopt.use_singular_normalization = g_cli.enable_rewrite_singular_nf;
+            rwopt.enable_moduli_normalization = g_cli.enable_moduli_normalization;
+            rwopt.use_subexpression_rules = g_cli.enable_subexpression_rules;
+            rwopt.use_raw_poly_power_rules = g_cli.enable_raw_poly_power_rules;
+            rwopt.preserve_eqmodp1_vars = g_cli.preserve_eqmodp1_vars;
+            rwopt.enable_expression_growth_check = g_cli.enable_expression_growth_check;
+            rwopt.disable_rewrite_cache = g_cli.disable_rewrite_cache;
+            rwopt.verify_rewrite_lookups = g_cli.verify_rewrite_lookups;
 
             std::ofstream rewrite_log;
-            if (rewrite_log_requested)
+            if (g_cli.rewrite_log_requested)
             {
                 rewrite_log.open("rewrite.log", std::ios::out | std::ios::trunc);
                 if (!rewrite_log.is_open())
@@ -4743,7 +3342,7 @@ int main(int argc, char **argv)
                 rwopt.rewrite_log = &rewrite_log;
             }
             std::ofstream rewrite_lookup_log;
-            if (VERIFY_REWRITE_LOOKUPS)
+            if (g_cli.verify_rewrite_lookups)
             {
                 rewrite_lookup_log.open("rewritelookups.log", std::ios::out | std::ios::trunc);
                 if (!rewrite_lookup_log.is_open())
@@ -4751,13 +3350,18 @@ int main(int argc, char **argv)
                 rwopt.rewrite_lookup_log = &rewrite_lookup_log;
             }
 
-            begin_cli_timed_row(terminal_out, "Rewriting assignments:");
+            cli::report::begin_timed_row(
+                terminal_out, "Rewriting assignments:");
             auto rewrite_t0 = clk::now();
             RewriteResult rr = run_rewriting_pipeline(c, asserts, rwopt, g_log);
             auto rewrite_t1 = clk::now();
             summary.rewrite_time = std::chrono::duration_cast<std::chrono::nanoseconds>(rewrite_t1 - rewrite_t0);
             asserts = std::move(rr.asserts);
-            finish_cli_timed_row(terminal_out, "OK", summary.rewrite_time);
+            std::vector<RewrittenCoeffBase> eq_coeff_views;
+            if (rewrite_aware_coeff_views_enabled())
+                eq_coeff_views = rewrite_coeff_bases_to_int(pre_rewrite_coeff_bases, rr.rules_used);
+            cli::report::finish_timed_row(
+                terminal_out, "OK", summary.rewrite_time);
 
             solver s(c);
 
@@ -4771,6 +3375,24 @@ int main(int argc, char **argv)
                     (Z3_solver)s,
                     (Z3_ast)asserts[i],
                     (Z3_ast)tag);
+            }
+
+            std::vector<expr> partition_prepass_triggers;
+            if (g_cli.eq_gb_partition_prepass_propagation &&
+                !partition_prepass.native_equalities.empty())
+            {
+                expr trigger(
+                    c, Z3_mk_fresh_const(
+                           (Z3_context)c,
+                           "eq_gb_partition_prepass_trigger",
+                           (Z3_sort)c.bool_sort()));
+                s.add(trigger);
+                partition_prepass_triggers.push_back(trigger);
+                LOG_INFO(g_log, "eqpartition",
+                         "partition prepass propagation armed: equalities=" +
+                             std::to_string(
+                                 partition_prepass.native_equalities.size()) +
+                             " trigger=" + trigger.to_string());
             }
 
             std::vector<expr> eqps;
@@ -4790,7 +3412,7 @@ int main(int argc, char **argv)
 
             std::vector<expr> eqmodsP1;
             for (auto &f : asserts)
-                collect_eqmodP1_rec(f, eqmodsP1);
+                collect_eqmod_rec(f, 1, eqmodsP1);
 
             for (size_t i = 0; i < eqmodsP1.size(); ++i)
             {
@@ -4799,26 +3421,38 @@ int main(int argc, char **argv)
                               " constraint: " + eqmodsP1[i].to_string());
             }
 
-            std::vector<expr> eqmodsP2;
-            for (auto &f : asserts)
-                collect_eqmodP2_rec(f, eqmodsP2);
-
-            for (size_t i = 0; i < eqmodsP2.size(); ++i)
+            std::vector<std::vector<expr>> eqmodn_atoms(5);
+            for (unsigned arity = 2; arity <= 4; ++arity)
             {
-                LOG_TRACE(g_log, "parse",
-                          "Found eqmodP2#" + std::to_string(i) +
-                              " constraint: " + eqmodsP2[i].to_string());
+                for (auto &f : asserts)
+                    collect_eqmod_rec(f, arity, eqmodn_atoms[arity]);
+                for (size_t i = 0; i < eqmodn_atoms[arity].size(); ++i)
+                    LOG_TRACE(g_log, "parse",
+                              "Found eqmodP" + std::to_string(arity) + "#" +
+                                  std::to_string(i) + " constraint: " +
+                                  eqmodn_atoms[arity][i].to_string());
             }
 
             std::vector<std::string> indets = collect_all_indets(asserts);
+            std::vector<std::string> poly_symbols = collect_all_raw_poly_symbols(asserts);
             IndetEnv env;
             env.names = indets;
-            for (unsigned i = 0; i < env.names.size(); ++i)
-                env.idx[env.names[i]] = i;
+            env.split_indet_count = (unsigned)indets.size();
+            for (unsigned i = 0; i < indets.size(); ++i)
+                env.idx["PVar:" + indets[i]] = i;
+            for (const std::string &symbol : poly_symbols)
+            {
+                unsigned i = (unsigned)env.names.size();
+                env.names.push_back(symbol);
+                env.idx["PolySymbol:" + symbol] = i;
+            }
 
             std::unordered_set<Z3_ast> baseS;
             for (auto &f : asserts)
                 collect_coeff_bases_rec(f, baseS);
+            if (rewrite_aware_coeff_views_enabled())
+                for (const RewrittenCoeffBase &view : eq_coeff_views)
+                    collect_coeff_bases_rec(view.rewritten_int, baseS);
 
             std::vector<z3::expr> bases;
             bases.reserve(baseS.size());
@@ -4828,6 +3462,16 @@ int main(int argc, char **argv)
             std::sort(bases.begin(), bases.end(),
                       [](const z3::expr &x, const z3::expr &y)
                       { return x.to_string() < y.to_string(); });
+
+            std::unordered_set<Z3_ast> all_bv_set;
+            for (const expr &f : asserts)
+                util::bveq::collect_bv_constants(f, all_bv_set);
+            std::vector<expr> all_bv_terms;
+            all_bv_terms.reserve(all_bv_set.size());
+            for (Z3_ast ast : all_bv_set)
+                all_bv_terms.emplace_back(c, ast);
+            std::sort(all_bv_terms.begin(), all_bv_terms.end(),
+                      [](const expr &x, const expr &y) { return x.to_string() < y.to_string(); });
 
             std::unordered_set<std::string> used;
 
@@ -4846,12 +3490,51 @@ int main(int argc, char **argv)
             for (size_t i = 0; i < bases.size(); ++i)
                 cmap.base_to_index[(Z3_ast)bases[i]] = (unsigned)i;
 
+            if (rewrite_aware_coeff_views_enabled())
+            {
+                std::vector<RewrittenCoeffBase> lowerable_views;
+                lowerable_views.reserve(eq_coeff_views.size());
+                std::size_t skipped_views = 0;
+                for (const RewrittenCoeffBase &view : eq_coeff_views)
+                {
+                    std::unordered_set<Z3_ast> dependencies;
+                    collect_coeff_bases_rec(view.rewritten_int, dependencies);
+                    bool lowerable = true;
+                    for (Z3_ast dependency : dependencies)
+                    {
+                        if (cmap.base_to_index.count(dependency) == 0)
+                        {
+                            lowerable = false;
+                            break;
+                        }
+                    }
+                    if (lowerable)
+                        lowerable_views.push_back(view);
+                    else
+                        ++skipped_views;
+                }
+                eq_coeff_views = std::move(lowerable_views);
+                LOG_INFO(g_log, "eqgb",
+                         "rewrite-aware coefficient views=" +
+                             std::to_string(eq_coeff_views.size()) +
+                             " skipped_nonlowerable=" + std::to_string(skipped_views));
+            }
+
             std::vector<std::string> indet_ring_names(env.names.size());
             for (size_t i = 0; i < env.names.size(); ++i)
             {
-                std::string base = sanitize_ring_var_base(env.names[i]);
+                const bool is_poly_symbol = i >= env.split_indet_count;
+                std::string prefix = is_poly_symbol ? "poly_" : "";
+                std::string base = sanitize_ring_var_base(prefix + env.names[i]);
                 indet_ring_names[i] = make_unique_name(base, used);
             }
+
+            std::vector<std::string> pvar_ring_names(
+                indet_ring_names.begin(),
+                indet_ring_names.begin() + env.split_indet_count);
+            std::vector<std::string> poly_symbol_ring_names(
+                indet_ring_names.begin() + env.split_indet_count,
+                indet_ring_names.end());
 
             std::vector<std::string> qvar_names(eqmodsP1.size());
             for (size_t i = 0; i < eqmodsP1.size(); ++i)
@@ -4859,50 +3542,97 @@ int main(int argc, char **argv)
                 qvar_names[i] = make_unique_name("u_mod_0_" + std::to_string(i), used);
             }
 
-            std::vector<std::pair<std::string, std::string>> eqmodp2_qvar_names(eqmodsP2.size());
-            for (size_t i = 0; i < eqmodsP2.size(); ++i)
+            std::vector<std::vector<std::vector<std::string>>> eqmodn_qvar_names(5);
+            for (unsigned arity = 2; arity <= 4; ++arity)
             {
-                eqmodp2_qvar_names[i].first = make_unique_name("u_mod_1_" + std::to_string(i) + "_0", used);
-                eqmodp2_qvar_names[i].second = make_unique_name("u_mod_1_" + std::to_string(i) + "_1", used);
+                eqmodn_qvar_names[arity].resize(eqmodn_atoms[arity].size());
+                for (size_t i = 0; i < eqmodn_atoms[arity].size(); ++i)
+                    for (unsigned modulus = 0; modulus < arity; ++modulus)
+                        eqmodn_qvar_names[arity][i].push_back(make_unique_name(
+                            "u_mod_" + std::to_string(arity - 1) + "_" +
+                                std::to_string(i) + "_" + std::to_string(modulus),
+                            used));
             }
 
             std::vector<std::string> ring_vars;
-            if (USE_GROEBNER_RING_VAR_ORDER)
+            if (g_cli.use_groebner_ring_var_order)
             {
-                ring_vars = build_groebner_ring_var_order(cmap.ring_names, indet_ring_names,
-                                                          qvar_names, eqmodp2_qvar_names);
+                ring_vars = build_groebner_ring_var_order(cmap.ring_names, poly_symbol_ring_names,
+                                                          pvar_ring_names,
+                                                          qvar_names, eqmodn_qvar_names);
             }
             else
             {
                 ring_vars.reserve(cmap.ring_names.size() + indet_ring_names.size() +
-                                  qvar_names.size() + 2 * eqmodp2_qvar_names.size());
+                                  qvar_names.size());
+                for (unsigned arity = 4; arity >= 2; --arity)
+                    for (auto atom = eqmodn_qvar_names[arity].rbegin();
+                         atom != eqmodn_qvar_names[arity].rend(); ++atom)
+                        ring_vars.insert(ring_vars.end(), atom->begin(), atom->end());
+                for (auto atom = qvar_names.rbegin(); atom != qvar_names.rend(); ++atom)
+                    ring_vars.push_back(*atom);
+                ring_vars.insert(ring_vars.end(), poly_symbol_ring_names.begin(), poly_symbol_ring_names.end());
                 ring_vars.insert(ring_vars.end(), cmap.ring_names.begin(), cmap.ring_names.end());
-                ring_vars.insert(ring_vars.end(), indet_ring_names.begin(), indet_ring_names.end());
-                ring_vars.insert(ring_vars.end(), qvar_names.begin(), qvar_names.end());
-                for (const auto &qnames : eqmodp2_qvar_names)
-                {
-                    ring_vars.push_back(qnames.first);
-                    ring_vars.push_back(qnames.second);
-                }
+                ring_vars.insert(ring_vars.end(), pvar_ring_names.begin(), pvar_ring_names.end());
             }
+
+            const std::size_t p1_qvars = qvar_names.size();
+            std::array<std::size_t, 5> family_qvars{};
+            family_qvars[1] = p1_qvars;
+            for (unsigned arity = 2; arity <= 4; ++arity)
+                for (const auto &atom_qvars : eqmodn_qvar_names[arity])
+                    family_qvars[arity] += atom_qvars.size();
+            const std::size_t auxiliary_count =
+                std::count_if(cmap.ring_names.begin(), cmap.ring_names.end(),
+                              is_groebner_aux_var);
+            const std::size_t coefficient_count =
+                cmap.ring_names.size() - auxiliary_count;
+            const std::size_t singular_ring_var_limit =
+                util::singular::ring_variable_limit();
+
+            LOG_INFO(
+                g_log, "init",
+                "eqmod ring preflight: P1 atoms=" +
+                    std::to_string(eqmodsP1.size()) + " qvars=" +
+                    std::to_string(family_qvars[1]) + " ; P2 atoms=" +
+                    std::to_string(eqmodn_atoms[2].size()) + " qvars=" +
+                    std::to_string(family_qvars[2]) + " ; P3 atoms=" +
+                    std::to_string(eqmodn_atoms[3].size()) + " qvars=" +
+                    std::to_string(family_qvars[3]) + " ; P4 atoms=" +
+                    std::to_string(eqmodn_atoms[4].size()) + " qvars=" +
+                    std::to_string(family_qvars[4]) + " ; raw-poly=" +
+                    std::to_string(poly_symbol_ring_names.size()) +
+                    " auxiliary=" + std::to_string(auxiliary_count) +
+                    " coefficients=" + std::to_string(coefficient_count) +
+                    " PVar=" + std::to_string(pvar_ring_names.size()) +
+                    " total=" + std::to_string(ring_vars.size()) +
+                    " Singular-ABI-limit=" +
+                    std::to_string(singular_ring_var_limit));
+            util::singular::require_ring_variable_capacity(ring_vars.size());
 
             LOG_TRACE(g_log, "init",
                       "Initializing propagator with " +
                           std::to_string(eqps.size()) + " eqP constraint(s), " +
                           std::to_string(eqmodsP1.size()) + " eqmodP1 constraint(s), " +
-                          std::to_string(eqmodsP2.size()) + " eqmodP2 constraint(s).");
+                          std::to_string(eqmodn_atoms[2].size()) + " eqmodP2 constraint(s), " +
+                          std::to_string(eqmodn_atoms[3].size()) + " eqmodP3 constraint(s), " +
+                          std::to_string(eqmodn_atoms[4].size()) + " eqmodP4 constraint(s).");
 
-            PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1, eqmodsP2,
+            PolyPropagator up(&s, eqps, lhs, rhs, eqmodsP1, eqmodn_atoms,
                               env, cmap, indet_ring_names, ring_vars, qvar_names,
-                              eqmodp2_qvar_names, g_eq_experiment_options);
+                              eqmodn_qvar_names, g_cli.eq_callback_options, all_bv_terms,
+                              eq_coeff_views, online_bv_constraints, online_bv_terms,
+                              partition_prepass.native_equalities,
+                              partition_prepass_triggers);
 
-            begin_cli_timed_row(terminal_out, "Solving with Z3:");
+            cli::report::begin_timed_row(terminal_out, "Solving with Z3:");
             auto solve_t0 = clk::now();
             check_result r = s.check();
             auto solve_t1 = clk::now();
             summary.solve_time = std::chrono::duration_cast<std::chrono::nanoseconds>(solve_t1 - solve_t0);
             summary.result = r;
-            finish_cli_timed_row(terminal_out, "OK", summary.solve_time);
+            cli::report::finish_timed_row(
+                terminal_out, "OK", summary.solve_time);
 
             std::cout << "Solver result: " << r << "\n";
             if (r == unknown)
@@ -4910,7 +3640,7 @@ int main(int argc, char **argv)
             if (SHOW_MODEL && r == sat)
             {
                 print_model_filtered(s.get_model());
-                if (show_model_on_terminal)
+                if (g_cli.show_model_on_terminal)
                 {
                     std::ostringstream model_out;
                     print_model_filtered(s.get_model(), model_out);
@@ -4925,6 +3655,9 @@ int main(int argc, char **argv)
             summary.groebner_calls = g_groebner_timing.calls;
             summary.groebner_time = g_groebner_timing.elapsed;
             summary.final_fixed_value_check_calls = g_final_fixed_value_check_timing.calls;
+            summary.singular_runtime = util::singular::runtime_statistics();
+            summary.self_max_rss_kb = util::singular::current_process_max_rss_kb();
+            summary.eqmod_summary = up.terminal_eqmod_summary();
             if (g_final_fixed_value_check_span_start)
             {
                 summary.final_fixed_value_check_time =
@@ -4938,20 +3671,9 @@ int main(int argc, char **argv)
             runlog.flush();
         }
 
-        begin_cli_timed_row(terminal_out, "   Computing Groebner basis:");
-        finish_cli_timed_row(terminal_out, "OK", summary.groebner_time, summary.groebner_calls);
-        terminal_out << "\n";
-        begin_cli_timed_row(terminal_out, "   Fixed-value check:");
-        finish_cli_timed_row(terminal_out, "OK",
-                             summary.final_fixed_value_check_time,
-                             summary.final_fixed_value_check_calls);
-        terminal_out << "\n# Summary\n\n";
-        begin_cli_timed_row(terminal_out, "Verification result:");
-        finish_cli_timed_row(terminal_out, check_result_name(summary.result), summary.total_time);
-        if (show_model_on_terminal && !terminal_model.empty())
-            terminal_out << "\n"
-                         << terminal_model;
-        terminal_out.flush();
+        cli::report::print_summary(
+            terminal_out, summary, terminal_model,
+            g_cli.show_model_on_terminal);
         return 0;
     }
     catch (const z3::exception &ex)
