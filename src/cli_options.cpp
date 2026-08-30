@@ -262,7 +262,7 @@ ParseResult parse_options(int argc, char **argv)
             if (i + 1 >= argc)
                 return error_result(
                     std::move(options),
-                    arg + " requires z3, boolector, or bitwuzla");
+                    arg + " requires z3 or boolector");
             const std::string value = argv[++i];
             if (value == "z3")
                 options.eq_gb_partition_prepass_bv1_zero_backend =
@@ -270,13 +270,10 @@ ParseResult parse_options(int argc, char **argv)
             else if (value == "boolector")
                 options.eq_gb_partition_prepass_bv1_zero_backend =
                     Bv1ZeroBackend::Boolector;
-            else if (value == "bitwuzla")
-                options.eq_gb_partition_prepass_bv1_zero_backend =
-                    Bv1ZeroBackend::Bitwuzla;
             else
                 return error_result(
                     std::move(options),
-                    arg + " requires z3, boolector, or bitwuzla");
+                    arg + " requires z3 or boolector");
             options.eq_gb_partition_prepass_bv1_zero_backend_explicit = true;
         }
         else if (arg ==
@@ -345,16 +342,6 @@ ParseResult parse_options(int argc, char **argv)
             options.eq_gb_partition_prepass_variant =
                 EqGbPartitionPrepassVariant::Hsopr;
         }
-        else if (arg == "--eq-gb-partition-prepass-bitwuzla")
-        {
-            if (options.eq_gb_partition_prepass_variant !=
-                EqGbPartitionPrepassVariant::Default)
-                return error_result(
-                    std::move(options),
-                    "partition-prepass engine options are mutually exclusive");
-            options.eq_gb_partition_prepass_variant =
-                EqGbPartitionPrepassVariant::Bitwuzla;
-        }
         else if (arg == "--eq-gb-partition-prepass-boolector")
         {
             if (options.eq_gb_partition_prepass_variant !=
@@ -413,16 +400,8 @@ ParseResult parse_options(int argc, char **argv)
             options.eq_gb_partition_prepass_parallel_boolector_embedded_global_fallback =
                 true;
         else if (arg ==
-                 "--eq-gb-partition-prepass-parallel-bitwuzla-embedded-global-fallback")
-            options.eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback =
-                true;
-        else if (arg ==
                  "--eq-gb-partition-prepass-parallel-boolector-direct-fallback")
             options.eq_gb_partition_prepass_parallel_boolector_direct_fallback =
-                true;
-        else if (arg ==
-                 "--eq-gb-partition-prepass-parallel-bitwuzla-direct-fallback")
-            options.eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback =
                 true;
         else if (arg ==
                  "--eq-gb-partition-prepass-parallel-final-validation")
@@ -645,20 +624,15 @@ ParseResult parse_options(int argc, char **argv)
         options.eq_gb_partition_prepass_variant !=
             EqGbPartitionPrepassVariant::ParallelBpr &&
         options.eq_gb_partition_prepass_variant !=
-            EqGbPartitionPrepassVariant::Bitwuzla &&
-        options.eq_gb_partition_prepass_variant !=
             EqGbPartitionPrepassVariant::Boolector)
         return error_result(
             std::move(options),
             "--eq-gb-partition-prepass-parallel-workers requires "
-            "--eq-gb-partition-prepass-parallel-bpr, "
-            "--eq-gb-partition-prepass-bitwuzla, or "
+            "--eq-gb-partition-prepass-parallel-bpr or "
             "--eq-gb-partition-prepass-boolector");
     if (options.eq_gb_partition_prepass_parallel_query_timeout_ms &&
         options.eq_gb_partition_prepass_variant !=
             EqGbPartitionPrepassVariant::ParallelBpr &&
-        options.eq_gb_partition_prepass_variant !=
-            EqGbPartitionPrepassVariant::Bitwuzla &&
         options.eq_gb_partition_prepass_variant !=
             EqGbPartitionPrepassVariant::Boolector)
         return error_result(
@@ -694,21 +668,6 @@ ParseResult parse_options(int argc, char **argv)
             "--eq-gb-partition-prepass-parallel-boolector-embedded-global-fallback "
             "requires a non-zero "
             "--eq-gb-partition-prepass-parallel-query-timeout-ms");
-    if (options.eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback &&
-        options.eq_gb_partition_prepass_variant !=
-            EqGbPartitionPrepassVariant::ParallelBpr)
-        return error_result(
-            std::move(options),
-            "--eq-gb-partition-prepass-parallel-bitwuzla-embedded-global-fallback "
-            "requires --eq-gb-partition-prepass-parallel-bpr");
-    if (options.eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback &&
-        (!options.eq_gb_partition_prepass_parallel_query_timeout_ms ||
-         *options.eq_gb_partition_prepass_parallel_query_timeout_ms == 0))
-        return error_result(
-            std::move(options),
-            "--eq-gb-partition-prepass-parallel-bitwuzla-embedded-global-fallback "
-            "requires a non-zero "
-            "--eq-gb-partition-prepass-parallel-query-timeout-ms");
     if (options.eq_gb_partition_prepass_parallel_boolector_direct_fallback &&
         options.eq_gb_partition_prepass_variant !=
             EqGbPartitionPrepassVariant::ParallelBpr)
@@ -722,22 +681,6 @@ ParseResult parse_options(int argc, char **argv)
         return error_result(
             std::move(options),
             "--eq-gb-partition-prepass-parallel-boolector-direct-fallback "
-            "requires a non-zero "
-            "--eq-gb-partition-prepass-parallel-query-timeout-ms");
-    if (options.eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback &&
-        options.eq_gb_partition_prepass_variant !=
-            EqGbPartitionPrepassVariant::ParallelBpr)
-        return error_result(
-            std::move(options),
-            "--eq-gb-partition-prepass-parallel-bitwuzla-direct-fallback "
-            "requires "
-            "--eq-gb-partition-prepass-parallel-bpr");
-    if (options.eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback &&
-        (!options.eq_gb_partition_prepass_parallel_query_timeout_ms ||
-         *options.eq_gb_partition_prepass_parallel_query_timeout_ms == 0))
-        return error_result(
-            std::move(options),
-            "--eq-gb-partition-prepass-parallel-bitwuzla-direct-fallback "
             "requires a non-zero "
             "--eq-gb-partition-prepass-parallel-query-timeout-ms");
     const unsigned fallback_modes =
@@ -746,11 +689,7 @@ ParseResult parse_options(int argc, char **argv)
         static_cast<unsigned>(
             options.eq_gb_partition_prepass_parallel_boolector_embedded_global_fallback) +
         static_cast<unsigned>(
-            options.eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback) +
-        static_cast<unsigned>(
-            options.eq_gb_partition_prepass_parallel_boolector_direct_fallback) +
-        static_cast<unsigned>(
-            options.eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback);
+            options.eq_gb_partition_prepass_parallel_boolector_direct_fallback);
     if (fallback_modes > 1)
         return error_result(
             std::move(options),
@@ -818,7 +757,7 @@ void print_usage(std::ostream &os, const char *program)
           " [--eq-gb-partition-prepass-bv1-zero-anchor]"
           " [--eq-gb-partition-prepass-bv1-zero-timeout-ms <N>]"
           " [--eq-gb-partition-prepass-bv1-zero-workers <N>]"
-          " [--eq-gb-partition-prepass-bv1-zero-backend <z3|boolector|bitwuzla>]"
+          " [--eq-gb-partition-prepass-bv1-zero-backend <z3|boolector>]"
           " [--eq-gb-partition-prepass-bv1-zero-only]"
           " [--eq-gb-partition-prepass-concurrent-widths]"
           " [--eq-gb-partition-prepass-z3-mpm]"
@@ -827,16 +766,13 @@ void print_usage(std::ostream &os, const char *program)
           " [--eq-gb-partition-prepass-abipr]"
           " [--eq-gb-partition-prepass-sopr]"
           " [--eq-gb-partition-prepass-hsopr]"
-          " [--eq-gb-partition-prepass-bitwuzla]"
           " [--eq-gb-partition-prepass-boolector]"
           " [--eq-gb-partition-prepass-parallel-bpr]"
           " [--eq-gb-partition-prepass-parallel-workers <N>]"
           " [--eq-gb-partition-prepass-parallel-query-timeout-ms <N>]"
           " [--eq-gb-partition-prepass-parallel-boolector-fallback]"
           " [--eq-gb-partition-prepass-parallel-boolector-embedded-global-fallback]"
-          " [--eq-gb-partition-prepass-parallel-bitwuzla-embedded-global-fallback]"
           " [--eq-gb-partition-prepass-parallel-boolector-direct-fallback]"
-          " [--eq-gb-partition-prepass-parallel-bitwuzla-direct-fallback]"
           " [--eq-gb-partition-prepass-parallel-final-validation]"
           " [--enable-eq-gb-z3]"
           " [--enable-eq-gb-z3-parallel-candidates]"

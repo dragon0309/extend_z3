@@ -64,10 +64,6 @@ make_partition_prepass_options(const cli::Options &options)
         result.bv1_zero_backend =
             util::eqpartition::Bv1ZeroBackend::Boolector;
         break;
-    case cli::Bv1ZeroBackend::Bitwuzla:
-        result.bv1_zero_backend =
-            util::eqpartition::Bv1ZeroBackend::Bitwuzla;
-        break;
     }
 
     switch (options.eq_gb_partition_prepass_variant)
@@ -90,13 +86,6 @@ make_partition_prepass_options(const cli::Options &options)
     case cli::EqGbPartitionPrepassVariant::Hsopr:
         result.experimental_variant = util::eqpartition::Variant::Hsopr;
         break;
-    case cli::EqGbPartitionPrepassVariant::Bitwuzla:
-        result.experimental_variant = util::eqpartition::Variant::Bitwuzla;
-        result.parallel_workers =
-            options.eq_gb_partition_prepass_parallel_workers.value_or(1);
-        result.parallel_query_timeout_ms =
-            options.eq_gb_partition_prepass_parallel_query_timeout_ms.value_or(0);
-        break;
     case cli::EqGbPartitionPrepassVariant::Boolector:
         result.experimental_variant = util::eqpartition::Variant::Boolector;
         result.parallel_workers =
@@ -115,15 +104,9 @@ make_partition_prepass_options(const cli::Options &options)
         if (options.eq_gb_partition_prepass_parallel_boolector_embedded_global_fallback)
             result.parallel_embedded_global_fallback =
                 util::eqpartition::ParallelFallbackBackend::Boolector;
-        else if (options.eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback)
-            result.parallel_embedded_global_fallback =
-                util::eqpartition::ParallelFallbackBackend::Bitwuzla;
         if (options.eq_gb_partition_prepass_parallel_boolector_direct_fallback)
             result.parallel_fallback =
                 util::eqpartition::ParallelFallbackBackend::Boolector;
-        else if (options.eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback)
-            result.parallel_fallback =
-                util::eqpartition::ParallelFallbackBackend::Bitwuzla;
         result.parallel_final_global_validation =
             options.eq_gb_partition_prepass_parallel_final_validation;
         break;

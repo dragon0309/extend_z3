@@ -341,10 +341,6 @@ PrepassResult run_eqp_prepass(
             const NativeSingletonValidationResult native =
                 run_native_bv1_singleton_queries(
                     context, constraints, bv1_candidates,
-                    prepass_options.bv1_zero_backend ==
-                            Bv1ZeroBackend::Boolector
-                        ? NativeSingletonBackend::Boolector
-                        : NativeSingletonBackend::Bitwuzla,
                     prepass_options.bv1_zero_workers,
                     prepass_options.bv1_zero_timeout_ms, log);
             zero_validation.candidates = bv1_candidates.size();
@@ -383,10 +379,7 @@ PrepassResult run_eqp_prepass(
             const char *backend =
                 prepass_options.bv1_zero_backend == Bv1ZeroBackend::Z3
                     ? "z3"
-                    : prepass_options.bv1_zero_backend ==
-                              Bv1ZeroBackend::Boolector
-                          ? "boolector"
-                          : "bitwuzla";
+                    : "boolector";
             LOG_INFO(
                 *log, "eqpartition",
                 "BV1 zero-only benchmark summary: backend=" +
@@ -498,10 +491,7 @@ PrepassResult run_eqp_prepass(
                      " bv1-zero-backend=" +
                      (prepass_options.bv1_zero_backend == Bv1ZeroBackend::Z3
                           ? "z3"
-                          : prepass_options.bv1_zero_backend ==
-                                    Bv1ZeroBackend::Boolector
-                                ? "boolector"
-                                : "bitwuzla") +
+                          : "boolector") +
                      " bv1-zero-workers=" +
                      std::to_string(prepass_options.bv1_zero_workers) +
                      " widths-concurrent=" +

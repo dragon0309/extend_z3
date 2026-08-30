@@ -21,7 +21,6 @@ enum class EqGbPartitionPrepassVariant
     Abipr,
     Sopr,
     Hsopr,
-    Bitwuzla,
     Boolector,
     ParallelBpr
 };
@@ -29,8 +28,7 @@ enum class EqGbPartitionPrepassVariant
 enum class Bv1ZeroBackend
 {
     Z3,
-    Boolector,
-    Bitwuzla
+    Boolector
 };
 
 enum class EqGbPartitionPrepassScheduler
@@ -105,9 +103,7 @@ struct Options
     std::optional<unsigned> eq_gb_partition_prepass_parallel_query_timeout_ms;
     bool eq_gb_partition_prepass_parallel_boolector_fallback = false;
     bool eq_gb_partition_prepass_parallel_boolector_embedded_global_fallback = false;
-    bool eq_gb_partition_prepass_parallel_bitwuzla_embedded_global_fallback = false;
     bool eq_gb_partition_prepass_parallel_boolector_direct_fallback = false;
-    bool eq_gb_partition_prepass_parallel_bitwuzla_direct_fallback = false;
     bool eq_gb_partition_prepass_parallel_final_validation = false;
     bool enable_eq_gb_z3 = false;
     bool enable_eq_gb_z3_parallel_candidates = false;

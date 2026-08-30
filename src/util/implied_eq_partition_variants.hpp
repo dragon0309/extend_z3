@@ -24,7 +24,6 @@ enum class Variant
     Abipr,
     Sopr,
     Hsopr,
-    Bitwuzla,
     Boolector,
     ParallelBpr
 };
@@ -34,8 +33,7 @@ const char *variant_name(Variant variant);
 enum class ParallelFallbackBackend
 {
     None,
-    Boolector,
-    Bitwuzla
+    Boolector
 };
 
 enum class ParallelScheduler
@@ -46,12 +44,6 @@ enum class ParallelScheduler
 };
 
 const char *parallel_fallback_name(ParallelFallbackBackend backend);
-
-enum class NativeSingletonBackend
-{
-    Boolector,
-    Bitwuzla
-};
 
 enum class NativeSingletonOutcome
 {
@@ -77,7 +69,6 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
     z3::context &source_context,
     const std::vector<z3::expr> &source_constraints,
     const std::vector<z3::expr> &source_candidates,
-    NativeSingletonBackend backend,
     std::size_t workers,
     unsigned timeout_ms,
     util::Logger *log = nullptr);

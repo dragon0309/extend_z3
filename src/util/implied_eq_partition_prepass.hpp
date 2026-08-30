@@ -23,8 +23,7 @@ namespace util::eqpartition
 enum class Bv1ZeroBackend
 {
     Z3,
-    Boolector,
-    Bitwuzla
+    Boolector
 };
 
 struct PrepassResult

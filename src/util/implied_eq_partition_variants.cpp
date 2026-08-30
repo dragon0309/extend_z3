@@ -2,8 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bitwuzla/cpp/bitwuzla.h>
-#include <bitwuzla/cpp/parser.h>
 #include <boolector/boolector.h>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cerrno>
@@ -386,190 +384,6 @@ std::vector<z3::expr> free_bv_inputs(
     return inputs;
 }
 
-void collect_bitwuzla_qfbv_constants(
-    const z3::expr &expression,
-    std::map<std::string, z3::expr> &out)
-{
-    const z3::sort sort = expression.get_sort();
-    if (!sort.is_bool() && !sort.is_bv())
-        throw std::runtime_error(
-            "Bitwuzla partition backend only supports QF_BV expressions; "
-            "unsupported sort in " + expression.to_string());
-    if (!expression.is_app())
-        throw std::runtime_error(
-            "Bitwuzla partition backend does not support quantified or "
-            "bound-variable expressions");
-
-    if (expression.decl().decl_kind() == Z3_OP_UNINTERPRETED)
-    {
-        if (!expression.is_const() || expression.is_numeral())
-            throw std::runtime_error(
-                "Bitwuzla partition backend does not yet support "
-                "uninterpreted functions");
-        out.emplace(expression.to_string(), expression);
-    }
-    for (unsigned i = 0; i < expression.num_args(); ++i)
-        collect_bitwuzla_qfbv_constants(expression.arg(i), out);
-}
-
-Result run_bitwuzla_partition(
-    const std::vector<z3::expr> &constraints,
-    const std::vector<z3::expr> &terms,
-    unsigned timeout_ms,
-    util::Logger *log)
-{
-    Result output;
-    output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
-    output.statistics.initial_blocks = blocks.size();
-    if (!has_non_singleton(blocks))
-    {
-        output.status = Status::Complete;
-        output.diagnostic = "embedded-cpp-api=true";
-        finalize_result(output, std::move(blocks));
-        return output;
-    }
-
-    std::map<std::string, z3::expr> constants;
-    for (const z3::expr &constraint : constraints)
-        collect_bitwuzla_qfbv_constants(constraint, constants);
-    for (const z3::expr &term : terms)
-        collect_bitwuzla_qfbv_constants(term, constants);
-
-    std::ostringstream smt;
-    smt << "(set-logic QF_BV)\n";
-    for (const auto &[name, constant] : constants)
-        smt << "(declare-const " << name << ' '
-            << constant.get_sort().to_string() << ")\n";
-    for (const z3::expr &constraint : constraints)
-        smt << "(assert " << constraint << ")\n";
-
-    bitwuzla::TermManager term_manager;
-    bitwuzla::Options bitwuzla_options;
-    bitwuzla_options.set(bitwuzla::Option::PRODUCE_MODELS, 1);
-    if (timeout_ms != 0)
-        bitwuzla_options.set(
-            bitwuzla::Option::TIME_LIMIT_PER, timeout_ms);
-    std::ostringstream parser_output;
-    std::ostringstream diagnostics;
-    bitwuzla_options.set_diagnostic_output_stream(diagnostics);
-    bitwuzla::parser::Parser parser(
-        term_manager, bitwuzla_options, "smt2", &parser_output);
-    parser.parse(smt.str(), true, false);
-    const std::shared_ptr<bitwuzla::Bitwuzla> solver =
-        parser.bitwuzla();
-
-    std::vector<bitwuzla::Term> bitwuzla_terms;
-    bitwuzla_terms.reserve(terms.size());
-    for (const z3::expr &term : terms)
-        bitwuzla_terms.push_back(parser.parse_term(term.to_string()));
-
-    auto model_values = [&]() {
-        std::vector<std::string> values;
-        values.reserve(bitwuzla_terms.size());
-        for (const bitwuzla::Term &term : bitwuzla_terms)
-            values.push_back(solver->get_value(term).str(2));
-        return values;
-    };
-    auto check = [&](const std::vector<bitwuzla::Term> &assumptions = {}) {
-        const auto started = clk::now();
-        const bitwuzla::Result result = solver->check_sat(assumptions);
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                clk::now() - started);
-        output.statistics.check_time += elapsed;
-        ++output.statistics.checks;
-        if (result == bitwuzla::Result::SAT)
-            ++output.statistics.sat_checks;
-        else if (result == bitwuzla::Result::UNSAT)
-            ++output.statistics.unsat_checks;
-        if (log)
-            LOG_INFO(
-                *log, "eqpartition",
-                "Bitwuzla C++ check=" +
-                    std::to_string(output.statistics.checks) +
-                    " result=" + std::to_string(result) +
-                    " blocks=" + std::to_string(blocks.size()) +
-                    " elapsed=" + util::fmt_duration(elapsed));
-        return result;
-    };
-
-    bitwuzla::Result result = check();
-    if (result == bitwuzla::Result::UNSAT)
-    {
-        output.constraints_unsat = true;
-        output.status = Status::Complete;
-        output.diagnostic = "embedded-cpp-api=true";
-        finalize_result(output, std::move(blocks));
-        return output;
-    }
-    if (result == bitwuzla::Result::UNKNOWN)
-    {
-        output.status = Status::Unknown;
-        output.diagnostic =
-            "Bitwuzla initial check returned unknown: " +
-            diagnostics.str();
-        finalize_result(output, std::move(blocks));
-        return output;
-    }
-    refine_partition_with_values(
-        blocks, model_values(), output.statistics);
-
-    while (has_non_singleton(blocks))
-    {
-        std::vector<bitwuzla::Term> differences;
-        for (const auto &block : blocks)
-        {
-            if (block.size() < 2)
-                continue;
-            const std::size_t representative = block.front();
-            for (std::size_t i = 1; i < block.size(); ++i)
-                differences.push_back(term_manager.mk_term(
-                    bitwuzla::Kind::DISTINCT,
-                    {bitwuzla_terms.at(representative),
-                     bitwuzla_terms.at(block[i])}));
-        }
-        output.statistics.splitter_edges += differences.size();
-        output.statistics.max_splitter_edges = std::max(
-            output.statistics.max_splitter_edges,
-            differences.size());
-        if (differences.empty())
-            break;
-
-        const bitwuzla::Term splitter =
-            differences.size() == 1
-                ? differences.front()
-                : term_manager.mk_term(bitwuzla::Kind::OR, differences);
-        result = check({splitter});
-        if (result == bitwuzla::Result::UNSAT)
-        {
-            output.status = Status::Complete;
-            break;
-        }
-        if (result == bitwuzla::Result::UNKNOWN)
-        {
-            output.status = Status::Unknown;
-            output.diagnostic =
-                "Bitwuzla splitter check returned unknown: " +
-                diagnostics.str();
-            break;
-        }
-
-        const std::size_t split_blocks = refine_partition_with_values(
-            blocks, model_values(), output.statistics);
-        if (split_blocks == 0)
-            throw std::runtime_error(
-                "Bitwuzla SAT model did not refine any partition block");
-    }
-
-    if (output.status == Status::Error)
-        output.status = Status::Complete;
-    if (output.diagnostic.empty())
-        output.diagnostic = "embedded-cpp-api=true";
-    finalize_result(output, std::move(blocks));
-    return output;
-}
-
 class NativePartitionWorker
 {
 public:
@@ -577,140 +391,6 @@ public:
     virtual ParallelQueryResult check(
         const std::vector<ParallelEdge> &edges) = 0;
     virtual void cancel() {}
-};
-
-std::string qfbv_smt2_base(
-    const std::vector<z3::expr> &constraints,
-    const std::vector<z3::expr> &terms)
-{
-    std::map<std::string, z3::expr> constants;
-    for (const z3::expr &constraint : constraints)
-        collect_bitwuzla_qfbv_constants(constraint, constants);
-    for (const z3::expr &term : terms)
-        collect_bitwuzla_qfbv_constants(term, constants);
-
-    std::ostringstream smt;
-    smt << "(set-logic QF_BV)\n";
-    for (const auto &[name, constant] : constants)
-        smt << "(declare-const " << name << ' '
-            << constant.get_sort().to_string() << ")\n";
-    for (const z3::expr &constraint : constraints)
-        smt << "(assert " << constraint << ")\n";
-    return smt.str();
-}
-
-bitwuzla::Options bitwuzla_worker_options(
-    unsigned timeout_ms, std::size_t worker_index)
-{
-    bitwuzla::Options options;
-    options.set(bitwuzla::Option::PRODUCE_MODELS, 1);
-    options.set(
-        bitwuzla::Option::SEED,
-        static_cast<std::uint64_t>(worker_index + 1));
-    if (timeout_ms != 0)
-        options.set(bitwuzla::Option::TIME_LIMIT_PER, timeout_ms);
-    return options;
-}
-
-class BitwuzlaPartitionWorker final : public NativePartitionWorker
-{
-    class CancelTerminator final : public bitwuzla::Terminator
-    {
-    public:
-        std::atomic<bool> canceled{false};
-
-        bool terminate() override
-        {
-            return canceled.load();
-        }
-    };
-
-    bitwuzla::TermManager term_manager_;
-    // Must outlive both parser_ and solver_, which retain this pointer.
-    CancelTerminator terminator_;
-    bitwuzla::Options options_;
-    std::ostringstream parser_output_;
-    std::ostringstream diagnostics_;
-    bitwuzla::parser::Parser parser_;
-    std::shared_ptr<bitwuzla::Bitwuzla> solver_;
-    std::vector<bitwuzla::Term> terms_;
-
-public:
-    BitwuzlaPartitionWorker(
-        const std::string &base_smt,
-        const std::vector<z3::expr> &terms,
-        unsigned timeout_ms,
-        std::size_t worker_index)
-        : options_(bitwuzla_worker_options(timeout_ms, worker_index)),
-          parser_(term_manager_, options_, "smt2", &parser_output_)
-    {
-        options_.set_diagnostic_output_stream(diagnostics_);
-        parser_.parse(base_smt, true, false);
-        solver_ = parser_.bitwuzla();
-        solver_->configure_terminator(&terminator_);
-        terms_.reserve(terms.size());
-        for (const z3::expr &term : terms)
-            terms_.push_back(parser_.parse_term(term.to_string()));
-    }
-
-    ParallelQueryResult check(
-        const std::vector<ParallelEdge> &edges) override
-    {
-        ParallelQueryResult output;
-        output.splitter_edges = edges.size();
-        try
-        {
-            std::vector<bitwuzla::Term> assumptions;
-            if (!edges.empty())
-            {
-                std::vector<bitwuzla::Term> differences;
-                differences.reserve(edges.size());
-                for (const auto &[lhs, rhs] : edges)
-                    differences.push_back(term_manager_.mk_term(
-                        bitwuzla::Kind::DISTINCT,
-                        {terms_.at(lhs), terms_.at(rhs)}));
-                assumptions.push_back(
-                    differences.size() == 1
-                        ? differences.front()
-                        : term_manager_.mk_term(
-                              bitwuzla::Kind::OR, differences));
-            }
-            const auto started = clk::now();
-            const bitwuzla::Result result =
-                solver_->check_sat(assumptions);
-            output.check_time =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    clk::now() - started);
-            if (result == bitwuzla::Result::SAT)
-            {
-                output.outcome = ParallelQueryOutcome::Sat;
-                output.values.reserve(terms_.size());
-                for (const bitwuzla::Term &term : terms_)
-                    output.values.push_back(
-                        solver_->get_value(term).str(2));
-            }
-            else if (result == bitwuzla::Result::UNSAT)
-                output.outcome = ParallelQueryOutcome::Unsat;
-            else
-            {
-                output.outcome = terminator_.canceled.load()
-                                     ? ParallelQueryOutcome::Canceled
-                                     : ParallelQueryOutcome::Unknown;
-                output.diagnostic = diagnostics_.str();
-            }
-        }
-        catch (const std::exception &ex)
-        {
-            output.outcome = ParallelQueryOutcome::Error;
-            output.diagnostic = ex.what();
-        }
-        return output;
-    }
-
-    void cancel() override
-    {
-        terminator_.canceled.store(true);
-    }
 };
 
 class BoolectorPartitionWorker final : public NativePartitionWorker
@@ -1136,31 +816,20 @@ Result run_native_parallel_partition(
     z3::context &context,
     const std::vector<z3::expr> &constraints,
     const std::vector<z3::expr> &terms,
-    Variant variant,
     const VariantOptions &options,
     util::Logger *log)
 {
     if (options.parallel_workers == 0)
         throw std::runtime_error(
             "native partition backend requires at least one worker");
-    const std::string backend = variant_name(variant);
-    const std::string base_smt =
-        variant == Variant::Bitwuzla
-            ? qfbv_smt2_base(constraints, terms)
-            : std::string();
+    const std::string backend = "boolector";
 
     std::vector<std::unique_ptr<NativePartitionWorker>> workers;
     workers.reserve(options.parallel_workers);
     for (std::size_t i = 0; i < options.parallel_workers; ++i)
-    {
-        if (variant == Variant::Bitwuzla)
-            workers.push_back(std::make_unique<BitwuzlaPartitionWorker>(
-                base_smt, terms, options.parallel_query_timeout_ms, i));
-        else
-            workers.push_back(std::make_unique<BoolectorPartitionWorker>(
-                context, constraints, terms,
-                options.parallel_query_timeout_ms, i));
-    }
+        workers.push_back(std::make_unique<BoolectorPartitionWorker>(
+            context, constraints, terms,
+            options.parallel_query_timeout_ms, i));
 
     Result output;
     output.statistics.terms = terms.size();
@@ -2080,7 +1749,6 @@ Result run_global_edge_portfolio(
 
             const auto validation = run_native_bv1_singleton_queries(
                 context, constraints, candidates,
-                NativeSingletonBackend::Boolector,
                 options.parallel_workers, 0, log);
             output.statistics.checks += validation.checks;
             output.statistics.sat_checks += validation.sat;
@@ -2841,12 +2509,6 @@ Result run_parallel_bpr(
     }
 
     std::vector<std::unique_ptr<ParallelWorkerState>> workers;
-    const std::string fallback_base_smt =
-        options.parallel_fallback == ParallelFallbackBackend::Bitwuzla ||
-                options.parallel_embedded_global_fallback ==
-                    ParallelFallbackBackend::Bitwuzla
-            ? qfbv_smt2_base(constraints, terms)
-            : std::string();
     if (can_continue && has_non_singleton(blocks))
     {
         apply_deterministic_seed_models(
@@ -2974,17 +2636,10 @@ Result run_parallel_bpr(
                         ParallelQueryOutcome::Unknown)
                     continue;
                 fallback_used[i] = true;
-                if (options.parallel_fallback ==
-                    ParallelFallbackBackend::Boolector)
-                    fallback_workers[i] =
-                        std::make_unique<BoolectorPartitionWorker>(
-                            context, constraints, terms,
-                            options.parallel_query_timeout_ms, i);
-                else
-                    fallback_workers[i] =
-                        std::make_unique<BitwuzlaPartitionWorker>(
-                            fallback_base_smt, terms,
-                            options.parallel_query_timeout_ms, i);
+                fallback_workers[i] =
+                    std::make_unique<BoolectorPartitionWorker>(
+                        context, constraints, terms,
+                        options.parallel_query_timeout_ms, i);
             }
             for (std::size_t i = 0; i < assignments.size(); ++i)
             {
@@ -3156,30 +2811,16 @@ Result run_parallel_bpr(
             {
                 const std::vector<z3::expr> inputs =
                     free_bv_inputs(constraints);
-                std::vector<z3::expr> native_model_terms = terms;
-                native_model_terms.insert(
-                    native_model_terms.end(), inputs.begin(), inputs.end());
                 const std::uint64_t timeout_ms_64 =
                     static_cast<std::uint64_t>(fallback_seconds) * 1000u;
                 const unsigned fallback_timeout_ms =
                     static_cast<unsigned>(std::min<std::uint64_t>(
                         timeout_ms_64,
                         std::numeric_limits<unsigned>::max()));
-                ParallelQueryResult query;
-                if (options.parallel_embedded_global_fallback ==
-                    ParallelFallbackBackend::Boolector)
-                    query = run_boolector_parser_global_witness(
+                ParallelQueryResult query =
+                    run_boolector_parser_global_witness(
                         constraints, inputs, active_edges, terms,
                         fallback_timeout_ms);
-                else
-                {
-                    std::unique_ptr<NativePartitionWorker> fallback_worker =
-                        std::make_unique<BitwuzlaPartitionWorker>(
-                            fallback_base_smt, native_model_terms,
-                            fallback_timeout_ms,
-                            output.statistics.parallel_rounds);
-                    query = fallback_worker->check(active_edges);
-                }
                 ++output.statistics.checks;
                 ++output.statistics.parallel_fallback_checks;
                 output.statistics.splitter_edges +=
@@ -3192,19 +2833,8 @@ Result run_parallel_bpr(
                     ++output.statistics.sat_checks;
                     std::optional<std::vector<std::string>> model_values;
                     std::vector<std::string> input_values;
-                    if (options.parallel_embedded_global_fallback ==
-                            ParallelFallbackBackend::Boolector &&
-                        query.values.size() == inputs.size())
+                    if (query.values.size() == inputs.size())
                         input_values = query.values;
-                    else if (query.values.size() ==
-                             native_model_terms.size())
-                    {
-                        const auto input_values_begin =
-                            query.values.begin() +
-                            static_cast<std::ptrdiff_t>(terms.size());
-                        input_values.assign(
-                            input_values_begin, query.values.end());
-                    }
                     if (input_values.size() == inputs.size())
                     {
                         ++output.statistics.checks;
@@ -4112,7 +3742,6 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
     z3::context &source_context,
     const std::vector<z3::expr> &source_constraints,
     const std::vector<z3::expr> &source_candidates,
-    NativeSingletonBackend backend,
     std::size_t workers,
     unsigned timeout_ms,
     util::Logger *log)
@@ -4134,16 +3763,6 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
 
     const auto all_started = clk::now();
     const z3::expr zero = source_context.bv_val(0, 1);
-    const std::vector<z3::expr> declaration_terms = [&]() {
-        std::vector<z3::expr> terms = source_candidates;
-        terms.push_back(zero);
-        return terms;
-    }();
-    const std::string bitwuzla_base =
-        backend == NativeSingletonBackend::Bitwuzla
-            ? qfbv_smt2_base(source_constraints, declaration_terms)
-            : std::string();
-
     // Build each batch on the caller thread because Boolector's hand AST
     // translator reads the source Z3 context. The expensive SAT calls then run
     // concurrently, and every candidate gets a fresh solver so a timeout
@@ -4159,14 +3778,9 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
         {
             const std::vector<z3::expr> query_terms{
                 source_candidates[begin + offset], zero};
-            if (backend == NativeSingletonBackend::Boolector)
-                batch.push_back(std::make_unique<BoolectorPartitionWorker>(
-                    source_context, source_constraints, query_terms,
-                    timeout_ms, begin + offset, true));
-            else
-                batch.push_back(std::make_unique<BitwuzlaPartitionWorker>(
-                    bitwuzla_base, query_terms, timeout_ms,
-                    begin + offset));
+            batch.push_back(std::make_unique<BoolectorPartitionWorker>(
+                source_context, source_constraints, query_terms,
+                timeout_ms, begin + offset, true));
         }
 
         std::vector<ParallelQueryResult> results(count);
@@ -4204,11 +3818,7 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
             if (log)
                 LOG_INFO(
                     *log, "eqpartition",
-                    "BV1 singleton native query: backend=" +
-                        std::string(
-                            backend == NativeSingletonBackend::Boolector
-                                ? "boolector"
-                                : "bitwuzla") +
+                    std::string("BV1 singleton native query: backend=boolector") +
                         " term=" + source_candidates[candidate_index].to_string() +
                         " status=" + status +
                         " time=" + util::fmt_duration(result.check_time) +
@@ -4240,8 +3850,6 @@ const char *variant_name(Variant variant)
         return "sopr";
     case Variant::Hsopr:
         return "hsopr";
-    case Variant::Bitwuzla:
-        return "bitwuzla";
     case Variant::Boolector:
         return "boolector";
     case Variant::ParallelBpr:
@@ -4258,8 +3866,6 @@ const char *parallel_fallback_name(ParallelFallbackBackend backend)
         return "none";
     case ParallelFallbackBackend::Boolector:
         return "boolector";
-    case ParallelFallbackBackend::Bitwuzla:
-        return "bitwuzla";
     }
     return "unknown";
 }
@@ -4316,19 +3922,9 @@ Result run_variant(z3::context &source_context,
         else if (variant == Variant::Hsopr)
             output = run_space_optimized_pr(
                 context, constraints, terms, true, log);
-        else if (variant == Variant::Bitwuzla)
-        {
-            if (options.parallel_workers == 1)
-                output = run_bitwuzla_partition(
-                    constraints, terms,
-                    options.parallel_query_timeout_ms, log);
-            else
-                output = run_native_parallel_partition(
-                    context, constraints, terms, variant, options, log);
-        }
         else if (variant == Variant::Boolector)
             output = run_native_parallel_partition(
-                context, constraints, terms, variant, options, log);
+                context, constraints, terms, options, log);
         else if (variant == Variant::ParallelBpr)
         {
             const bool legacy_scheduler_requested =
