@@ -3357,6 +3357,7 @@ int main(int argc, char **argv)
             auto rewrite_t1 = clk::now();
             summary.rewrite_time = std::chrono::duration_cast<std::chrono::nanoseconds>(rewrite_t1 - rewrite_t0);
             asserts = std::move(rr.asserts);
+            const std::vector<expr> native_bindings = std::move(rr.native_coefficient_bindings);
             std::vector<RewrittenCoeffBase> eq_coeff_views;
             if (rewrite_aware_coeff_views_enabled())
                 eq_coeff_views = rewrite_coeff_bases_to_int(pre_rewrite_coeff_bases, rr.rules_used);
@@ -3375,6 +3376,18 @@ int main(int argc, char **argv)
                     (Z3_solver)s,
                     (Z3_ast)asserts[i],
                     (Z3_ast)tag);
+            }
+
+            // Native coefficient bindings are guarded so the first check runs
+            // without them; see the two-phase check below.
+            expr native_binding_guard = c.bool_val(true);
+            if (!native_bindings.empty())
+            {
+                native_binding_guard = expr(
+                    c, Z3_mk_fresh_const((Z3_context)c, "native_binding_guard",
+                                         (Z3_sort)c.bool_sort()));
+                for (const expr &binding : native_bindings)
+                    s.add(implies(native_binding_guard, binding));
             }
 
             std::vector<expr> partition_prepass_triggers;
@@ -3627,7 +3640,35 @@ int main(int argc, char **argv)
 
             cli::report::begin_timed_row(terminal_out, "Solving with Z3:");
             auto solve_t0 = clk::now();
-            check_result r = s.check();
+            // The bindings only strengthen the query: unsat without them is
+            // final, and sat/unknown is re-checked with them enabled.
+            check_result r;
+            if (native_bindings.empty())
+                r = s.check();
+            else
+            {
+                expr_vector without(c);
+                without.push_back(!native_binding_guard);
+                auto result_name = [](check_result result)
+                {
+                    std::ostringstream os;
+                    os << result;
+                    return os.str();
+                };
+                r = s.check(without);
+                LOG_INFO(g_log, "rewrite",
+                         "native coefficient bindings=" + std::to_string(native_bindings.size()) +
+                             " check without bindings: " + result_name(r));
+                if (r != unsat)
+                {
+                    expr_vector with(c);
+                    with.push_back(native_binding_guard);
+                    r = s.check(with);
+                    LOG_INFO(g_log, "rewrite",
+                             std::string("check with native coefficient bindings: ") +
+                                 result_name(r));
+                }
+            }
             auto solve_t1 = clk::now();
             summary.solve_time = std::chrono::duration_cast<std::chrono::nanoseconds>(solve_t1 - solve_t0);
             summary.result = r;

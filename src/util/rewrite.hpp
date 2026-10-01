@@ -112,6 +112,10 @@ struct RewriteResult
     // Assertion-level wrapper output used by main.cpp.
     std::vector<z3::expr> asserts;
     std::vector<z3::expr> residual_assertions;
+    // Native Int definitions of rewritten coefficients (e.g. bv2nat terms)
+    // that link Poly-space substitutions back to their SMT meaning. Dropping
+    // them only weakens the query, so an unsat answer without them is sound.
+    std::vector<z3::expr> native_coefficient_bindings;
     int rewrite_atoms_before = 0;
     int unique_vars_before = 0;
     int rewrite_atoms_after = 0;

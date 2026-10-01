@@ -1928,6 +1928,7 @@ namespace
     struct AssertionRewriteResult
     {
         std::vector<expr> residual_assertions;
+        std::vector<expr> native_coefficient_bindings;
         std::vector<RewriteRule> rules_used;
         bool used_worklist_rewrite = false;
         std::size_t dag_rounds = 0;
@@ -3265,6 +3266,88 @@ namespace
         return e.is_bool() && e.is_true();
     }
 
+    void collect_native_int_terms(const expr &e,
+                                  std::unordered_set<Z3_ast> &terms,
+                                  std::unordered_set<Z3_ast> &visited,
+                                  bool skip_atomic_coefficients)
+    {
+        if (!visited.insert((Z3_ast)e).second)
+            return;
+        // Atomic coefficients are rewritten in Poly space. Their uses outside
+        // that space (including inside a compound PConst) need SMT bindings.
+        if (skip_atomic_coefficients && is_ctor(e, "PConst", 1) &&
+            is_int_atom(e.arg(0)))
+            return;
+        if (e.get_sort().is_int())
+            terms.insert((Z3_ast)e);
+        if (e.is_quantifier())
+            collect_native_int_terms(e.body(), terms, visited, skip_atomic_coefficients);
+        else if (e.is_app())
+            for (unsigned i = 0; i < e.num_args(); ++i)
+                collect_native_int_terms(e.arg(i), terms, visited, skip_atomic_coefficients);
+    }
+
+    void preserve_native_coefficient_bindings(const std::vector<expr> &input,
+                                              const PolyDecls &d,
+                                              AssertionRewriteResult &result)
+    {
+        std::unordered_set<Z3_ast> needed, visited;
+        for (const expr &a : input)
+            collect_native_int_terms(a, needed, visited, true);
+
+        // A BV conversion is not a freely eliminable integer variable, even
+        // when it only occurs as a coefficient (its finite range still applies).
+        // Keep subexpression definitions too when they can be lowered to Int.
+        std::vector<expr> left, right;
+        for (const RewriteRule &rule : result.rules_used)
+        {
+            expr lhs(rule.lhs.ctx()), rhs(rule.rhs.ctx());
+            if (!poly_to_int_expr(rule.lhs, d, lhs) ||
+                !poly_to_int_expr(rule.rhs, d, rhs))
+                continue;
+            left.push_back(lhs);
+            right.push_back(rhs);
+            if (!(lhs.is_const() && !lhs.is_numeral()))
+                needed.insert((Z3_ast)lhs);
+        }
+
+        // Definitions can cross DAG rounds or worklist steps: retaining c=d
+        // also requires a later eliminated definition of d to remain linked.
+        std::unordered_map<Z3_ast, std::vector<std::size_t>> definitions;
+        for (std::size_t i = 0; i < left.size(); ++i)
+            definitions[(Z3_ast)left[i]].push_back(i);
+        std::vector<Z3_ast> pending(needed.begin(), needed.end());
+        std::unordered_set<Z3_ast> expanded;
+        // Z3 hash-conses ASTs, so pointer identity is structural equality.
+        std::unordered_set<Z3_ast> present;
+        for (const expr &a : result.residual_assertions)
+            present.insert((Z3_ast)a);
+        while (!pending.empty())
+        {
+            Z3_ast term = pending.back();
+            pending.pop_back();
+            if (!expanded.insert(term).second)
+                continue;
+            auto found = definitions.find(term);
+            if (found == definitions.end())
+                continue;
+            for (std::size_t index : found->second)
+            {
+                expr binding = (left[index] == right[index]).simplify();
+                if (!binding.is_true() && present.insert((Z3_ast)binding).second)
+                    result.native_coefficient_bindings.push_back(binding);
+                std::unordered_set<Z3_ast> dependencies, seen;
+                collect_native_int_terms(left[index], dependencies, seen, false);
+                collect_native_int_terms(right[index], dependencies, seen, false);
+                pending.insert(pending.end(), dependencies.begin(), dependencies.end());
+            }
+        }
+        if (!result.native_coefficient_bindings.empty())
+            result.diagnostics.push_back(
+                "retained " + std::to_string(result.native_coefficient_bindings.size()) +
+                " native coefficient binding(s)");
+    }
+
 } // namespace
 
 RewriteResult run_rewriting_pipeline(z3::context &ctx,
@@ -3344,10 +3427,17 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     AssertionRewriteTiming assertion_timing;
     phase_t0 = std::chrono::steady_clock::now();
     AssertionRewriteResult unified = try_dag_rewrite(input_asserts, d, options, &assertion_timing);
+    preserve_native_coefficient_bindings(input_asserts, d, unified);
+    if (options.rewrite_log)
+    {
+        *options.rewrite_log << "\n[native coefficient bindings]\n";
+        write_final_residuals(*options.rewrite_log, unified.native_coefficient_bindings, d);
+    }
     assertion_rewrite_time = std::chrono::steady_clock::now() - phase_t0;
 
     out.residual_assertions = unified.residual_assertions;
     out.asserts = unified.residual_assertions;
+    out.native_coefficient_bindings = unified.native_coefficient_bindings;
     out.rewritten_target = poly_zero;
     out.rules_used = unified.rules_used;
     out.used_worklist_rewrite = unified.used_worklist_rewrite;
@@ -3393,6 +3483,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
             << " asserted_eqP=" << asserted_eqps_before.size()
             << " assignments=" << out.rules_used.size()
             << " residual_assertions=" << out.residual_assertions.size()
+            << " native_bindings=" << out.native_coefficient_bindings.size()
             << " relational_eqP=" << relational_eqps_after
             << " dag_rounds=" << out.dag_rounds
             << " worklist=" << (out.used_worklist_rewrite ? "yes" : "no")
