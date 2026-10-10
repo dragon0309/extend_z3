@@ -1387,15 +1387,17 @@ namespace
     {
         ring R = nullptr;
         std::vector<char *> names;
-        rRingOrder_t *ord = nullptr;
-        int *block0 = nullptr;
-        int *block1 = nullptr;
-        int ord_size = 0;
 
         ~SingularRing()
         {
             if (R)
+            {
+                // rDelete leaves currRing dangling; later kStd calls then read
+                // the freed ring's memory (observed as a jump to 0x6000080).
+                if (currRing == R)
+                    rChangeCurrRing(nullptr);
                 rDelete(R);
+            }
             for (char *p : names)
                 free(p);
         }
@@ -1412,22 +1414,29 @@ namespace
                 for (const auto &v : vars)
                     names.push_back(strdup(v.c_str()));
 
-            ord_size = 3;
-            ord = (rRingOrder_t *)omAlloc(ord_size * sizeof(rRingOrder_t));
-            block0 = (int *)omAlloc0(ord_size * sizeof(int));
-            block1 = (int *)omAlloc0(ord_size * sizeof(int));
-            ord[0] = ringorder_dp;
-            ord[1] = ringorder_C;
-            ord[2] = (rRingOrder_t)0;
-            block0[0] = 1;
-            block1[0] = nvars;
-
-            R = rDefault(cfZ, nvars, names.data(), ord_size, ord, block0, block1, nullptr);
+            R = rDefault(cfZ, nvars, names.data(), ringorder_dp);
             if (!R)
                 throw std::runtime_error("Singular rDefault failed");
             rComplete(R);
             rChangeCurrRing(R);
         }
+    };
+
+    // Declare after the owning SingularRing so the ideal is deleted first.
+    struct SingularIdeal
+    {
+        ideal I = nullptr;
+        ring R = nullptr;
+
+        SingularIdeal(ideal value, ring owner) : I(value), R(owner) {}
+        ~SingularIdeal()
+        {
+            if (I)
+                id_Delete(&I, R);
+        }
+
+        SingularIdeal(const SingularIdeal &) = delete;
+        SingularIdeal &operator=(const SingularIdeal &) = delete;
     };
 
     number singular_num_from_mpz(const mpz_class &v, const coeffs cf)
@@ -1573,12 +1582,15 @@ namespace
                 return zero;
             }
 
-            ideal I = idInit((int)moduli.size(), 1);
+            SingularIdeal I(idInit((int)moduli.size(), 1), R);
             for (int i = 0; i < (int)moduli.size(); ++i)
-                I->m[i] = singular_from_poly_expr(moduli[(std::size_t)i], d, idx, R);
-            ideal G = util::singular::groebner(I, R, "rewrite-normalization");
+                I.I->m[i] = singular_from_poly_expr(moduli[(std::size_t)i], d, idx, R);
+            SingularIdeal G(util::singular::groebner(I.I, R, "rewrite-normalization"), R);
             poly pp = singular_from_poly_expr(p, d, idx, R);
-            poly nf = util::singular::normal_form(G, pp, R, "rewrite-normalization");
+            // kNF does not take ownership of pp.
+            poly nf = util::singular::normal_form(G.I, pp, R, "rewrite-normalization");
+            if (pp)
+                p_Delete(&pp, R);
             const bool zero = (nf == nullptr);
             if (nf)
                 p_Delete(&nf, R);

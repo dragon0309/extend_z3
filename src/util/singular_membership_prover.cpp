@@ -94,7 +94,7 @@ std::vector<bool> raw_membership(std::vector<poly> owned_generators,
             continue;
         }
         poly normal = util::singular::normal_form(
-            basis.get(), p_Copy(targets[i], R), R, label);
+            basis.get(), targets[i], R, label);
         membership[i] = normal == nullptr;
         if (normal_forms)
             (*normal_forms)[i] = poly_to_string(normal, R);

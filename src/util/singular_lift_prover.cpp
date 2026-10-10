@@ -215,7 +215,7 @@ LiftBatchResult prove_with_lift_support(
                     continue;
                 }
                 poly normal = util::singular::normal_form(
-                    basis, p_Copy(owned_targets[i], R), R, label);
+                    basis, owned_targets[i], R, label);
                 target_result.member = normal == nullptr;
                 delete_poly_if_nonnull(normal, R);
             }

@@ -82,6 +82,23 @@ z3::expr z3_pow(z3::expr base, int exponent)
     return result;
 }
 
+void delete_ring(ring &R)
+{
+    // rDelete leaves currRing dangling; later Singular calls then read the
+    // freed ring's memory.
+    if (currRing == R)
+        rChangeCurrRing(nullptr);
+    rDelete(R);
+    R = nullptr;
+}
+
+void free_names(std::vector<char *> &names)
+{
+    for (char *name : names)
+        std::free(name);
+    names.clear();
+}
+
 } // namespace
 
 bool is_poly_sort(const z3::sort &value)
@@ -233,13 +250,8 @@ void collect_coeff_bases_rec(
 RingEnv::~RingEnv()
 {
     if (R)
-    {
-        rDelete(R);
-        R = nullptr;
-    }
-    for (char *name : name_buf)
-        std::free(name);
-    name_buf.clear();
+        delete_ring(R);
+    free_names(name_buf);
 }
 
 void RingEnv::build(coeffs coefficients,
@@ -250,7 +262,7 @@ void RingEnv::build(coeffs coefficients,
     if (variable_count == 0)
         variable_count = 1;
 
-    name_buf.clear();
+    free_names(name_buf);
     name_buf.reserve(variable_count);
     var_to_idx.clear();
     if (!variables.empty())
@@ -268,10 +280,7 @@ void RingEnv::build(coeffs coefficients,
     }
 
     if (R)
-    {
-        rDelete(R);
-        R = nullptr;
-    }
+        delete_ring(R);
     ord_heap = nullptr;
     block0_heap = nullptr;
     block1_heap = nullptr;

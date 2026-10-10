@@ -34,8 +34,7 @@ ideal groebner(ideal input, ring R, const std::string &label = {});
  * Execute kNF. If basis came from groebner(), append this NF calculation to the
  * same file; otherwise create a standalone NF replay file.
  *
- * target has exactly the same ownership semantics as the poly argument passed
- * directly to kNF.
+ * Like kNF, this does not take ownership of target; the caller still deletes it.
  */
 poly normal_form(ideal basis, poly target, ring R, const std::string &label = {});
 
