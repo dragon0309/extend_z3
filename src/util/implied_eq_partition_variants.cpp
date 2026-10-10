@@ -280,34 +280,43 @@ std::size_t refine_partition_with_values(
     return split_blocks;
 }
 
+// Z3 contexts are not thread-safe. A worker thread may only use the private
+// context built here, on the thread that owns the source context, before the
+// worker starts.
 struct ParallelWorkerState
 {
     std::unique_ptr<z3::context> context;
     std::vector<z3::expr> constraints;
     std::vector<z3::expr> terms;
+    std::vector<z3::expr> inputs;
 
     ParallelWorkerState(
         z3::context &source_context,
         const std::vector<z3::expr> &source_constraints,
-        const std::vector<z3::expr> &source_terms)
-        : context(std::make_unique<z3::context>())
+        const std::vector<z3::expr> &source_terms,
+        const std::vector<z3::expr> &source_inputs = {})
+        : context(std::make_unique<z3::context>()),
+          constraints(translate(source_context, source_constraints)),
+          terms(translate(source_context, source_terms)),
+          inputs(translate(source_context, source_inputs))
     {
-        constraints.reserve(source_constraints.size());
-        for (const z3::expr &constraint : source_constraints)
-            constraints.emplace_back(
+    }
+
+private:
+    std::vector<z3::expr> translate(
+        z3::context &source_context,
+        const std::vector<z3::expr> &source) const
+    {
+        std::vector<z3::expr> translated;
+        translated.reserve(source.size());
+        for (const z3::expr &expression : source)
+            translated.emplace_back(
                 *context,
                 Z3_translate(
                     static_cast<Z3_context>(source_context),
-                    static_cast<Z3_ast>(constraint),
+                    static_cast<Z3_ast>(expression),
                     static_cast<Z3_context>(*context)));
-        terms.reserve(source_terms.size());
-        for (const z3::expr &term : source_terms)
-            terms.emplace_back(
-                *context,
-                Z3_translate(
-                    static_cast<Z3_context>(source_context),
-                    static_cast<Z3_ast>(term),
-                    static_cast<Z3_context>(*context)));
+        return translated;
     }
 };
 
@@ -393,6 +402,9 @@ public:
     virtual void cancel() {}
 };
 
+// Translation reads Z3 and must run on the thread that owns the source
+// context. Afterwards the worker holds no Z3 state, so check() may run on any
+// thread.
 class BoolectorPartitionWorker final : public NativePartitionWorker
 {
     struct Deadline
@@ -403,7 +415,6 @@ class BoolectorPartitionWorker final : public NativePartitionWorker
     };
 
     Btor *btor_ = nullptr;
-    z3::context &context_;
     unsigned timeout_ms_ = 0;
     bool one_shot_ = false;
     Deadline deadline_;
@@ -469,7 +480,7 @@ class BoolectorPartitionWorker final : public NativePartitionWorker
                  expression.get_sort().is_bv())
         {
             std::string bits = Z3_get_numeral_binary_string(
-                static_cast<Z3_context>(context_), raw);
+                static_cast<Z3_context>(expression.ctx()), raw);
             const unsigned width = expression.get_sort().bv_size();
             if (bits.size() < width)
                 bits.insert(0, width - bits.size(), '0');
@@ -609,31 +620,31 @@ class BoolectorPartitionWorker final : public NativePartitionWorker
                 result = boolector_sext(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0));
                 break;
             case Z3_OP_ZERO_EXT:
                 result = boolector_uext(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0));
                 break;
             case Z3_OP_EXTRACT:
                 result = boolector_slice(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 1));
                 break;
             case Z3_OP_REPEAT:
                 result = boolector_repeat(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0));
                 break;
             case Z3_OP_BREDOR:
@@ -658,14 +669,14 @@ class BoolectorPartitionWorker final : public NativePartitionWorker
                 result = boolector_roli(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0));
                 break;
             case Z3_OP_ROTATE_RIGHT:
                 result = boolector_rori(
                     btor_, args.at(0),
                     Z3_get_decl_int_parameter(
-                        static_cast<Z3_context>(context_),
+                        static_cast<Z3_context>(expression.ctx()),
                         static_cast<Z3_func_decl>(expression.decl()), 0));
                 break;
             case Z3_OP_EXT_ROTATE_LEFT:
@@ -686,7 +697,6 @@ class BoolectorPartitionWorker final : public NativePartitionWorker
 
 public:
     BoolectorPartitionWorker(
-        z3::context &context,
         const std::vector<z3::expr> &constraints,
         const std::vector<z3::expr> &terms,
         unsigned timeout_ms,
@@ -694,7 +704,6 @@ public:
         bool one_shot = false,
         std::optional<unsigned> one_shot_seed = std::nullopt)
         : btor_(boolector_new()),
-          context_(context),
           timeout_ms_(timeout_ms),
           one_shot_(one_shot)
     {
@@ -828,8 +837,7 @@ Result run_native_parallel_partition(
     workers.reserve(options.parallel_workers);
     for (std::size_t i = 0; i < options.parallel_workers; ++i)
         workers.push_back(std::make_unique<BoolectorPartitionWorker>(
-            context, constraints, terms,
-            options.parallel_query_timeout_ms, i));
+            constraints, terms, options.parallel_query_timeout_ms, i));
 
     Result output;
     output.statistics.terms = terms.size();
@@ -1940,7 +1948,7 @@ Result run_global_edge_portfolio(
                     // lossless-QF_BV capability check.
                     task->native_worker =
                         std::make_unique<BoolectorPartitionWorker>(
-                            context, epoch_constraints, terms, 0, i, true,
+                            epoch_constraints, terms, 0, i, true,
                             task->native_seed);
                     task->label = "boolector-direct";
                     task->native_accelerator = true;
@@ -1967,10 +1975,16 @@ Result run_global_edge_portfolio(
                                 std::string(ex.what()));
                 }
             }
+            // The parser witness prints SMT2 from Z3 inside its worker, so it
+            // needs a private context exactly like the Z3 tasks.
             if (!task->native_accelerator)
                 task->state =
                     std::make_unique<ParallelWorkerState>(
                         context, epoch_constraints, terms);
+            else if (task->native_input_witness)
+                task->state =
+                    std::make_unique<ParallelWorkerState>(
+                        context, epoch_constraints, terms, native_inputs);
             task->build_time =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     clk::now() - build_started);
@@ -2012,28 +2026,34 @@ Result run_global_edge_portfolio(
         std::deque<std::size_t> completed;
         const unsigned epoch_seed = static_cast<unsigned>(
             output.statistics.parallel_rounds);
+        const unsigned seed_stride =
+            static_cast<unsigned>(options.parallel_workers);
+        const unsigned query_timeout_ms = options.parallel_query_timeout_ms;
         for (std::size_t i = 0; i < tasks.size(); ++i)
         {
             EpochTask *task = tasks[i].get();
-            task->thread = std::thread([&, i, task] {
+            // This thread keeps using `context` (e.g. witness validation)
+            // while the workers run, so workers capture only task-owned state
+            // and must never reach the shared terms or constraints.
+            task->thread = std::thread([i, task, epoch_seed, seed_stride,
+                                        query_timeout_ms, &completion_mutex,
+                                        &completed, &completion_cv] {
                 const auto task_started = clk::now();
                 if (task->native_input_witness)
                     task->result =
                         run_boolector_parser_global_witness(
-                            epoch_constraints, native_inputs, task->edges,
-                            terms, 0, task->native_seed,
-                            &task->cancel_requested);
+                            task->state->constraints, task->state->inputs,
+                            task->edges, task->state->terms, 0,
+                            task->native_seed, &task->cancel_requested);
                 else if (task->native_accelerator)
                     task->result =
                         task->native_worker->check(task->edges);
                 else
                     task->result = run_parallel_group_query(
                         *task->state, task->edges,
-                        epoch_seed * static_cast<unsigned>(
-                                         options.parallel_workers) +
+                        epoch_seed * seed_stride +
                             static_cast<unsigned>(i) + 1,
-                        options.parallel_query_timeout_ms,
-                        &task->cancel_requested);
+                        query_timeout_ms, &task->cancel_requested);
                 if (task->cancel_requested.load() &&
                     task->result.outcome ==
                         ParallelQueryOutcome::Unknown)
@@ -2638,7 +2658,7 @@ Result run_parallel_bpr(
                 fallback_used[i] = true;
                 fallback_workers[i] =
                     std::make_unique<BoolectorPartitionWorker>(
-                        context, constraints, terms,
+                        constraints, terms,
                         options.parallel_query_timeout_ms, i);
             }
             for (std::size_t i = 0; i < assignments.size(); ++i)
@@ -3779,8 +3799,8 @@ NativeSingletonValidationResult run_native_bv1_singleton_queries(
             const std::vector<z3::expr> query_terms{
                 source_candidates[begin + offset], zero};
             batch.push_back(std::make_unique<BoolectorPartitionWorker>(
-                source_context, source_constraints, query_terms,
-                timeout_ms, begin + offset, true));
+                source_constraints, query_terms, timeout_ms,
+                begin + offset, true));
         }
 
         std::vector<ParallelQueryResult> results(count);
