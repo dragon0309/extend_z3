@@ -1,0 +1,11 @@
+# Build outputs and dependencies (rebuildable)
+/.build/
+/bin/
+/.deps/
+/z3/
+/config.local.mk
+
+# Run outputs
+*.log
+__pycache__/
+/logs/
