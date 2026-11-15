@@ -75,6 +75,7 @@ struct Summary
     std::size_t self_max_rss_kb = 0;
     std::string eqmod_summary;
     z3::check_result result = z3::unknown;
+    std::string unknown_reason;
 };
 
 void print_value_row(

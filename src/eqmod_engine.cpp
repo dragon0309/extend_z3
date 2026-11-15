@@ -263,6 +263,15 @@ bool EqmodEngine::same_poly(poly lhs, poly rhs, ring current_ring)
     return util::singular::poly_equal(lhs, rhs, current_ring);
 }
 
+bool EqmodEngine::mentions_opaque_symbol(poly value, ring current_ring) const
+{
+    for (poly term = value; term != nullptr; term = pNext(term))
+        for (const int variable : m_opaque_ring_vars)
+            if (p_GetExp(term, variable, current_ring) != 0)
+                return true;
+    return false;
+}
+
 std::string EqmodEngine::render_summary(bool final_validation_enabled) const
 {
     const std::string status =
@@ -401,6 +410,8 @@ bool EqmodEngine::lower_atom(
     if (!valid)
     {
         ++m_eqmod_invalid_atoms.at(family);
+        m_uninterpreted_eqmod_atoms.emplace_back(
+            atom, label + " kept as UF (" + incomplete_reason + ")");
         m_eqmod_incomplete_reasons.at(family).push_back(
             std::move(incomplete_reason));
         m_semantic_validation_incomplete = true;

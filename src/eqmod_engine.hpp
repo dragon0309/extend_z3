@@ -19,6 +19,21 @@
 namespace eqmod
 {
 
+// Number of moduli of an eqP (0) or eqmodPk (k) application; -1 otherwise.
+int semantic_atom_moduli(const z3::expr &e);
+
+// Outcome of checking a sat answer's model against what the eqP and eqmod
+// atoms mean; see EqmodEngine::check_model.
+struct ModelCheckResult
+{
+    bool verified = false;
+    std::size_t atoms = 0;
+    // Why the model was not verified; when it was, a note on atoms whose
+    // model truth was wrong although the assertions hold with their actual
+    // truth.
+    std::string reason;
+};
+
 // Lowered representation shared by the runtime EqmodEngine and the
 // PolyPropagator callback adapter. Singular polynomial fields are owned by the
 // containing engine and must be released with destroy().
@@ -225,6 +240,15 @@ protected:
     std::vector<std::vector<std::string>> m_eqmod_incomplete_reasons =
         std::vector<std::vector<std::string>>(5);
     bool m_semantic_validation_incomplete = false;
+    // Atoms that could not be lowered stay uninterpreted; each entry keeps a
+    // description for the verdict when one of them is assigned.
+    std::vector<std::pair<z3::expr, std::string>> m_uninterpreted_eqmod_atoms;
+    // What the latest final round left unchecked. Z3 answers sat right after
+    // a final round without conflict, so a sat answer is verified only when
+    // this list is empty.
+    std::vector<std::string> m_final_round_unverified;
+    // Ring variables of the opaque (Poly Int) symbols.
+    std::vector<int> m_opaque_ring_vars;
     std::size_t m_eqmod_all_false_conflicts = 0;
     std::size_t m_eqmod_unit_conflicts = 0;
     std::size_t m_eqmod_mixed_conflicts = 0;
@@ -246,6 +270,7 @@ protected:
     void reset_after_pop(bool live_equality_enabled);
     void record_membership(unsigned family, bool member);
     static bool same_poly(poly lhs, poly rhs, ring current_ring);
+    bool mentions_opaque_symbol(poly value, ring current_ring) const;
     std::string render_summary(bool final_validation_enabled) const;
     bool is_compiled(const z3::expr &atom) const;
     void register_slot(const z3::expr &atom, unsigned family,
@@ -281,6 +306,14 @@ protected:
     void check_cross_family_eqmod_refutations(bool force = false);
     void propagate_eqmod_true_lemmas_from_context(bool force = false);
     bool final_fixed_value_check_all_eqmods();
+    ModelCheckResult check_model(
+        const z3::model &candidate,
+        const z3::expr_vector &assertions,
+        const util::singular::lowering::IndetEnv &indets,
+        const std::vector<std::string> &indet_ring_names,
+        const util::singular::lowering::RingEnv &ring_environment,
+        const util::singular::lowering::CoeffVarMap &coefficients,
+        int coefficient_count);
     bool conflict_on_propagated_eqmod_truth();
     bool conflict_on_propagated_p1_truth();
     bool conflict_on_propagated_p2_truth();

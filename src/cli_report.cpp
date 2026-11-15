@@ -155,6 +155,8 @@ void print_summary(
         print_value_row(output, "eqmod semantic status:", summary.eqmod_summary);
     begin_timed_row(output, "Verification result:");
     finish_timed_row(output, result_name(summary.result), summary.total_time);
+    if (summary.result == z3::unknown && !summary.unknown_reason.empty())
+        print_value_row(output, "Reason unknown:", summary.unknown_reason);
     if (show_model && !terminal_model.empty())
         output << "\n" << terminal_model;
     output.flush();
