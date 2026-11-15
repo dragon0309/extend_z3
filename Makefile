@@ -30,6 +30,7 @@ MAIN_SRCS := \
 	src/util/implied_eq_partition_refiner.cpp \
 	src/util/implied_eq_partition_variants.cpp \
 	src/util/implied_eq_partition_prepass.cpp \
+	src/util/pconst_purification.cpp \
 	src/util/rewrite.cpp \
 	src/util/ideal_rewrite.cpp \
 	src/util/singular_dump.cpp \
