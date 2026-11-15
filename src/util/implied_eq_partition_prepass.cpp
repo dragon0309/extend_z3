@@ -12,6 +12,7 @@
 #include "util/auto_zero_lemmas.hpp"
 #include <unordered_set>
 
+#include "util/bv_to_int.hpp"
 #include "util/fmt_duration.hpp"
 #include "util/logger.hpp"
 
@@ -20,26 +21,11 @@ namespace util::eqpartition
 namespace
 {
 
-bool is_bv_to_int_app(const z3::expr &expression)
-{
-    if (!expression.is_app() || !expression.get_sort().is_int() ||
-        expression.num_args() != 1 ||
-        !expression.arg(0).get_sort().is_bv())
-        return false;
-    if (expression.decl().decl_kind() == Z3_OP_BV2INT)
-        return true;
-    const std::string name = expression.decl().name().str();
-    return name == "ubv_to_int" || name == "sbv_to_int" ||
-           name == "bv2nat" || name == "bv2int";
-}
-
+// Both interpreted conversions map the zero bit-vector to 0.
 bool is_semantic_bv_to_int_decl(
     z3::context &context, Z3_func_decl raw)
 {
-    if (!raw)
-        return false;
-    const z3::func_decl declaration(context, raw);
-    return declaration.decl_kind() == Z3_OP_BV2INT;
+    return raw && is_interpreted_bv_to_int(z3::func_decl(context, raw));
 }
 
 bool is_bv_zero_numeral(const z3::expr &expression)
@@ -310,6 +296,53 @@ PrepassResult run_eqp_prepass(
         output.bv1_zero_anchor_added ? 1 : 0;
     output.terms = output.original_terms + output.anchor_terms;
 
+    // Group 0 holds the terms read unsigned and group 1 those read signed, so
+    // a term is only ever compared with terms read the same way.
+    std::vector<unsigned> view_groups;
+    if (prepass_options.split_by_view)
+    {
+        std::string together;
+        if (prepass_options.lift_casts)
+            together = "lift-casts needs equalities across the views";
+        for (std::size_t i = 0; together.empty() && i < term_infos.size(); ++i)
+        {
+            const TermInfo &info = term_infos[i];
+            if (is_bv_zero_numeral(info.term))
+            {
+                view_groups.push_back(0);
+                continue;
+            }
+            if (info.conversions.size() != 1 ||
+                !is_semantic_bv_to_int_decl(context, info.conversions.front()))
+            {
+                together = "a term does not have exactly one interpreted "
+                           "conversion: " +
+                           info.term.to_string();
+                break;
+            }
+            const bool read_signed =
+                z3::func_decl(context, info.conversions.front())
+                    .decl_kind() == Z3_OP_SBV2INT;
+            if (read_signed && info.term.get_sort().bv_size() == 1)
+            {
+                together = "a 1-bit term is read signed: " +
+                           info.term.to_string();
+                break;
+            }
+            view_groups.push_back(read_signed ? 1u : 0u);
+        }
+        if (!together.empty())
+        {
+            view_groups.clear();
+            if (log)
+                LOG_INFO(*log, "eqpartition",
+                         "partition prepass keeps signed and unsigned terms "
+                         "together: " +
+                             together);
+        }
+    }
+    output.split_by_view = !view_groups.empty();
+
     if (log)
     {
         LOG_INFO(*log, "eqpartition",
@@ -318,7 +351,9 @@ PrepassResult run_eqp_prepass(
                      " terms=" + std::to_string(output.terms) +
                      " partition-terms=" + std::to_string(terms.size()) +
                      " bv1-zero-candidates=" +
-                     std::to_string(bv1_term_infos.size()));
+                     std::to_string(bv1_term_infos.size()) +
+                     " split-by-view=" +
+                     (output.split_by_view ? "true" : "false"));
         log->flush();
     }
 
@@ -415,6 +450,7 @@ PrepassResult run_eqp_prepass(
             prepass_options.parallel_fallback;
         variant_options.parallel_final_global_validation =
             prepass_options.parallel_final_global_validation;
+        variant_options.initial_groups = view_groups;
         selected_result = run_variant(
             context, constraints, terms,
             *prepass_options.experimental_variant,
@@ -425,6 +461,7 @@ PrepassResult run_eqp_prepass(
         Options options;
         options.timeout_ms = 0;
         options.start_async = false;
+        options.initial_groups = view_groups;
         ImpliedEqualityPartitionRefiner refiner(
             context, constraints, terms, options, log);
         selected_result = refiner.wait();
@@ -580,6 +617,12 @@ PrepassResult run_eqp_prepass(
                           : "proof-forest") +
                      " injected-eqps=" +
                      std::to_string(output.injected_eqps) +
+                     " cross-view-edges=" +
+                     std::to_string(output.cross_view_edges) +
+                     " cross-view-lifted=" +
+                     std::to_string(output.cross_view_lifted) +
+                     " split-by-view=" +
+                     (output.split_by_view ? "true" : "false") +
                      " check-time=" +
                      util::fmt_duration(stats.check_time) +
                      " elapsed=" + util::fmt_duration(stats.elapsed));
@@ -594,13 +637,6 @@ PrepassResult run_eqp_prepass(
         log_summary();
         return output;
     }
-
-    const std::size_t expected_partition_injections =
-        prepass_options.inject_all_pairs
-            ? result.statistics.implied_pairs
-            : result.proof_edges.size();
-    const std::size_t expected_injections =
-        expected_partition_injections;
 
     if (output.bv1_zero_count != 0)
     {
@@ -642,7 +678,145 @@ PrepassResult run_eqp_prepass(
         }
     }
 
-    if (expected_injections != 0 &&
+    // An equality a = b between BV terms lifts to f(a) = f(b) only through a
+    // conversion f that both terms use; sbv_to_int(a) = ubv_to_int(b) does
+    // not follow. Each conversion (view) therefore gets its own spanning
+    // forest, or all pairs, over the class members that use it, and the zero
+    // anchor joins every interpreted view.
+    struct Injection
+    {
+        std::size_t lhs;
+        std::size_t rhs;
+        Z3_func_decl conversion;
+        // lhs is read signed and rhs unsigned:
+        // sbv(lhs) = ubv(rhs) - 2^n * msb(rhs).
+        bool through_msb = false;
+    };
+    std::vector<Injection> injections;
+    for (const auto &block : result.classes)
+    {
+        if (block.size() < 2)
+            continue;
+        std::optional<std::size_t> zero;
+        std::vector<Z3_func_decl> views;
+        for (const std::size_t index : block)
+        {
+            if (is_bv_zero_numeral(terms.at(index)))
+            {
+                zero = index;
+                continue;
+            }
+            for (const Z3_func_decl conversion : term_infos.at(index).conversions)
+                if (std::find(views.begin(), views.end(), conversion) == views.end())
+                    views.push_back(conversion);
+        }
+        for (const Z3_func_decl view : views)
+        {
+            const bool with_zero =
+                zero && is_semantic_bv_to_int_decl(context, view);
+            std::vector<std::size_t> members;
+            for (const std::size_t index : block)
+            {
+                const auto &conversions = term_infos.at(index).conversions;
+                if (index == zero
+                        ? with_zero
+                        : std::find(conversions.begin(), conversions.end(),
+                                    view) != conversions.end())
+                    members.push_back(index);
+            }
+            if (prepass_options.inject_all_pairs)
+            {
+                for (std::size_t i = 0; i < members.size(); ++i)
+                    for (std::size_t j = i + 1; j < members.size(); ++j)
+                        injections.push_back({members[i], members[j], view});
+            }
+            else
+            {
+                // Equality transitivity derives every omitted pair, while
+                // avoiding quadratic eqP assertions and native propagations.
+                const std::size_t anchor = with_zero ? *zero : members.front();
+                for (const std::size_t index : members)
+                    if (index != anchor)
+                        injections.push_back({anchor, index, view});
+            }
+        }
+    }
+
+    // A proof edge whose terms share no view, typically a cast from an
+    // unsigned to a signed name, still relates the signed view of one term to
+    // the unsigned view of the other through the top bit.
+    // --eq-gb-partition-prepass-lift-casts states that relation per class:
+    // each unsigned member against one signed member, through its own top
+    // bit, which covers every cross-view pair whatever edges the forest has.
+    auto view_of_kind = [&](const std::vector<Z3_func_decl> &views,
+                            Z3_decl_kind kind) -> Z3_func_decl
+    {
+        for (const Z3_func_decl view : views)
+            if (z3::func_decl(context, view).decl_kind() == kind)
+                return view;
+        return nullptr;
+    };
+    for (const auto &[lhs_index, rhs_index] : result.proof_edges)
+    {
+        // Every member of a zero class has an interpreted view (checked above).
+        if (is_bv_zero_numeral(terms.at(lhs_index)) ||
+            is_bv_zero_numeral(terms.at(rhs_index)))
+            continue;
+        const auto &lhs_views = term_infos.at(lhs_index).conversions;
+        const auto &rhs_views = term_infos.at(rhs_index).conversions;
+        if (std::any_of(lhs_views.begin(), lhs_views.end(),
+                        [&](const Z3_func_decl view) {
+                            return std::find(rhs_views.begin(), rhs_views.end(),
+                                             view) != rhs_views.end();
+                        }))
+            continue;
+        ++output.cross_view_edges;
+    }
+    if (prepass_options.lift_casts)
+    {
+        for (const auto &block : result.classes)
+        {
+            std::optional<std::size_t> signed_anchor;
+            Z3_func_decl signed_view = nullptr;
+            for (const std::size_t index : block)
+            {
+                if (is_bv_zero_numeral(terms.at(index)))
+                    continue;
+                signed_view = view_of_kind(term_infos.at(index).conversions,
+                                           Z3_OP_SBV2INT);
+                if (signed_view)
+                {
+                    signed_anchor = index;
+                    break;
+                }
+            }
+            if (!signed_anchor)
+                continue;
+            for (const std::size_t index : block)
+            {
+                if (index == *signed_anchor ||
+                    is_bv_zero_numeral(terms.at(index)) ||
+                    !view_of_kind(term_infos.at(index).conversions,
+                                  Z3_OP_BV2INT))
+                    continue;
+                injections.push_back({*signed_anchor, index, signed_view, true});
+                ++output.cross_view_lifted;
+            }
+        }
+    }
+
+    // An input with only eqmod atoms never applies eqP; declare it with the
+    // prelude's signature, which yields the same declaration.
+    std::optional<z3::func_decl> declared_eqp;
+    if (!injections.empty() && injection_decls.pconst && !injection_decls.eqp)
+    {
+        const z3::sort poly =
+            z3::func_decl(context, injection_decls.pconst).range();
+        declared_eqp = context.function("eqP", poly, poly, context.bool_sort());
+        injection_decls.eqp = static_cast<Z3_func_decl>(*declared_eqp);
+    }
+
+    if (!injections.empty() &&
         (!injection_decls.pconst || !injection_decls.eqp))
         throw std::runtime_error(
             "partition equality prepass proved equalities but cannot find "
@@ -669,25 +843,16 @@ PrepassResult run_eqp_prepass(
         }
     }
 
-    auto inject_terms = [&](const TermInfo &lhs, const TermInfo &rhs)
+    auto inject_terms = [&](const TermInfo &lhs, const TermInfo &rhs,
+                            const Z3_func_decl selected_conversion,
+                            bool through_msb)
     {
-        if (lhs.conversions.empty())
-            throw std::runtime_error(
-                "partition equality prepass term has no BV-to-Int conversion");
-
-        auto selected_conversion = lhs.conversions.begin();
-        if (is_bv_zero_numeral(rhs.term))
-            selected_conversion = std::find_if(
-                lhs.conversions.begin(), lhs.conversions.end(),
-                [&](const Z3_func_decl candidate) {
-                    return is_semantic_bv_to_int_decl(
-                        context, candidate);
-                });
-        if (selected_conversion == lhs.conversions.end())
+        if (is_bv_zero_numeral(rhs.term) &&
+            !is_semantic_bv_to_int_decl(context, selected_conversion))
             throw std::runtime_error(
                 "partition equality prepass cannot map zero through an "
                 "uninterpreted conversion");
-        z3::func_decl conversion(context, *selected_conversion);
+        z3::func_decl conversion(context, selected_conversion);
         if (conversion.arity() != 1 ||
             !z3::eq(conversion.domain(0), rhs.term.get_sort()))
             throw std::runtime_error(
@@ -697,9 +862,10 @@ PrepassResult run_eqp_prepass(
         const z3::expr lhs_int = is_bv_zero_numeral(lhs.term)
                                      ? context.int_val(0)
                                      : conversion(lhs.term);
-        const z3::expr rhs_int = is_bv_zero_numeral(rhs.term)
-                                     ? context.int_val(0)
-                                     : conversion(rhs.term);
+        const z3::expr rhs_int =
+            is_bv_zero_numeral(rhs.term) ? context.int_val(0)
+            : through_msb                ? signed_through_unsigned(rhs.term)
+                                         : conversion(rhs.term);
         const z3::expr lhs_poly =
             apply_decl(context, injection_decls.pconst, {lhs_int});
         const z3::expr rhs_poly =
@@ -714,7 +880,6 @@ PrepassResult run_eqp_prepass(
         output.assertions.push_back(eqp);
         output.equalities.emplace_back(lhs.term.to_string(),
                                        rhs.term.to_string());
-        output.native_equalities.emplace_back(lhs.term, rhs.term);
         if (log)
             LOG_INFO(*log, "eqpartition",
                      "partition prepass injected equality: " +
@@ -723,47 +888,55 @@ PrepassResult run_eqp_prepass(
                          compact(eqp.to_string()));
     };
 
-    auto inject_pair = [&](std::size_t lhs_index, std::size_t rhs_index)
+    for (const Injection &injection : injections)
     {
-        if (lhs_index >= term_infos.size() || rhs_index >= term_infos.size())
+        if (injection.lhs >= term_infos.size() ||
+            injection.rhs >= term_infos.size())
             throw std::runtime_error(
                 "partition equality prepass received an invalid equality pair");
-        const TermInfo *lhs = &term_infos[lhs_index];
-        const TermInfo *rhs = &term_infos[rhs_index];
+        const TermInfo *lhs = &term_infos[injection.lhs];
+        const TermInfo *rhs = &term_infos[injection.rhs];
         if (is_bv_zero_numeral(lhs->term) &&
             !is_bv_zero_numeral(rhs->term))
             std::swap(lhs, rhs);
-        inject_terms(*lhs, *rhs);
-    };
+        inject_terms(*lhs, *rhs, injection.conversion, injection.through_msb);
+    }
 
+    // A proved BV equality holds whatever view lifts it, so the native side
+    // keeps one equality per proof edge (or implied pair), views aside.
+    auto add_native = [&](std::size_t lhs_index, std::size_t rhs_index)
+    {
+        const z3::expr *lhs = &term_infos.at(lhs_index).term;
+        const z3::expr *rhs = &term_infos.at(rhs_index).term;
+        if (is_bv_zero_numeral(*lhs) && !is_bv_zero_numeral(*rhs))
+            std::swap(lhs, rhs);
+        output.native_equalities.emplace_back(*lhs, *rhs);
+    };
     if (prepass_options.inject_all_pairs)
     {
         for (const auto &block : result.classes)
             for (std::size_t i = 0; i < block.size(); ++i)
                 for (std::size_t j = i + 1; j < block.size(); ++j)
-                    inject_pair(block[i], block[j]);
+                    add_native(block[i], block[j]);
     }
     else
     {
-        // A connected spanning forest represents every equality class:
-        // equality transitivity derives every omitted pair, while avoiding
-        // quadratic eqP assertions and native equality propagations.
         for (const auto &[lhs_index, rhs_index] : result.proof_edges)
-            inject_pair(lhs_index, rhs_index);
+            add_native(lhs_index, rhs_index);
     }
 
     output.injected_eqps = output.assertions.size();
     if (result.proof_edges.size() != result.statistics.proof_edges)
         throw std::runtime_error(
             "partition equality prepass proof-edge statistic is inconsistent");
-    if (output.injected_eqps != expected_injections)
+    if (output.injected_eqps != injections.size())
         throw std::runtime_error(
-            prepass_options.inject_all_pairs
-                ? "partition equality prepass did not inject every implied pair"
-                : "partition equality prepass did not inject every proof edge");
-    if (output.native_equalities.size() != output.injected_eqps)
+            "partition equality prepass did not inject every planned equality");
+    if (output.native_equalities.size() !=
+        (prepass_options.inject_all_pairs ? result.statistics.implied_pairs
+                                          : result.proof_edges.size()))
         throw std::runtime_error(
-            "partition equality prepass did not retain every native injection edge");
+            "partition equality prepass did not retain every native proof edge");
 
     log_summary();
     return output;

@@ -27,11 +27,17 @@ std::string sort_key(const z3::expr &term)
 }
 
 std::vector<std::vector<std::size_t>> initial_partition(
-    const std::vector<z3::expr> &terms)
+    const std::vector<z3::expr> &terms,
+    const std::vector<unsigned> &groups)
 {
-    std::map<std::string, std::vector<std::size_t>> by_sort;
+    if (!groups.empty() && groups.size() != terms.size())
+        throw std::runtime_error(
+            "initial partition groups do not match the terms");
+    std::map<std::pair<std::string, unsigned>, std::vector<std::size_t>>
+        by_sort;
     for (std::size_t i = 0; i < terms.size(); ++i)
-        by_sort[sort_key(terms[i])].push_back(i);
+        by_sort[{sort_key(terms[i]), groups.empty() ? 0u : groups[i]}]
+            .push_back(i);
 
     std::vector<std::vector<std::size_t>> blocks;
     blocks.reserve(by_sort.size());
@@ -126,7 +132,7 @@ struct ImpliedEqualityPartitionRefiner::Impl
         try
         {
             std::vector<std::vector<std::size_t>> blocks =
-                initial_partition(terms);
+                initial_partition(terms, options.initial_groups);
             output.statistics.terms = terms.size();
             output.statistics.initial_blocks = blocks.size();
 

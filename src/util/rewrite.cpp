@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "util/bv_to_int.hpp"
 #include "util/fmt_duration.hpp"
 #include "util/logger.hpp"
 #include "util/singular_dump.hpp"
@@ -211,22 +212,10 @@ namespace
         return true;
     }
 
-    bool is_bv_to_int_app(const z3::expr &e)
-    {
-        if (!e.is_app() || !e.get_sort().is_int() || e.num_args() != 1 || !e.arg(0).get_sort().is_bv())
-            return false;
-#ifdef Z3_OP_BV2INT
-        if (e.decl().decl_kind() == Z3_OP_BV2INT)
-            return true;
-#endif
-        const std::string n = e.decl().name().str();
-        return n == "ubv_to_int" || n == "sbv_to_int" || n == "bv2nat" || n == "bv2int";
-    }
-
     bool is_int_atom(const expr &e)
     {
         return e.get_sort().is_int() &&
-               ((e.is_const() && !e.is_numeral()) || is_bv_to_int_app(e));
+               ((e.is_const() && !e.is_numeral()) || util::is_bv_to_int_app(e));
     }
 
     struct PolyDecls
@@ -3278,6 +3267,241 @@ namespace
         return e.is_bool() && e.is_true();
     }
 
+    // Z3's bv_rewriter unconditionally rewrites sbv_to_int(x) into
+    // ite(0 <=s x, ubv_to_int(x), ubv_to_int(x) - 2^n), which polynomial
+    // lowering cannot read, and this module simplifies throughout. Signed
+    // conversions are therefore replaced by fresh Int constants while
+    // rewriting and restored before any result leaves the module.
+    class SignedConversionFreeze
+    {
+    public:
+        explicit SignedConversionFreeze(context &ctx)
+            : m_ctx(ctx), m_conversions(ctx), m_constants(ctx)
+        {
+        }
+
+        void collect(const expr &e)
+        {
+            std::vector<expr> pending{e};
+            while (!pending.empty())
+            {
+                const expr current = pending.back();
+                pending.pop_back();
+                if (!current.is_app() || !m_visited.insert((Z3_ast)current).second)
+                    continue;
+                // A ground argument simplifies to a numeral, so the conversion
+                // becomes an Int numeral, which lowers.
+                if (util::bv_to_int_kind(current) == util::BvToIntKind::Signed &&
+                    !is_ground(current.arg(0)))
+                {
+                    const std::string prefix =
+                        "sbv_to_int!" + (current.arg(0).is_const()
+                                             ? current.arg(0).decl().name().str()
+                                             : std::string("term"));
+                    expr constant(m_ctx, Z3_mk_fresh_const(m_ctx, prefix.c_str(),
+                                                           m_ctx.int_sort()));
+                    m_conversion_index.emplace((Z3_ast)current, m_conversions.size());
+                    m_constant_index.emplace((Z3_ast)constant, m_constants.size());
+                    m_conversions.push_back(current);
+                    m_constants.push_back(constant);
+                    continue;
+                }
+                for (unsigned i = 0; i < current.num_args(); ++i)
+                    pending.push_back(current.arg(i));
+            }
+        }
+
+        void collect(const RewriteRule &rule)
+        {
+            collect(rule.lhs);
+            collect(rule.rhs);
+            collect(rule.source_generator);
+        }
+
+        std::size_t size() const { return m_conversions.size(); }
+
+        const expr_vector &conversions() const { return m_conversions; }
+
+        bool is_conversion_constant(const expr &e) const
+        {
+            return m_constant_index.count((Z3_ast)e) != 0;
+        }
+
+        expr freeze(const expr &e)
+        {
+            return replace(e, m_conversion_index, m_constants, m_freeze_cache);
+        }
+
+        expr thaw(const expr &e)
+        {
+            return replace(e, m_constant_index, m_conversions, m_thaw_cache);
+        }
+
+        RewriteRule freeze(const RewriteRule &rule) { return mapped(rule, true); }
+
+        void thaw(RewriteResult &result)
+        {
+            if (m_conversions.empty())
+                return;
+            for (std::vector<expr> *values :
+                 {&result.residual_generators, &result.asserts,
+                  &result.residual_assertions, &result.native_coefficient_bindings})
+                for (expr &value : *values)
+                    value = thaw(value);
+            result.rewritten_target = thaw(result.rewritten_target);
+            for (RewriteRule &rule : result.rules_used)
+                rule = mapped(rule, false);
+            // result.rewrite_rules keeps the frozen names: it only feeds the
+            // substitution log written inside this module.
+
+            // A frozen constant left behind would reach the solver as an
+            // unconstrained Int.
+            std::unordered_set<Z3_ast> seen;
+            std::vector<expr> pending;
+            for (const std::vector<expr> *values :
+                 {&result.residual_generators, &result.asserts,
+                  &result.residual_assertions, &result.native_coefficient_bindings})
+                pending.insert(pending.end(), values->begin(), values->end());
+            pending.push_back(result.rewritten_target);
+            while (!pending.empty())
+            {
+                const expr current = pending.back();
+                pending.pop_back();
+                if (!seen.insert((Z3_ast)current).second)
+                    continue;
+                if (is_conversion_constant(current))
+                    throw std::runtime_error(
+                        "rewrite left the frozen sbv_to_int constant " +
+                        current.to_string() + " in its result");
+                if (current.is_quantifier())
+                    pending.push_back(current.body());
+                else if (current.is_app())
+                    for (unsigned i = 0; i < current.num_args(); ++i)
+                        pending.push_back(current.arg(i));
+            }
+        }
+
+    private:
+        // No uninterpreted symbol and no bound variable, so Z3 folds the term.
+        static bool is_ground(const expr &e)
+        {
+            std::unordered_set<Z3_ast> seen;
+            std::vector<expr> pending{e};
+            while (!pending.empty())
+            {
+                const expr current = pending.back();
+                pending.pop_back();
+                if (!seen.insert((Z3_ast)current).second)
+                    continue;
+                if (!current.is_app() ||
+                    current.decl().decl_kind() == Z3_OP_UNINTERPRETED)
+                    return false;
+                for (unsigned i = 0; i < current.num_args(); ++i)
+                    pending.push_back(current.arg(i));
+            }
+            return true;
+        }
+
+        // Keeps the source term alive so a recycled AST address cannot hit a
+        // stale entry.
+        struct Rebuilt
+        {
+            expr source;
+            expr result;
+        };
+
+        // Z3_substitute rebuilds its replacement table and cache on every
+        // call; results hold thousands of expressions over the same terms,
+        // so the cache here is shared by every call in one direction.
+        expr replace(const expr &e,
+                     const std::unordered_map<Z3_ast, std::size_t> &index,
+                     const expr_vector &targets,
+                     std::unordered_map<Z3_ast, Rebuilt> &cache)
+        {
+            if (index.empty())
+                return e;
+            std::vector<std::pair<expr, bool>> pending{{e, false}};
+            while (!pending.empty())
+            {
+                const auto [current, args_ready] = pending.back();
+                pending.pop_back();
+                const Z3_ast key = current;
+                if (cache.count(key) != 0)
+                    continue;
+                const auto found = index.find(key);
+                if (found != index.end())
+                {
+                    cache.emplace(key, Rebuilt{current, targets[found->second]});
+                    continue;
+                }
+                // Rewriting may substitute a frozen constant into a quantifier
+                // body, so the body is mapped too; the constants and the
+                // conversions they stand for contain no bound variables.
+                if (current.is_quantifier())
+                {
+                    const expr body = current.body();
+                    if (!args_ready)
+                    {
+                        pending.emplace_back(current, true);
+                        pending.emplace_back(body, false);
+                        continue;
+                    }
+                    const expr &rebuilt = cache.at((Z3_ast)body).result;
+                    Z3_ast rebuilt_body = rebuilt;
+                    cache.emplace(
+                        key, Rebuilt{current,
+                                     z3::eq(rebuilt, body)
+                                         ? current
+                                         : expr(m_ctx, Z3_update_term(m_ctx, current, 1,
+                                                                      &rebuilt_body))});
+                    continue;
+                }
+                if (!current.is_app() || current.num_args() == 0)
+                {
+                    cache.emplace(key, Rebuilt{current, current});
+                    continue;
+                }
+                if (!args_ready)
+                {
+                    pending.emplace_back(current, true);
+                    for (unsigned i = 0; i < current.num_args(); ++i)
+                        pending.emplace_back(current.arg(i), false);
+                    continue;
+                }
+                expr_vector args(m_ctx);
+                bool changed = false;
+                for (unsigned i = 0; i < current.num_args(); ++i)
+                {
+                    const expr arg = current.arg(i);
+                    const expr &rebuilt = cache.at((Z3_ast)arg).result;
+                    changed = changed || !z3::eq(rebuilt, arg);
+                    args.push_back(rebuilt);
+                }
+                cache.emplace(key, Rebuilt{current, changed ? current.decl()(args) : current});
+            }
+            return cache.at((Z3_ast)e).result;
+        }
+
+        RewriteRule mapped(RewriteRule rule, bool freezing)
+        {
+            auto map = [&](const expr &e) { return freezing ? freeze(e) : thaw(e); };
+            rule.lhs = map(rule.lhs);
+            rule.rhs = map(rule.rhs);
+            rule.source_generator = map(rule.source_generator);
+            rule.rhs_dependencies = collect_sorted_vars(rule.rhs);
+            return rule;
+        }
+
+        context &m_ctx;
+        expr_vector m_conversions;
+        expr_vector m_constants;
+        std::unordered_map<Z3_ast, std::size_t> m_conversion_index;
+        std::unordered_map<Z3_ast, std::size_t> m_constant_index;
+        std::unordered_set<Z3_ast> m_visited;
+        std::unordered_map<Z3_ast, Rebuilt> m_freeze_cache;
+        std::unordered_map<Z3_ast, Rebuilt> m_thaw_cache;
+    };
+
     void collect_native_int_terms(const expr &e,
                                   std::unordered_set<Z3_ast> &terms,
                                   std::unordered_set<Z3_ast> &visited,
@@ -3301,11 +3525,18 @@ namespace
 
     void preserve_native_coefficient_bindings(const std::vector<expr> &input,
                                               const PolyDecls &d,
+                                              const SignedConversionFreeze &freeze,
                                               AssertionRewriteResult &result)
     {
         std::unordered_set<Z3_ast> needed, visited;
         for (const expr &a : input)
             collect_native_int_terms(a, needed, visited, true);
+        // Rewriting never looks inside a frozen conversion, so every Int term
+        // there keeps its native meaning, a Poly coefficient included.
+        std::unordered_set<Z3_ast> frozen_visited;
+        for (const expr &conversion : freeze.conversions())
+            collect_native_int_terms(conversion.arg(0), needed, frozen_visited,
+                                     false);
 
         // A BV conversion is not a freely eliminable integer variable, even
         // when it only occurs as a coefficient (its finite range still applies).
@@ -3319,7 +3550,8 @@ namespace
                 continue;
             left.push_back(lhs);
             right.push_back(rhs);
-            if (!(lhs.is_const() && !lhs.is_numeral()))
+            if (!(lhs.is_const() && !lhs.is_numeral()) ||
+                freeze.is_conversion_constant(lhs))
                 needed.insert((Z3_ast)lhs);
         }
 
@@ -3362,10 +3594,12 @@ namespace
 
 } // namespace
 
-RewriteResult run_rewriting_pipeline(z3::context &ctx,
-                                     const std::vector<z3::expr> &input_asserts,
-                                     const RewriteOptions &option,
-                                     util::Logger &log)
+static RewriteResult run_rewriting_pipeline_frozen(
+    z3::context &ctx,
+    const std::vector<z3::expr> &input_asserts,
+    const RewriteOptions &option,
+    util::Logger &log,
+    const SignedConversionFreeze &freeze)
 {
     const auto rewrite_t0 = std::chrono::steady_clock::now();
     std::chrono::nanoseconds pre_scan_time{0};
@@ -3439,7 +3673,7 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     AssertionRewriteTiming assertion_timing;
     phase_t0 = std::chrono::steady_clock::now();
     AssertionRewriteResult unified = try_dag_rewrite(input_asserts, d, options, &assertion_timing);
-    preserve_native_coefficient_bindings(input_asserts, d, unified);
+    preserve_native_coefficient_bindings(input_asserts, d, freeze, unified);
     if (options.rewrite_log)
     {
         *options.rewrite_log << "\n[native coefficient bindings]\n";
@@ -3551,18 +3785,54 @@ RewriteResult run_rewriting_pipeline(z3::context &ctx,
     return out;
 }
 
+RewriteResult run_rewriting_pipeline(z3::context &ctx,
+                                     const std::vector<z3::expr> &input_asserts,
+                                     const RewriteOptions &option,
+                                     util::Logger &log)
+{
+    SignedConversionFreeze freeze(ctx);
+    if (option.enable_rewriting)
+        for (const expr &a : input_asserts)
+            freeze.collect(a);
+    if (freeze.size() != 0)
+        LOG_INFO(log, "rewrite",
+                 "[rewrite] froze " + std::to_string(freeze.size()) +
+                     " sbv_to_int application(s) as Int constants while rewriting");
+
+    std::vector<expr> frozen_asserts;
+    frozen_asserts.reserve(input_asserts.size());
+    for (const expr &a : input_asserts)
+        frozen_asserts.push_back(freeze.freeze(a));
+    RewriteResult out =
+        run_rewriting_pipeline_frozen(ctx, frozen_asserts, option, log, freeze);
+    freeze.thaw(out);
+    return out;
+}
+
 std::vector<RewrittenCoeffBase> rewrite_coeff_bases_to_int(
     const std::vector<z3::expr> &bases,
-    const std::vector<RewriteRule> &rules)
+    const std::vector<RewriteRule> &original_rules)
 {
     std::vector<RewrittenCoeffBase> out;
     out.reserve(bases.size());
     if (bases.empty())
         return out;
 
+    // The rules come back from run_rewriting_pipeline with sbv_to_int
+    // restored, and the steps below simplify again.
+    SignedConversionFreeze freeze(bases.front().ctx());
+    for (const expr &base : bases)
+        freeze.collect(base);
+    for (const RewriteRule &rule : original_rules)
+        freeze.collect(rule);
+    std::vector<RewriteRule> rules;
+    rules.reserve(original_rules.size());
+    for (const RewriteRule &rule : original_rules)
+        rules.push_back(freeze.freeze(rule));
+
     std::vector<expr> roots;
     roots.reserve(1 + 2 * rules.size());
-    roots.push_back(bases.front());
+    roots.push_back(freeze.freeze(bases.front()));
     for (const RewriteRule &rule : rules)
     {
         roots.push_back(rule.lhs);
@@ -3571,14 +3841,15 @@ std::vector<RewrittenCoeffBase> rewrite_coeff_bases_to_int(
     PolyDecls d = collect_decls(roots);
     RewriteEnv env(rules, d);
 
-    for (const expr &base : bases)
+    for (const expr &original_base : bases)
     {
         if (!d.pconst)
         {
-            out.emplace_back(base, base);
+            out.emplace_back(original_base, original_base);
             continue;
         }
 
+        const expr base = freeze.freeze(original_base);
         expr poly_base = mk_pconst(d, base);
         expr rewritten = poly_base;
         if (env.all_variable_rules)
@@ -3597,7 +3868,7 @@ std::vector<RewrittenCoeffBase> rewrite_coeff_bases_to_int(
             throw std::runtime_error(
                 "rewrite_coeff_bases_to_int: rewritten PConst is not an Int polynomial: " +
                 rewritten.to_string());
-        out.emplace_back(base, rewritten_int.simplify());
+        out.emplace_back(original_base, freeze.thaw(rewritten_int.simplify()));
     }
     return out;
 }

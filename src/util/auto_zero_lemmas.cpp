@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "util/bv_eq.hpp"
+#include "util/bv_to_int.hpp"
 #include "util/fmt_duration.hpp"
 #include "util/live_global_eq_validator.hpp"
 
@@ -27,20 +28,6 @@ constexpr unsigned BV1_ZERO_CALLBACK_DISCOVERY_TIMEOUT_MS = 10000;
 
 namespace
 {
-
-bool is_bv_to_int_app(const expr &e)
-{
-    if (!e.is_app() || !e.get_sort().is_int() || e.num_args() != 1 ||
-        !e.arg(0).get_sort().is_bv())
-        return false;
-#ifdef Z3_OP_BV2INT
-    if (e.decl().decl_kind() == Z3_OP_BV2INT)
-        return true;
-#endif
-    const std::string name = e.decl().name().str();
-    return name == "ubv_to_int" || name == "sbv_to_int" ||
-           name == "bv2nat" || name == "bv2int";
-}
 
 void collect_conversion_bases(const expr &e,
                               std::unordered_set<Z3_ast> &out)

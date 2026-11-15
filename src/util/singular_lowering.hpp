@@ -2,6 +2,7 @@
 
 #include <z3++.h>
 
+#include "util/bv_to_int.hpp"
 #include "util/singular_poly.hpp"
 
 #include <cstdint>
@@ -16,6 +17,10 @@ namespace util::singular
 namespace lowering
 {
 
+// Largest PPow exponent polyterm_to_singular_poly expands; a larger one
+// aborts the process.
+inline constexpr std::int64_t max_pow_expand = 65536;
+
 bool is_poly_sort(const z3::sort &value);
 bool is_ctor(const z3::expr &value, const char *name, unsigned arity);
 bool get_int64_numeral(const z3::expr &value, std::int64_t &out);
@@ -29,8 +34,14 @@ std::vector<std::string> collect_all_indets(
 std::vector<std::string> collect_all_raw_poly_symbols(
     const std::vector<z3::expr> &roots);
 
-bool is_bv_to_int_app(const z3::expr &value);
+using util::is_bv_to_int_app;
+// The ring variable name of a coefficient base. A signed view (sbv_to_int x)
+// is named x_s so that it can be told apart from the unsigned view x, and the
+// top bit (_ extract n-1 n-1) x of a named bit-vector is named x_msb.
 std::string coeff_base_pretty_name(const z3::expr &value);
+// The same name without the signed-view suffix: ring variables are ordered by
+// it, so marking signed views does not reorder the Groebner variables.
+std::string coeff_base_order_name(const z3::expr &value);
 void collect_coeff_bases_rec(
     const z3::expr &value,
     std::unordered_set<Z3_ast> &out);

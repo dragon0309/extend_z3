@@ -90,6 +90,9 @@ struct VariantOptions
     ParallelFallbackBackend parallel_fallback =
         ParallelFallbackBackend::None;
     bool parallel_final_global_validation = false;
+    // Optional group per term, as in Options::initial_groups: terms in
+    // different groups never end up in one class.
+    std::vector<unsigned> initial_groups;
 };
 
 // Experimental alternatives used only when explicitly selected by the

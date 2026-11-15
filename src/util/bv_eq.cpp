@@ -9,6 +9,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "util/bv_to_int.hpp"
 #include "util/fmt_duration.hpp"
 
 namespace util::bveq
@@ -16,21 +17,6 @@ namespace util::bveq
 
 using namespace z3;
 using clk = std::chrono::steady_clock;
-
-
-static bool is_bv_to_int_app(const expr &e)
-{
-    if (!e.is_app() || !e.get_sort().is_int() || e.num_args() != 1 ||
-        !e.arg(0).get_sort().is_bv())
-        return false;
-#ifdef Z3_OP_BV2INT
-    if (e.decl().decl_kind() == Z3_OP_BV2INT)
-        return true;
-#endif
-    const std::string n = e.decl().name().str();
-    return n == "ubv_to_int" || n == "sbv_to_int" ||
-           n == "bv2nat" || n == "bv2int";
-}
 
 static void collect_coeff_bases_rec(const expr &e, std::unordered_set<Z3_ast> &out)
 {

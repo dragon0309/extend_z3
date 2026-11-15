@@ -30,6 +30,10 @@ struct Options
     // result and therefore cannot provide a completeness guarantee.
     unsigned timeout_ms = 0;
     bool start_async = true;
+    // Optional group per term. Terms in different groups start, and so stay,
+    // in different blocks: the refinement never asks whether they are equal.
+    // Empty: one initial block per sort.
+    std::vector<unsigned> initial_groups;
 };
 
 struct Statistics

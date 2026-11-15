@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <thread>
+#include <tuple>
 #include <atomic>
 #include <unordered_map>
 #include <unistd.h>
@@ -44,12 +45,26 @@ std::string sort_key(const z3::expr &term)
     return term.get_sort().to_string();
 }
 
-std::vector<std::vector<std::size_t>> initial_partition(
-    const std::vector<z3::expr> &terms)
+// The initial block of term i: its sort and, when groups are given, its group.
+std::pair<std::string, unsigned> initial_block_key(
+    const std::vector<z3::expr> &terms,
+    const std::vector<unsigned> &groups,
+    std::size_t i)
 {
-    std::map<std::string, std::vector<std::size_t>> by_sort;
+    return {sort_key(terms[i]), groups.empty() ? 0u : groups[i]};
+}
+
+std::vector<std::vector<std::size_t>> initial_partition(
+    const std::vector<z3::expr> &terms,
+    const std::vector<unsigned> &groups)
+{
+    if (!groups.empty() && groups.size() != terms.size())
+        throw std::runtime_error(
+            "initial partition groups do not match the terms");
+    std::map<std::pair<std::string, unsigned>, std::vector<std::size_t>>
+        by_sort;
     for (std::size_t i = 0; i < terms.size(); ++i)
-        by_sort[sort_key(terms[i])].push_back(i);
+        by_sort[initial_block_key(terms, groups, i)].push_back(i);
 
     std::vector<std::vector<std::size_t>> blocks;
     blocks.reserve(by_sort.size());
@@ -176,11 +191,12 @@ z3::expr fresh_bool(z3::context &context,
 
 Result run_z3_mpm(z3::context &context,
                   const std::vector<z3::expr> &constraints,
-                  const std::vector<z3::expr> &terms)
+                  const std::vector<z3::expr> &terms,
+                  const std::vector<unsigned> &groups)
 {
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, groups);
     output.statistics.initial_blocks = blocks.size();
 
     if (terms.empty())
@@ -229,10 +245,14 @@ Result run_z3_mpm(z3::context &context,
     }
 
     ++output.statistics.sat_checks;
-    std::map<std::pair<std::string, unsigned>,
+    // Z3 compares every pair, so the classes are split by group afterwards.
+    std::map<std::tuple<std::string, unsigned, unsigned>,
              std::vector<std::size_t>> by_class;
     for (std::size_t i = 0; i < terms.size(); ++i)
-        by_class[{sort_key(terms[i]), class_ids[i]}].push_back(i);
+    {
+        const auto [sort, group] = initial_block_key(terms, groups, i);
+        by_class[{sort, group, class_ids[i]}].push_back(i);
+    }
     blocks.clear();
     blocks.reserve(by_class.size());
     for (auto &[key, block] : by_class)
@@ -841,7 +861,7 @@ Result run_native_parallel_partition(
 
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, options.initial_groups);
     output.statistics.initial_blocks = blocks.size();
     if (!has_non_singleton(blocks))
     {
@@ -1664,7 +1684,7 @@ Result run_global_edge_portfolio(
 
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, options.initial_groups);
     output.statistics.initial_blocks = blocks.size();
     std::set<ParallelEdge> certified_edges;
     bool can_continue = true;
@@ -2486,7 +2506,7 @@ Result run_parallel_bpr(
 
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, options.initial_groups);
     output.statistics.initial_blocks = blocks.size();
     // An UNSAT worker query certifies every representative-star edge in that
     // query, not an entire block.  Edge-level certificates let one large block
@@ -3117,11 +3137,12 @@ Result run_parallel_bpr(
 Result run_hipr(z3::context &context,
                 const std::vector<z3::expr> &constraints,
                 const std::vector<z3::expr> &terms,
+                const std::vector<unsigned> &groups,
                 util::Logger *log)
 {
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, groups);
     output.statistics.initial_blocks = blocks.size();
 
     auto refine_with_model = [&](const z3::model &model) -> std::size_t {
@@ -3297,6 +3318,7 @@ Result run_hipr(z3::context &context,
 Result run_ipr(z3::context &context,
                const std::vector<z3::expr> &constraints,
                const std::vector<z3::expr> &terms,
+               const std::vector<unsigned> &groups,
                bool assumption_based,
                util::Logger *log)
 {
@@ -3304,7 +3326,7 @@ Result run_ipr(z3::context &context,
         assumption_based ? Variant::Abipr : Variant::Ipr;
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, groups);
     output.statistics.initial_blocks = blocks.size();
 
     if (!has_non_singleton(blocks))
@@ -3536,13 +3558,14 @@ Result run_space_optimized_pr(
     z3::context &context,
     const std::vector<z3::expr> &constraints,
     const std::vector<z3::expr> &terms,
+    const std::vector<unsigned> &groups,
     bool term_sharing,
     util::Logger *log)
 {
     const Variant variant = term_sharing ? Variant::Hsopr : Variant::Sopr;
     Result output;
     output.statistics.terms = terms.size();
-    auto blocks = initial_partition(terms);
+    auto blocks = initial_partition(terms, groups);
     output.statistics.initial_blocks = blocks.size();
 
     if (!has_non_singleton(blocks))
@@ -3931,17 +3954,22 @@ Result run_variant(z3::context &source_context,
                              static_cast<Z3_context>(context)));
 
         if (variant == Variant::Z3Mpm)
-            output = run_z3_mpm(context, constraints, terms);
+            output = run_z3_mpm(
+                context, constraints, terms, options.initial_groups);
         else if (variant == Variant::Ipr)
-            output = run_ipr(context, constraints, terms, false, log);
+            output = run_ipr(context, constraints, terms,
+                             options.initial_groups, false, log);
         else if (variant == Variant::Abipr)
-            output = run_ipr(context, constraints, terms, true, log);
+            output = run_ipr(context, constraints, terms,
+                             options.initial_groups, true, log);
         else if (variant == Variant::Sopr)
             output = run_space_optimized_pr(
-                context, constraints, terms, false, log);
+                context, constraints, terms, options.initial_groups, false,
+                log);
         else if (variant == Variant::Hsopr)
             output = run_space_optimized_pr(
-                context, constraints, terms, true, log);
+                context, constraints, terms, options.initial_groups, true,
+                log);
         else if (variant == Variant::Boolector)
             output = run_native_parallel_partition(
                 context, constraints, terms, options, log);
@@ -4000,7 +4028,8 @@ Result run_variant(z3::context &source_context,
                                options, log);
         }
         else if (variant == Variant::Hipr)
-            output = run_hipr(context, constraints, terms, log);
+            output = run_hipr(
+                context, constraints, terms, options.initial_groups, log);
         else
             throw std::runtime_error("unsupported partition variant");
     }

@@ -17,8 +17,6 @@ namespace lowering
 namespace
 {
 
-constexpr std::int64_t max_pow_expand = 65536;
-
 number num_from_z3_any(const z3::expr &value, coeffs coefficients)
 {
     const Z3_string text = Z3_get_numeral_string(
@@ -203,32 +201,41 @@ std::vector<std::string> collect_all_raw_poly_symbols(
     return result;
 }
 
-bool is_bv_to_int_app(const z3::expr &value)
+namespace
 {
-    if (!value.is_app() || !value.get_sort().is_int() ||
-        value.num_args() != 1 || !value.arg(0).get_sort().is_bv())
-        return false;
-#ifdef Z3_OP_BV2INT
-    if (value.decl().decl_kind() == Z3_OP_BV2INT)
-        return true;
-#endif
-    const std::string name = value.decl().name().str();
-    return name == "ubv_to_int" || name == "sbv_to_int" ||
-           name == "bv2nat" || name == "bv2int";
-}
 
-std::string coeff_base_pretty_name(const z3::expr &value)
+std::string coeff_base_name(const z3::expr &value, bool mark_signed)
 {
-    if (is_bv_to_int_app(value))
+    const util::BvToIntKind kind = util::bv_to_int_kind(value);
+    if (kind != util::BvToIntKind::None)
     {
+        const std::string suffix =
+            mark_signed && kind == util::BvToIntKind::Signed ? "_s" : "";
         const z3::expr bv = value.arg(0);
         if (bv.is_const() && !bv.is_numeral())
-            return bv.decl().name().str();
-        return "bv2int";
+            return bv.decl().name().str() + suffix;
+        const z3::expr whole = bv.is_app() && bv.num_args() == 1 ? bv.arg(0) : bv;
+        if (bv.is_app() && bv.decl().decl_kind() == Z3_OP_EXTRACT &&
+            whole.is_const() && !whole.is_numeral() && bv.hi() == bv.lo() &&
+            bv.hi() + 1 == whole.get_sort().bv_size())
+            return whole.decl().name().str() + "_msb" + suffix;
+        return "bv2int" + suffix;
     }
     if (value.is_const() && !value.is_numeral())
         return value.decl().name().str();
     return value.to_string();
+}
+
+} // namespace
+
+std::string coeff_base_pretty_name(const z3::expr &value)
+{
+    return coeff_base_name(value, true);
+}
+
+std::string coeff_base_order_name(const z3::expr &value)
+{
+    return coeff_base_name(value, false);
 }
 
 void collect_coeff_bases_rec(

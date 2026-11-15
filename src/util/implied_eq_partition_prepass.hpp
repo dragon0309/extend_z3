@@ -35,6 +35,15 @@ struct PrepassResult
     std::size_t anchor_terms = 0;
     std::size_t terms = 0;
     std::size_t injected_eqps = 0;
+    // Proof-forest edges whose two terms share no BV-to-Int conversion (e.g.
+    // a cast from an unsigned to a signed name). With lift_casts, those with
+    // a signed view on one side and an unsigned view on the other are lifted
+    // through the top bit, sbv(a) = ubv(b) - 2^n * msb(b).
+    std::size_t cross_view_edges = 0;
+    std::size_t cross_view_lifted = 0;
+    // Whether terms read signed and terms read unsigned were refined apart
+    // (PrepassOptions::split_by_view); cross_view_edges is then zero.
+    bool split_by_view = false;
     bool bv1_zero_anchor_added = false;
     std::size_t bv1_zero_candidates = 0;
     std::size_t bv1_zero_proved = 0;
@@ -81,6 +90,19 @@ struct PrepassOptions
     // Compatibility mode: materialize every C(k,2) pair instead of the
     // default k-1 proof-edge spanning forest for each size-k class.
     bool inject_all_pairs = false;
+    // Lift a cross-view edge (a read signed, b read unsigned) through the
+    // top bit, sbv(a) = ubv(b) - 2^n * msb(b). Off by default: the extra
+    // relations slow down cases whose proofs do not need them.
+    bool lift_casts = false;
+    // Refine terms read signed (sbv_to_int) and terms read unsigned
+    // (ubv_to_int) apart, so that no equality across the two is searched for.
+    // Equalities are injected per view anyway, so the injections stay the
+    // same; only lift_casts and the caller's native propagation use the
+    // skipped cross-view equalities. The views stay together when lift_casts
+    // is set, when a term has more than one conversion or one that is not
+    // interpreted, and when a 1-bit term is read signed (the single #b0
+    // anchor joins the unsigned terms).
+    bool split_by_view = false;
     // Unified production mode adds #b0 directly to the full BV1 partition.
     // The backend/worker fields below are retained only for the legacy
     // zero-only benchmark path.
