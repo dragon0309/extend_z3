@@ -10,6 +10,7 @@ make_partition_prepass_options(const cli::Options &options)
             cli::EqGbPartitionPrepassVariant::Default &&
         !options.eq_gb_partition_prepass_workers &&
         !options.eq_gb_partition_prepass_all_pairs &&
+        !options.eq_gb_partition_prepass_lift_casts &&
         !options.eq_gb_partition_prepass_bv1_zero_anchor)
     {
         return std::nullopt;
@@ -34,6 +35,7 @@ make_partition_prepass_options(const cli::Options &options)
     }
 
     result.inject_all_pairs = options.eq_gb_partition_prepass_all_pairs;
+    result.lift_casts = options.eq_gb_partition_prepass_lift_casts;
     // Unified production BPR always includes the unique BV1 zero anchor when
     // the conversion-backed BV1 universe is non-empty. The legacy flag is a
     // compatibility alias that still selects the configurable call path.

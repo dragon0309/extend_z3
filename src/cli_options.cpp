@@ -108,7 +108,11 @@ ParseResult parse_options(int argc, char **argv)
     for (int i = 2; i < argc; ++i)
     {
         const std::string arg = argv[i];
-        if (arg == "--ring-detail")
+        if (arg == "--enable-mixed-signedness")
+            options.enable_mixed_signedness = true;
+        else if (arg == "--disable-pconst-purification")
+            options.enable_pconst_purification = false;
+        else if (arg == "--ring-detail")
             options.ring_detail = true;
         else if (arg == "--no-trace")
             options.no_trace = true;
@@ -223,6 +227,8 @@ ParseResult parse_options(int argc, char **argv)
         }
         else if (arg == "--eq-gb-partition-prepass-all-pairs")
             options.eq_gb_partition_prepass_all_pairs = true;
+        else if (arg == "--eq-gb-partition-prepass-lift-casts")
+            options.eq_gb_partition_prepass_lift_casts = true;
         else if (arg == "--eq-gb-partition-prepass-bv1-zero-anchor")
             options.eq_gb_partition_prepass_bv1_zero_anchor = true;
         else if (arg ==
@@ -584,6 +590,11 @@ ParseResult parse_options(int argc, char **argv)
         return error_result(
             std::move(options),
             "--eq-gb-partition-prepass-all-pairs requires --enable-eq-gb-partition-prepass");
+    if (options.eq_gb_partition_prepass_lift_casts &&
+        !options.enable_eq_gb_partition_prepass)
+        return error_result(
+            std::move(options),
+            "--eq-gb-partition-prepass-lift-casts requires --enable-eq-gb-partition-prepass");
     if (options.eq_gb_partition_prepass_bv1_zero_anchor &&
         !options.enable_eq_gb_partition_prepass)
         return error_result(
@@ -728,7 +739,9 @@ ParseResult parse_options(int argc, char **argv)
 void print_usage(std::ostream &os, const char *program)
 {
     os << "Usage: " << program
-       << " <input.smt2> [--ring-detail] [--no-trace]"
+       << " <input.smt2> [--enable-mixed-signedness]"
+          " [--disable-pconst-purification]"
+          " [--ring-detail] [--no-trace]"
           " [--disable-all-false] [--disable-all-true] [--disable-mixed]"
           " [--m-prime]"
           " [--auto-zero-lemmas]"
@@ -754,6 +767,7 @@ void print_usage(std::ostream &os, const char *program)
           "<auto|persistent|portfolio>]"
           " (legacy partition experiment options remain accepted but deprecated)"
           " [--eq-gb-partition-prepass-all-pairs]"
+          " [--eq-gb-partition-prepass-lift-casts]"
           " [--eq-gb-partition-prepass-bv1-zero-anchor]"
           " [--eq-gb-partition-prepass-bv1-zero-timeout-ms <N>]"
           " [--eq-gb-partition-prepass-bv1-zero-workers <N>]"

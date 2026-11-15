@@ -43,6 +43,15 @@ struct Options
     std::string input_file;
     std::string option_summary = "(none)";
 
+    // Accept an input that reads one bit-vector term both through sbv_to_int
+    // and through ubv_to_int; without it such an input is rejected.
+    bool enable_mixed_signedness = false;
+
+    // Replace each non-polynomial Int subterm under a PConst (div, mod, ite,
+    // ...) by a fresh Int constant defined by an equality, so that the atom
+    // can still be lowered to a polynomial instead of being kept as a UF.
+    bool enable_pconst_purification = true;
+
     bool ring_detail = false;
     bool no_trace = false;
     bool enable_all_false = true;
@@ -88,6 +97,7 @@ struct Options
         EqGbPartitionPrepassScheduler::Auto;
     bool eq_gb_partition_prepass_scheduler_explicit = false;
     bool eq_gb_partition_prepass_all_pairs = false;
+    bool eq_gb_partition_prepass_lift_casts = false;
     bool eq_gb_partition_prepass_bv1_zero_anchor = false;
     std::optional<unsigned> eq_gb_partition_prepass_bv1_zero_timeout_ms;
     std::size_t eq_gb_partition_prepass_bv1_zero_workers = 4;
